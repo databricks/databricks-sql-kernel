@@ -32,15 +32,13 @@ use tokio_util::sync::CancellationToken;
 ///
 /// Requested and resolved paths must be within allowed roots. Symlinks between
 /// authorized roots work; path components must remain stable during file access.
-/// GET stages downloads before publication. Sibling staging permits atomic
-/// replacement; an existing writable file in a restricted directory uses private
-/// temporary storage followed by a non-atomic copy, which can fail partially.
-/// Atomic replacement copies mode bits, but not ownership, ACLs or extended attributes.
-/// Download failure or cancellation before publication preserves existing bytes.
+/// GET downloads into a temporary file, beside the destination when its directory
+/// allows it and in the system temporary directory otherwise, then copies it into
+/// the destination in place. Download failure or cancellation before publication
+/// preserves existing bytes; a failure during the copy can leave the destination
+/// partially written. Cancellation after publication starts does not interrupt it.
 /// GET decodes gzip Content-Encoding before writing the downloaded bytes.
 /// Filesystem setup and publication are synchronous and can delay cancellation.
-/// Cancellation and close can also wait for another statement's GET publication
-/// in the same session.
 #[derive(Debug, Clone, Default)]
 pub struct VolumeOptions {
     pub allowed_paths: Vec<PathBuf>,
@@ -56,14 +54,12 @@ pub enum VolumeCompletion {
     Completed,
 }
 
-/// The synchronous gate makes cancellation and local publication mutually exclusive.
 #[derive(Default)]
 pub(crate) struct VolumeState {
     retry: RetryConfig,
     read_timeout: Option<std::time::Duration>,
     completion: OnceCell<Result<VolumeCompletion>>,
     cancellation: CancellationToken,
-    publish: Arc<Mutex<()>>,
     started: AtomicBool,
 }
 
@@ -76,19 +72,16 @@ impl VolumeState {
         retry: RetryConfig,
         read_timeout: Option<std::time::Duration>,
         cancellation: CancellationToken,
-        publish: Arc<Mutex<()>>,
     ) -> Arc<Self> {
         Arc::new(Self {
             retry,
             read_timeout,
             cancellation,
-            publish,
             ..Self::default()
         })
     }
 
     pub(crate) fn cancel(&self) {
-        let _publish = self.publish.lock().unwrap_or_else(|e| e.into_inner());
         self.cancellation.cancel();
     }
 
@@ -215,54 +208,21 @@ impl VolumeState {
             Operation::Remove => Operation::Remove,
         };
         let mut destination = if let Operation::Get(path) = &operation {
-            // Replacement must still honor the destination's write permissions.
             let existing = match std::fs::OpenOptions::new().write(true).open(path) {
                 Ok(file) => Some(file),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
                 Err(error) => return Err(local_error(error, &local_file)),
             };
-            #[cfg(unix)]
-            let mut builder = tempfile::Builder::new();
-            #[cfg(not(unix))]
-            let builder = tempfile::Builder::new();
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                builder.permissions(std::fs::Permissions::from_mode(0o666));
-            }
-            let (temp, in_place) = match builder.tempfile_in(
+            let temp = tempfile::tempfile_in(
                 path.parent()
                     .ok_or_else(|| invalid("Missing destination parent"))?,
-            ) {
-                Ok(temp) => {
-                    if let Some(file) = existing {
-                        temp.as_file()
-                            .set_permissions(
-                                file.metadata()
-                                    .map_err(|e| local_error(e, &local_file))?
-                                    .permissions(),
-                            )
-                            .map_err(|e| local_error(e, &local_file))?;
-                    }
-                    (temp, None)
-                }
-                Err(error)
-                    if error.kind() == std::io::ErrorKind::PermissionDenied
-                        && existing.is_some() =>
-                {
-                    // An existing file may be writable without permission to replace its entry.
-                    let temp =
-                        tempfile::NamedTempFile::new().map_err(|e| local_error(e, &local_file))?;
-                    (temp, existing)
-                }
-                Err(error) => return Err(local_error(error, &local_file)),
-            };
+            )
+            .or_else(|_| tempfile::tempfile())
+            .map_err(|e| local_error(e, &local_file))?;
             let writer = tokio::fs::File::from_std(
-                temp.as_file()
-                    .try_clone()
-                    .map_err(|e| local_error(e, &local_file))?,
+                temp.try_clone().map_err(|e| local_error(e, &local_file))?,
             );
-            Some((temp, writer, in_place, path))
+            Some((temp, writer, existing, path))
         } else {
             None
         };
@@ -328,27 +288,28 @@ impl VolumeState {
                     .map_err(|e| local_error(e, &local_file))?;
             }
         }
-        if let Some((mut temp, mut writer, in_place, path)) = destination.take() {
+        if let Some((mut temp, mut writer, existing, path)) = destination.take() {
             writer
                 .flush()
                 .await
                 .map_err(|e| local_error(e, &local_file))?;
             drop(writer);
-            let _publish = self.publish.lock().unwrap_or_else(|e| e.into_inner());
             if self.cancellation.is_cancelled() {
                 return Err(cancelled());
             }
-            if let Some(mut file) = in_place {
-                std::io::Seek::rewind(temp.as_file_mut())
-                    .map_err(|e| local_error(e, &local_file))?;
-                let length = std::io::copy(temp.as_file_mut(), &mut file)
-                    .map_err(|e| local_error(e, &local_file))?;
-                file.set_len(length)
-                    .map_err(|e| local_error(e, &local_file))?;
-            } else {
-                temp.persist(path)
-                    .map_err(|e| local_error(e.error, &local_file))?;
-            }
+            let mut file = match existing {
+                Some(file) => file,
+                None => std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(path)
+                    .map_err(|e| local_error(e, &local_file))?,
+            };
+            std::io::Seek::rewind(&mut temp).map_err(|e| local_error(e, &local_file))?;
+            let length =
+                std::io::copy(&mut temp, &mut file).map_err(|e| local_error(e, &local_file))?;
+            file.set_len(length)
+                .map_err(|e| local_error(e, &local_file))?;
         }
         Ok(VolumeCompletion::Completed)
     }
@@ -671,7 +632,7 @@ mod tests {
     use arrow_array::{ArrayRef, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
     #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::time::Duration;
     use wiremock::matchers::{body_bytes, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -713,7 +674,6 @@ mod tests {
                 ..Default::default()
             },
             None,
-            Default::default(),
             Default::default(),
         )
     }
@@ -875,7 +835,6 @@ mod tests {
                 },
                 None,
                 Default::default(),
-                Default::default(),
             );
             let batch = instruction(
                 operation,
@@ -917,7 +876,6 @@ mod tests {
                 ..Default::default()
             },
             None,
-            Default::default(),
             Default::default(),
         );
         let batch = instruction("REMOVE", &server.uri(), Path::new(""));
@@ -1000,7 +958,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_replaces_destination_and_caches_error_without_replay() {
+    async fn get_writes_in_place_and_preserves_old_bytes_on_download_failure() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/ok"))
@@ -1018,6 +976,8 @@ mod tests {
         let dest = dir.path().join("download");
         std::fs::write(&dest, b"old bytes").unwrap();
         #[cfg(unix)]
+        let inode = std::fs::metadata(&dest).unwrap().ino();
+        #[cfg(unix)]
         std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o200)).unwrap();
         let batch = instruction("GET", &format!("{}/ok", server.uri()), &dest);
         let completed = transfer_state(0);
@@ -1031,6 +991,7 @@ mod tests {
             .unwrap();
         #[cfg(unix)]
         {
+            assert_eq!(std::fs::metadata(&dest).unwrap().ino(), inode);
             assert_eq!(
                 std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777,
                 0o200
@@ -1069,8 +1030,11 @@ mod tests {
                     std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777,
                     0o200
                 );
+                assert_eq!(std::fs::metadata(&dest).unwrap().ino(), inode);
                 std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o600)).unwrap();
                 assert_eq!(std::fs::read(&dest).unwrap(), b"new bytes");
+            } else {
+                eprintln!("SKIP: restricted-directory permissions are not enforced for this user");
             }
         }
         let state = transfer_state(0);
@@ -1202,7 +1166,6 @@ mod tests {
                     .clone(),
                 Some(Duration::from_millis(150)),
                 Default::default(),
-                Default::default(),
             );
             let batch = instruction(operation, &url, &dest);
             let error = tokio::time::timeout(
@@ -1261,7 +1224,6 @@ mod tests {
         let state = VolumeState::new(
             transfer_state(0).retry.clone(),
             Some(Duration::from_millis(150)),
-            Default::default(),
             Default::default(),
         );
         state

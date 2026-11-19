@@ -100,7 +100,6 @@ pub(crate) struct SessionInner {
     storage_client: Arc<crate::client::http::StorageClient>,
     storage_retry: RetryConfig,
     volume_cancellation: tokio_util::sync::CancellationToken,
-    volume_publish: Arc<std::sync::Mutex<()>>,
 
     /// Server-issued session identifier.
     session_id: String,
@@ -167,15 +166,10 @@ impl SessionInner {
             self.storage_retry.clone(),
             self.config.http.storage_read_timeout,
             self.volume_cancellation.child_token(),
-            Arc::clone(&self.volume_publish),
         )
     }
 
     fn cancel_volume_operations(&self) {
-        let _publish = self
-            .volume_publish
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         self.volume_cancellation.cancel();
     }
 
@@ -503,7 +497,6 @@ impl Session {
                 storage_client,
                 storage_retry,
                 volume_cancellation: tokio_util::sync::CancellationToken::new(),
-                volume_publish: Default::default(),
                 session_id: session_info.session_id,
                 config,
                 runtime_handle,

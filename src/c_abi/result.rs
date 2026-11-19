@@ -784,12 +784,7 @@ mod tests {
         )
         .unwrap();
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let volume = crate::volume::VolumeState::new(
-            Default::default(),
-            None,
-            Default::default(),
-            Default::default(),
-        );
+        let volume = crate::volume::VolumeState::new(Default::default(), None, Default::default());
         let stream = rt.block_on(async {
             let mut stream =
                 ResultStream::from_reader(Box::new(MockReader::new(vec![batch.clone()])))

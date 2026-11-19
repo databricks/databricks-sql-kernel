@@ -409,12 +409,7 @@ mod tests {
 
             stream.attach_volume(
                 true,
-                crate::volume::VolumeState::new(
-                    Default::default(),
-                    None,
-                    Default::default(),
-                    Default::default(),
-                ),
+                crate::volume::VolumeState::new(Default::default(), None, Default::default()),
                 Arc::new(
                     crate::client::DatabricksHttpClient::with_default_retry(Default::default())
                         .unwrap()
