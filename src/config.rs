@@ -1041,6 +1041,16 @@ pub struct TlsConfig {
     /// [`Self::client_cert_pem`] for pairing rules and the
     /// backend-specific validation timing.
     pub client_key_pem: Option<Vec<u8>>,
+
+    /// Check the server chain's revocation status against its CRL distribution
+    /// points. Default off. Revoked certificates are always rejected. Requires
+    /// the `tls-rustls` backend; `tls-native` fails session open with
+    /// `InvalidArgument`. Disabled by [`Self::accept_self_signed`].
+    pub check_certificate_revocation: Option<bool>,
+
+    /// With [`Self::check_certificate_revocation`] on, accept a chain whose status
+    /// cannot be determined (no CRL, fetch failure, expired CRL). Default off.
+    pub accept_undetermined_certificate_revocation: Option<bool>,
 }
 
 impl std::fmt::Debug for TlsConfig {

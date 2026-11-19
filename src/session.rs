@@ -366,6 +366,9 @@ impl Session {
         // 1. HTTP client — built before auth so OAuth providers can use
         //    it for OIDC discovery / token endpoint calls.
         let http_client_config = build_http_client_config(&config, org_id);
+        // Checked before the client-construction wrapping below, so the
+        // configuration error keeps its InvalidArgument category.
+        crate::client::http::check_revocation_support(&http_client_config.tls)?;
         let retry_configs = build_retry_configs_for_session(&config);
         let http_client = Arc::new(
             DatabricksHttpClient::new(http_client_config, retry_configs).map_err(|e| {
@@ -3945,5 +3948,46 @@ mod is_open_tests {
                 ))
             })
         }
+    }
+}
+
+#[cfg(all(test, not(feature = "tls-rustls")))]
+mod revocation_open_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn revocation_on_tls_native_fails_open_as_invalid_argument() {
+        let config = SessionConfig {
+            connection: ConnectionConfig::new("https://workspace.invalid", "test_wh"),
+            defaults: None,
+            auth: AuthConfig::Pat {
+                token: "dapi-test".to_string(),
+                identity_federation_client_id: None,
+            },
+            driver_system_configuration: None,
+            session_conf: Default::default(),
+            geospatial_result_representation: None,
+            http: HttpConfig::default(),
+            proxy: None,
+            tls: TlsConfig {
+                check_certificate_revocation: Some(true),
+                ..TlsConfig::default()
+            },
+            result: ResultConfig::default(),
+            logging: LoggingConfig::default(),
+            telemetry: TelemetryConfig::default(),
+            transport: None,
+        };
+        let error = Session::open(config)
+            .await
+            .expect_err("tls-native must reject a revocation request");
+        assert_eq!(error.code, crate::kernel_error::ErrorCode::InvalidArgument);
+        assert!(
+            error
+                .message
+                .contains("certificate revocation checking requires the tls-rustls backend"),
+            "{}",
+            error.message
+        );
     }
 }

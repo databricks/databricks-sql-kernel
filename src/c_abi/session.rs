@@ -242,6 +242,9 @@ struct TlsSpec {
     client_cert_pem: Option<Vec<u8>>,
     /// PEM-encoded private key for the mTLS client certificate. Never log it.
     client_key_pem: Option<Vec<u8>>,
+    /// Set by `kernel_session_config_set_tls_certificate_revocation`.
+    check_certificate_revocation: Option<bool>,
+    accept_undetermined_certificate_revocation: Option<bool>,
 }
 
 /// Read a required C string argument into an owned `String`, mapping a
@@ -1297,6 +1300,29 @@ pub unsafe extern "C" fn kernel_session_config_set_tls_client_certificate(
     })
 }
 
+/// Enable or disable TLS certificate-revocation checking (default: off).
+///
+/// `check_revocation` turns checking on. A revoked certificate is always
+/// rejected. An undetermined status (no distribution point, CRL fetch failure,
+/// expired CRL) is rejected unless `accept_undetermined` is true. Requires the
+/// `tls-rustls` backend: under `tls-native`, opening a session with
+/// `check_revocation` true fails with `InvalidArgument`.
+///
+/// # Safety
+/// `config` must be a live config handle.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_session_config_set_tls_certificate_revocation(
+    config: *mut KernelSessionConfig,
+    check_revocation: bool,
+    accept_undetermined: bool,
+) -> KernelStatusCode {
+    set_on_config(config, |c| {
+        c.tls.check_certificate_revocation = Some(check_revocation);
+        c.tls.accept_undetermined_certificate_revocation = Some(accept_undetermined);
+        Ok(())
+    })
+}
+
 /// Set whether transaction control is ignored (no-oped). Pass `true`
 /// (the default) for `IgnoreTransactions=1` semantics — `SQLEndTran` /
 /// commit / rollback / autocommit-off become silent no-ops. Pass `false`
@@ -1748,6 +1774,7 @@ fn build_session(config: KernelSessionConfig) -> Result<Session, KernelStatusCod
                 || tls.accept_self_signed
                 || tls.skip_hostname_verification
                 || tls.client_cert_pem.is_some()
+                || tls.check_certificate_revocation.is_some()
             {
                 builder = builder.tls(TlsConfig {
                     custom_ca_cert: tls.custom_ca_cert,
@@ -1755,6 +1782,9 @@ fn build_session(config: KernelSessionConfig) -> Result<Session, KernelStatusCod
                     skip_hostname_verification: tls.skip_hostname_verification,
                     client_cert_pem: tls.client_cert_pem,
                     client_key_pem: tls.client_key_pem,
+                    check_certificate_revocation: tls.check_certificate_revocation,
+                    accept_undetermined_certificate_revocation: tls
+                        .accept_undetermined_certificate_revocation,
                     ..TlsConfig::default()
                 });
             }
@@ -3430,5 +3460,53 @@ mod tests {
         assert_eq!(http.pool_max_idle_per_host, 23);
         assert_eq!(http.request_timeout, default.request_timeout);
         assert_eq!(http.retry_max_retries, default.retry_max_retries);
+    }
+}
+
+#[cfg(all(test, not(feature = "tls-rustls")))]
+mod revocation_open_tests {
+    use super::*;
+    use std::ffi::{CStr, CString};
+
+    /// Revocation on tls-native: session open returns InvalidArgument with the
+    /// backend message. It is rejected before network I/O, so the host is not dialed.
+    #[test]
+    fn tls_revocation_on_tls_native_open_returns_invalid_argument() {
+        unsafe {
+            let mut config: *mut KernelSessionConfig = std::ptr::null_mut();
+            assert_eq!(
+                kernel_session_config_new(&mut config),
+                KernelStatusCode::Success
+            );
+            let host = CString::new("https://workspace.invalid").unwrap();
+            let http_path = CString::new("/sql/1.0/warehouses/test_wh").unwrap();
+            assert_eq!(
+                kernel_session_config_set_http_path(config, host.as_ptr(), http_path.as_ptr()),
+                KernelStatusCode::Success
+            );
+            let token = CString::new("dapi-test-token").unwrap();
+            assert_eq!(
+                kernel_session_config_set_auth_pat(config, token.as_ptr()),
+                KernelStatusCode::Success
+            );
+            assert_eq!(
+                kernel_session_config_set_tls_certificate_revocation(config, true, false),
+                KernelStatusCode::Success
+            );
+
+            let mut session: *mut kernel_session_t = std::ptr::null_mut();
+            let status = kernel_session_open(config, &mut session);
+            assert_eq!(status, KernelStatusCode::InvalidArgument);
+            assert!(session.is_null());
+
+            let mut out = std::mem::MaybeUninit::<crate::c_abi::error::KernelError>::uninit();
+            assert!(crate::c_abi::error::kernel_get_last_error(out.as_mut_ptr()));
+            let error = out.assume_init();
+            let message = CStr::from_ptr(error.message).to_str().unwrap();
+            assert!(
+                message.contains("certificate revocation checking requires the tls-rustls backend"),
+                "{message}"
+            );
+        }
     }
 }

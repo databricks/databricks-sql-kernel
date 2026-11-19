@@ -197,6 +197,53 @@ pub struct TlsConfig {
     /// Populated from [`crate::config::TlsConfig::client_key_pem`].
     /// Secret material — redacted in `Debug`.
     pub client_key_pem: Option<Vec<u8>>,
+    /// Check the chain's revocation status against its CRL distribution
+    /// points (tls-rustls only). `None` / `Some(false)` = off.
+    pub check_certificate_revocation: Option<bool>,
+    /// With revocation checking on, accept an undetermined status.
+    pub accept_undetermined_certificate_revocation: Option<bool>,
+    /// Bounds on each CRL fetch. Production defaults.
+    #[cfg(feature = "tls-rustls")]
+    pub(crate) crl_fetch_limits: CrlFetchLimits,
+}
+
+/// Bounds applied to each CRL HTTP fetch.
+#[cfg(feature = "tls-rustls")]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CrlFetchLimits {
+    pub(crate) timeout: Duration,
+    pub(crate) max_bytes: usize,
+}
+
+#[cfg(feature = "tls-rustls")]
+impl Default for CrlFetchLimits {
+    fn default() -> Self {
+        Self {
+            timeout: Duration::from_secs(10),
+            max_bytes: 32 * 1024 * 1024,
+        }
+    }
+}
+
+/// Rejects a revocation request the backend cannot honour. Shared by session
+/// open (which must report `InvalidArgument` unwrapped) and the HTTP client.
+pub(crate) fn check_revocation_support(tls: &TlsConfig) -> Result<()> {
+    if cfg!(feature = "tls-rustls") || tls.check_certificate_revocation != Some(true) {
+        return Ok(());
+    }
+    Err(Error::invalid_argument()
+        .message("certificate revocation checking requires the tls-rustls backend"))
+}
+
+/// The accept-undetermined flag when revocation checking applies. `allow_self_signed`
+/// turns it off, as Simba does.
+#[cfg(feature = "tls-rustls")]
+fn revocation_policy(tls: &TlsConfig) -> Option<bool> {
+    (tls.check_certificate_revocation == Some(true) && !tls.allow_self_signed.unwrap_or(false))
+        .then(|| {
+            tls.accept_undetermined_certificate_revocation
+                .unwrap_or(false)
+        })
 }
 
 impl std::fmt::Debug for TlsConfig {
@@ -260,6 +307,11 @@ impl TlsConfig {
             trusted_certificate_pem: cfg.custom_ca_cert.clone(),
             client_cert_pem: cfg.client_cert_pem.clone(),
             client_key_pem: cfg.client_key_pem.clone(),
+            check_certificate_revocation: cfg.check_certificate_revocation,
+            accept_undetermined_certificate_revocation: cfg
+                .accept_undetermined_certificate_revocation,
+            #[cfg(feature = "tls-rustls")]
+            crl_fetch_limits: CrlFetchLimits::default(),
         }
     }
 }
@@ -515,6 +567,7 @@ impl DatabricksHttpClient {
         config: &HttpClientConfig,
         redirect: reqwest::redirect::Policy,
     ) -> Result<Client> {
+        check_revocation_support(&config.tls)?;
         let mut builder = Client::builder()
             .connect_timeout(config.connect_timeout)
             // `read_timeout` is a historical name; reqwest applies this as
@@ -698,6 +751,17 @@ impl DatabricksHttpClient {
                 warn!("Proxy bypass_hosts provided but no proxy URL set; bypass list will be ignored (env var NO_PROXY is unaffected)");
             }
             debug!("HTTP client using default proxy behavior (env vars)");
+        }
+
+        // With revocation on, the verifier replaces reqwest's trust roots and
+        // identity. Those were already validated above.
+        #[cfg(feature = "tls-rustls")]
+        if let Some(accept_undetermined) = revocation_policy(&config.tls) {
+            builder = builder.use_preconfigured_tls(super::tls_revocation::client_config(
+                &config.tls,
+                &config.proxy,
+                accept_undetermined,
+            )?);
         }
 
         builder.build().map_err(|e| {
@@ -1648,6 +1712,8 @@ lGrv15pBcePj
             skip_hostname_verification: true,
             client_cert_pem: Some(b"cert-bytes".to_vec()),
             client_key_pem: Some(b"key-bytes".to_vec()),
+            check_certificate_revocation: Some(true),
+            accept_undetermined_certificate_revocation: Some(true),
         };
         let internal = TlsConfig::from_public(&public);
         assert_eq!(internal.allow_self_signed, Some(true));

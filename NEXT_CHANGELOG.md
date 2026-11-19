@@ -13,6 +13,11 @@ changes go in their respective binding's NEXT_CHANGELOG.
 
 - A native Rust ADBC 1.1 driver in `adbc/`, with an optional standard ADBC C
   ABI for driver-manager loading from other languages.
+- Opt-in TLS certificate revocation checking, off by default (`tls-rustls` only;
+  `tls-native` fails session open with `InvalidArgument`). Set it with
+  `TlsConfig::check_certificate_revocation` and
+  `TlsConfig::accept_undetermined_certificate_revocation`, or with
+  `kernel_session_config_set_tls_certificate_revocation`.
 
 ### Changed
 
