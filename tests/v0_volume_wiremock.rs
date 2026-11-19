@@ -132,6 +132,12 @@ async fn instruction_batches_preserve_one_row_and_reject_extra_rows() {
             panic!("expected buffered instruction batch");
         };
         assert_eq!(batch.num_rows(), 1);
+        if !valid {
+            let Some(ResultBatch::Arrow(batch)) = executed.next_batch().await.unwrap() else {
+                panic!("expected second instruction batch");
+            };
+            assert_eq!(batch.num_rows(), 1);
+        }
         assert!(executed.next_batch().await.unwrap().is_none());
         executed.close().await.unwrap();
         session.close().await.unwrap();

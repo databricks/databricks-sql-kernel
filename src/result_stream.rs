@@ -58,6 +58,7 @@ use arrow_array::types::{
 use arrow_array::{Array, RecordBatch};
 use arrow_schema::{DataType, Schema, TimeUnit};
 use chrono::{NaiveDate, NaiveDateTime};
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 /// Cheap-clone reference to a result schema. The kernel hands one
@@ -90,7 +91,7 @@ pub enum TryNextBatch<'a> {
     End,
 }
 
-type Prefetched<T> = Option<std::result::Result<T, Box<Error>>>;
+type Prefetched<T> = VecDeque<std::result::Result<T, Box<Error>>>;
 
 // `ResultBatch::into_arrow()` was deliberately removed: the
 // `#[non_exhaustive]` envelope is the right escape hatch already.
@@ -607,7 +608,7 @@ impl ResultStream {
             reader: Some(reader),
             schema,
             current: None,
-            prefetched: None,
+            prefetched: VecDeque::new(),
             current_row_idx: 0,
             exhausted: false,
             close_guard: None,
@@ -683,7 +684,7 @@ impl ResultStream {
                         if batch.num_rows() != 0 {
                             break batch.clone();
                         }
-                        self.prefetched.take();
+                        self.prefetched.pop_front();
                     };
                     // Later batches cannot authorize a partial transfer of a multi-row result.
                     while !self.exhausted {
@@ -695,6 +696,7 @@ impl ResultStream {
                             .await?
                         {
                             Some(batch) if batch.num_rows() != 0 => {
+                                self.prefetched.push_back(Ok(ResultBatch::Arrow(batch)));
                                 return Err(Error::invalid_argument()
                                     .message("Expected one Volume instruction row"));
                             }
@@ -799,7 +801,7 @@ impl ResultStream {
     pub async fn next_batch(&mut self) -> Result<Option<&ResultBatch>> {
         // Replay inspected batches first so DML counts and Volume validation
         // do not consume callers' result rows.
-        if let Some(batch) = self.prefetched.take() {
+        if let Some(batch) = self.prefetched.pop_front() {
             self.set_current_batch(batch.map_err(|error| *error)?);
             return Ok(self.current.as_ref());
         }
@@ -833,7 +835,7 @@ impl ResultStream {
     /// Return the next batch if it is already available without waiting for
     /// network or background-prefetch progress.
     pub fn try_next_batch(&mut self) -> Result<TryNextBatch<'_>> {
-        if let Some(batch) = self.prefetched.take() {
+        if let Some(batch) = self.prefetched.pop_front() {
             self.set_current_batch(batch.map_err(|error| *error)?);
             return Ok(TryNextBatch::Ready(
                 self.current.as_ref().expect("batch was just installed"),
@@ -876,14 +878,14 @@ impl ResultStream {
     /// exhausted. A subsequent [`next_batch`](Self::next_batch) still returns
     /// the buffered outcome.
     pub(crate) async fn peek_first_batch(&mut self) -> Result<Option<&ResultBatch>> {
-        if self.prefetched.is_none() && self.current.is_none() && !self.exhausted {
+        if self.prefetched.is_empty() && self.current.is_none() && !self.exhausted {
             let reader = self
                 .reader
                 .as_mut()
                 .expect("ResultStream reader is present until into_owned_batches consumes it");
             match reader.next_batch().await {
                 Ok(Some(rb)) => {
-                    self.prefetched = Some(Ok(ResultBatch::Arrow(rb)));
+                    self.prefetched.push_back(Ok(ResultBatch::Arrow(rb)));
                     // Stamp first-batch (result-set-ready) latency at fetch
                     // time, not when the caller later consumes the prefetched
                     // batch via `next_batch`. `record_result_batch` is
@@ -893,7 +895,7 @@ impl ResultStream {
                     // result set became ready rather than the caller's
                     // think-time before the first `next_batch` pull.
                     if let (Some(telemetry), Some(Ok(batch))) =
-                        (&self.telemetry, self.prefetched.as_ref())
+                        (&self.telemetry, self.prefetched.front())
                     {
                         telemetry.record_batch(batch);
                     }
@@ -901,12 +903,12 @@ impl ResultStream {
                 Ok(None) => self.exhausted = true,
                 Err(e) => {
                     self.finalize_telemetry(Some(&e));
-                    self.prefetched = Some(Err(Box::new(e.clone())));
+                    self.prefetched.push_back(Err(Box::new(e.clone())));
                     return Err(e);
                 }
             }
         }
-        match self.prefetched.as_ref() {
+        match self.prefetched.front() {
             Some(Ok(batch)) => Ok(Some(batch)),
             Some(Err(error)) => Err((**error).clone()),
             None => Ok(None),
@@ -1000,10 +1002,10 @@ impl ResultStream {
     /// after an `Err` keep returning `None`.
     pub fn into_owned_batches(mut self) -> OwnedBatchIter {
         // Inspected batches were pulled from the reader; yield them first to preserve row order.
-        let prefetched = self
-            .prefetched
-            .take()
-            .map(|outcome| outcome.map(|ResultBatch::Arrow(rb)| rb));
+        let prefetched = std::mem::take(&mut self.prefetched)
+            .into_iter()
+            .map(|outcome| outcome.map(|ResultBatch::Arrow(rb)| rb))
+            .collect();
         OwnedBatchIter {
             reader: self
                 .reader
@@ -1051,7 +1053,7 @@ impl Iterator for OwnedBatchIter {
         if self.done {
             return None;
         }
-        if let Some(outcome) = self.prefetched.take() {
+        if let Some(outcome) = self.prefetched.pop_front() {
             return match outcome {
                 Ok(batch) => {
                     if let Some(telemetry) = &self.telemetry {

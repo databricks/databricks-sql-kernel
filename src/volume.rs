@@ -36,6 +36,7 @@ use tokio_util::sync::CancellationToken;
 /// replacement; an existing writable file in a restricted directory uses private
 /// temporary storage followed by a non-atomic copy, which can fail partially.
 /// Download failure or cancellation before publication preserves existing bytes.
+/// GET decodes gzip Content-Encoding before writing the downloaded bytes.
 /// Filesystem setup and publication are synchronous and can delay cancellation.
 /// Cancellation and close can also wait for another statement's GET publication
 /// in the same session.

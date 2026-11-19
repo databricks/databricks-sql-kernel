@@ -289,6 +289,74 @@ async fn expired_certificate_fails_once_with_certificate_cause() {
 }
 
 #[tokio::test]
+async fn storage_redirect_rejects_https_to_http_on_the_same_port() {
+    let key = KeyPair::generate().unwrap();
+    let certificate = CertificateParams::new(vec!["127.0.0.1".to_string()])
+        .unwrap()
+        .self_signed(&key)
+        .unwrap();
+    let tls = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_no_client_auth()
+    .with_single_cert(
+        vec![certificate.der().clone()],
+        PrivatePkcs8KeyDer::from(key.serialize_der()).into(),
+    )
+    .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let socket = listener.accept().await.unwrap().0;
+        let mut stream = TlsAcceptor::from(Arc::new(tls))
+            .accept(socket)
+            .await
+            .unwrap();
+        let mut request = [0; 4096];
+        assert!(stream.read(&mut request).await.unwrap() > 0);
+        stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 302 Found\r\nLocation: http://{address}/plain\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), listener.accept())
+                .await
+                .is_err()
+        );
+    });
+    let client = test_client(
+        HttpClientConfig {
+            tls: TlsConfig {
+                allow_self_signed: Some(true),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        Duration::from_secs(2),
+    );
+    let storage = client.storage_client(None);
+    let error = storage
+        .get()
+        .await
+        .unwrap()
+        .get(format!("https://{address}/object"))
+        .header("authorization", "storage-secret")
+        .header("cookie", "storage-cookie")
+        .send()
+        .await
+        .unwrap_err();
+    assert!(error.is_redirect(), "{error}");
+    server.await.unwrap();
+}
+
+#[tokio::test]
 async fn storage_connection_timeout_preserves_unconfigured_limits() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();

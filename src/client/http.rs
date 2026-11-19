@@ -399,7 +399,18 @@ impl StorageClient {
             .get_or_try_init(|| async {
                 DatabricksHttpClient::build_reqwest_client(
                     &self.config,
-                    reqwest::redirect::Policy::default(),
+                    reqwest::redirect::Policy::custom(|attempt| {
+                        if attempt.url().scheme() == "http"
+                            && attempt
+                                .previous()
+                                .last()
+                                .is_some_and(|url| url.scheme() == "https")
+                        {
+                            attempt.error("Volume storage redirect cannot downgrade HTTPS to HTTP")
+                        } else {
+                            reqwest::redirect::Policy::default().redirect(attempt)
+                        }
+                    }),
                     None,
                     false,
                 )
