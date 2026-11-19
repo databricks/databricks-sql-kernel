@@ -348,7 +348,7 @@ impl ExecutedStatement {
         if inner.exhausted {
             return Ok(None);
         }
-        let batch = fetch::read_batch(py, fetch::try_next_batch_exec(&mut inner.exec), || {
+        let batch = fetch::read_batch(py, fetch::own_batch(inner.exec.try_next_batch()), || {
             fetch::next_batch_exec(&inner.runtime, &mut inner.exec)
         })?;
         match batch {

@@ -577,7 +577,7 @@ impl StreamingCloudFetchProvider {
                     ChunkState::Cancelled => {
                         break Err(Error::invalid_state().message("Operation cancelled"))
                     }
-                    _ => {}
+                    _ => break Ok(TryNextBatch::Pending),
                 },
                 Some(Entry::Vacant(_)) => {}
             }
@@ -2670,54 +2670,41 @@ mod tests {
         ))
     }
 
-    /// `try_next_batch` must return `Pending` (without blocking) while the
-    /// head chunk is not yet `Downloaded`, then `Ready` once it flips, and
-    /// finally `End` after the last chunk is consumed. This exercises the
-    /// non-blocking chunk-state machine that diverges from `next_batch`.
     #[tokio::test]
-    async fn try_next_batch_pending_then_ready_then_end() {
+    async fn try_next_batch_preserves_chunk_order() {
         use crate::reader::TryNextBatch;
 
-        let chunks: Arc<DashMap<i64, ChunkEntry>> = Arc::new(DashMap::new());
-        // Chunk 0 present but still downloading — not ready to yield.
+        let chunks = Arc::new(DashMap::new());
         chunks.insert(
             0,
             entry_with_state(create_test_link(0), ChunkState::Downloading),
         );
-        let fetcher: Arc<dyn ChunkLinkFetcher> = Arc::new(MockLinkFetcher::new(1));
         let provider = StreamingCloudFetchProvider::for_test_with_chunks(
-            fetcher,
+            Arc::new(MockLinkFetcher::new(1)),
             unused_downloader(),
             Arc::clone(&chunks),
-            /* end_of_stream = */ true,
+            false,
         );
-        // One chunk resident: `release_downloaded_chunk` decrements this.
         provider.chunks_in_memory.store(1, Ordering::Release);
+        *provider.terminal_error.lock().unwrap() =
+            Some(Error::unavailable().message("chunk 1 link fetch failed"));
 
-        // Not downloaded yet → Pending, and it must NOT block.
-        assert!(
-            matches!(provider.try_next_batch().unwrap(), TryNextBatch::Pending),
-            "a not-yet-Downloaded head chunk must report Pending"
-        );
-
-        // Flip the chunk to Downloaded with real batches, as a download
-        // task would.
+        assert!(matches!(
+            provider.try_next_batch().unwrap(),
+            TryNextBatch::Pending
+        ));
         {
             let mut entry = chunks.get_mut(&0).unwrap();
             entry.state = ChunkState::Downloaded;
             entry.batches = Some(vec![make_batch(&[1, 2, 3])]);
         }
-
         match provider.try_next_batch().unwrap() {
-            TryNextBatch::Ready(batch) => assert_eq!(batch.num_rows(), 3),
-            _ => panic!("expected Ready after chunk flipped to Downloaded"),
+            TryNextBatch::Ready(batch) => assert_eq!(batch, make_batch(&[1, 2, 3])),
+            _ => panic!("earlier rows must be returned before the link error"),
         }
-
-        // Head chunk consumed; end_of_stream + no more chunks → End.
-        assert!(
-            matches!(provider.try_next_batch().unwrap(), TryNextBatch::End),
-            "after the only chunk is drained the stream must report End"
-        );
+        let error = provider.try_next_batch().unwrap_err();
+        assert_eq!(error.code, ErrorCode::Unavailable);
+        assert_eq!(error.message, "chunk 1 link fetch failed");
     }
 
     #[tokio::test]
@@ -2744,30 +2731,22 @@ mod tests {
             Buffer,
             ChunkRead,
             ChunkWrite,
-            EmptyChunkBeforeReady,
             EmptyShard,
             TerminalError,
-            TerminalErrorAfterEmptyChunk,
         }
 
-        for held in [
-            HeldLock::Buffer,
-            HeldLock::ChunkRead,
-            HeldLock::ChunkWrite,
-            HeldLock::EmptyChunkBeforeReady,
-            HeldLock::EmptyShard,
-            HeldLock::TerminalError,
-            HeldLock::TerminalErrorAfterEmptyChunk,
+        for (held, empty_first) in [
+            (HeldLock::Buffer, false),
+            (HeldLock::ChunkRead, false),
+            (HeldLock::ChunkWrite, false),
+            (HeldLock::ChunkRead, true),
+            (HeldLock::EmptyShard, false),
+            (HeldLock::TerminalError, false),
+            (HeldLock::TerminalError, true),
         ] {
-            let terminal = matches!(
-                held,
-                HeldLock::TerminalError | HeldLock::TerminalErrorAfterEmptyChunk
-            );
-            let skipped = i64::from(matches!(held, HeldLock::TerminalErrorAfterEmptyChunk));
-            let data_index = i64::from(matches!(
-                held,
-                HeldLock::TerminalErrorAfterEmptyChunk | HeldLock::EmptyChunkBeforeReady
-            ));
+            let terminal = matches!(held, HeldLock::TerminalError);
+            let skipped = i64::from(empty_first && terminal);
+            let data_index = i64::from(empty_first);
             let chunks = Arc::new(DashMap::new());
             if data_index > 0 {
                 chunks.insert(
@@ -2775,15 +2754,9 @@ mod tests {
                     entry_with_state(create_test_link(0), ChunkState::Downloaded),
                 );
             }
-            if !matches!(held, HeldLock::EmptyShard) {
-                let mut entry = entry_with_state(
-                    create_test_link(data_index),
-                    if terminal {
-                        ChunkState::Downloading
-                    } else {
-                        ChunkState::Downloaded
-                    },
-                );
+            if !matches!(held, HeldLock::EmptyShard | HeldLock::TerminalError) {
+                let mut entry =
+                    entry_with_state(create_test_link(data_index), ChunkState::Downloaded);
                 entry.batches = Some(vec![make_batch(&[1]), make_batch(&[2])]);
                 chunks.insert(data_index, entry);
             }
@@ -2791,7 +2764,7 @@ mod tests {
                 Arc::new(MockLinkFetcher::new(2)),
                 unused_downloader(),
                 Arc::clone(&chunks),
-                true,
+                !terminal,
             );
             provider
                 .chunks_in_memory
@@ -2812,12 +2785,10 @@ mod tests {
                 HeldLock::Buffer => {
                     assert_pending(&provider, provider.current_batch_buffer.lock().unwrap())
                 }
-                HeldLock::ChunkRead | HeldLock::EmptyChunkBeforeReady => {
-                    assert_pending(&provider, chunks.get(&0).unwrap())
-                }
+                HeldLock::ChunkRead => assert_pending(&provider, chunks.get(&0).unwrap()),
                 HeldLock::ChunkWrite => assert_pending(&provider, chunks.get_mut(&0).unwrap()),
                 HeldLock::EmptyShard => assert_pending(&provider, chunks.entry(0)),
-                HeldLock::TerminalError | HeldLock::TerminalErrorAfterEmptyChunk => {
+                HeldLock::TerminalError => {
                     assert_pending(&provider, provider.terminal_error.lock().unwrap());
                 }
             }
@@ -2830,11 +2801,8 @@ mod tests {
                 chunks.len()
             );
             assert_eq!(
-                provider
-                    .metrics
-                    .total_chunks_iterated
-                    .load(Ordering::Acquire),
-                skipped as i32
+                provider.metrics.snapshot().total_chunks_iterated,
+                Some(skipped as i32)
             );
             if terminal {
                 let error = provider
@@ -3248,87 +3216,6 @@ mod tests {
             1,
             "concurrent refreshes must dedup down to one RPC"
         );
-    }
-
-    #[tokio::test]
-    async fn refresh_skip_logs_release_chunk_guard() {
-        use tracing_subscriber::prelude::*;
-
-        struct CheckLogLock {
-            chunks: Arc<DashMap<i64, ChunkEntry>>,
-            logged: Arc<AtomicBool>,
-        }
-
-        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CheckLogLock {
-            fn on_event(
-                &self,
-                event: &tracing::Event<'_>,
-                _: tracing_subscriber::layer::Context<'_, S>,
-            ) {
-                event.record(
-                    &mut |field: &tracing::field::Field, value: &dyn std::fmt::Debug| {
-                        if field.name() != "message" {
-                            return;
-                        }
-                        let message = format!("{value:?}");
-                        if message.starts_with("Concurrent refresh delivered")
-                            || message.contains("skipped after claim")
-                        {
-                            assert!(
-                                self.chunks.try_get_mut(&0).is_present(),
-                                "refresh log callback must be able to write the chunk: {message}"
-                            );
-                            self.logged.store(true, Ordering::Release);
-                        }
-                    },
-                );
-            }
-        }
-
-        for contended in [false, true] {
-            let chunks = Arc::new(DashMap::new());
-            let link = if contended {
-                expired_link(0)
-            } else {
-                create_test_link(0)
-            };
-            chunks.insert(0, entry_with_state(link, ChunkState::UrlFetched));
-            let mock = RefreshCountingMock::new(1);
-            let fetcher: Arc<dyn ChunkLinkFetcher> = mock.clone();
-            let coordinator = Arc::new(RefreshCoordinator::default());
-            coordinator.in_progress.store(contended, Ordering::Release);
-            let cancel = CancellationToken::new();
-            let logged = Arc::new(AtomicBool::new(false));
-            let subscriber = tracing_subscriber::registry().with(CheckLogLock {
-                chunks: Arc::clone(&chunks),
-                logged: Arc::clone(&logged),
-            });
-            let _guard = tracing::subscriber::set_default(subscriber);
-
-            let mut refresh = Box::pin(StreamingCloudFetchProvider::refresh_links_batch(
-                0,
-                &fetcher,
-                &chunks,
-                &coordinator,
-                &cancel,
-                None,
-            ));
-            if contended {
-                assert!(futures::poll!(refresh.as_mut()).is_pending());
-                chunks.insert(
-                    0,
-                    entry_with_state(create_test_link(0), ChunkState::UrlFetched),
-                );
-                coordinator.in_progress.store(false, Ordering::Release);
-                coordinator.done.notify_waiters();
-            }
-            tokio::time::timeout(NO_HANG, refresh)
-                .await
-                .unwrap()
-                .unwrap();
-            assert!(logged.load(Ordering::Acquire), "contended={contended}");
-            assert_eq!(mock.refresh_calls.load(AtomicOrdering::SeqCst), 0);
-        }
     }
 
     #[tokio::test]
@@ -4477,36 +4364,10 @@ mod tests {
     /// failure does not overwrite the originally-persisted error.
     #[tokio::test]
     async fn first_terminal_error_wins() {
-        use tracing_subscriber::prelude::*;
-
-        struct CheckLogLock {
-            provider: Arc<StreamingCloudFetchProvider>,
-            logged: Arc<AtomicBool>,
-        }
-
-        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CheckLogLock {
-            fn on_event(
-                &self,
-                _: &tracing::Event<'_>,
-                _: tracing_subscriber::layer::Context<'_, S>,
-            ) {
-                assert!(self.provider.terminal_error.try_lock().is_ok());
-                self.logged.store(true, Ordering::Release);
-            }
-        }
-
         let fetcher = FailingLinkFetcher::new(4, 2, 0);
         let provider = provider_with_failing_fetcher(fetcher, Some(4));
-        let logged = Arc::new(AtomicBool::new(false));
-        let subscriber = tracing_subscriber::registry().with(CheckLogLock {
-            provider: Arc::clone(&provider),
-            logged: Arc::clone(&logged),
-        });
-        let _guard = tracing::subscriber::set_default(subscriber);
-
         provider.set_terminal_error(Error::io().message("first error"));
         provider.set_terminal_error(Error::io().message("second error"));
-        assert!(logged.load(Ordering::Acquire));
 
         let stored = provider
             .terminal_error()

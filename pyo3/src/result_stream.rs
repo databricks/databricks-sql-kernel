@@ -14,16 +14,8 @@
 
 //! `ResultStream` — Python class wrapping a kernel `ResultStream`.
 //!
-//! Returned by `Session.metadata().list_*` calls and (in future)
-//! anywhere the kernel hands back a bare `ResultStream` without an
-//! enclosing `ExecutedStatement`. Identical fetch surface to
-//! `ExecutedStatement` (Arrow batches, drain-to-Table), minus the
-//! statement_id / cancel hooks that only make sense for an executed
-//! statement.
-//!
-//! The actual batch-pulling logic lives in `fetch::*` helpers so
-//! `ExecutedStatement::fetch_next_batch` / `fetch_all_arrow` can call
-//! the same code path through its `result_stream_mut()` borrow.
+//! Returned by metadata calls and asynchronous statement reads. Server cleanup
+//! belongs to the metadata close guard or the asynchronous statement owner.
 
 use crate::fetch;
 use crate::runtime::KernelRuntime;
@@ -76,7 +68,7 @@ impl ResultStream {
         if inner.exhausted {
             return Ok(None);
         }
-        let batch = fetch::read_batch(py, fetch::try_next_batch(&mut inner.stream), || {
+        let batch = fetch::read_batch(py, fetch::own_batch(inner.stream.try_next_batch()), || {
             fetch::next_batch(&inner.runtime, &mut inner.stream)
         })?;
         match batch {
