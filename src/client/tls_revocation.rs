@@ -386,9 +386,9 @@ type CrlRequest = (
 ///
 /// Dropping the worker closes its request channel. The thread then finishes its in-flight
 /// fetches, each bounded by the per-fetch timeout, and the drop waits at most that long.
-/// Trade-off: if a fetch outlives the wait, the thread can still run after the drop. A
-/// host that unloads this library then could fault that thread. The wait keeps that window
-/// to a fetch that is already past its timeout.
+/// The module is pinned before the thread starts (see [`pin_crate_module_once`]), so a host
+/// that unloads this library cannot unmap the thread's code, even when a fetch outlives
+/// that wait.
 struct CrlWorker {
     requests: Option<tokio::sync::mpsc::UnboundedSender<CrlRequest>>,
     /// Disconnects when the thread has finished.
@@ -408,6 +408,8 @@ impl CrlWorker {
         limits: CrlFetchLimits,
         roots: Vec<reqwest::Certificate>,
     ) -> std::io::Result<Self> {
+        // Pin before the thread exists, so the host cannot unmap this code once it runs.
+        pin_crate_module_once();
         let (requests, mut inbox) = tokio::sync::mpsc::unbounded_channel::<CrlRequest>();
         let (exit_signal, exited) = std::sync::mpsc::channel::<()>();
         std::thread::Builder::new()
@@ -470,11 +472,114 @@ impl Drop for CrlWorker {
         // Closing the channel ends the worker once its in-flight fetches finish. Wait for
         // that, but no longer than the per-fetch timeout.
         //
-        // Residual window: a fetch already past its per-fetch timeout can outlive this
-        // bounded wait. The thread then keeps running after the drop. Unloading the host
-        // library during that window is unsupported.
+        // A fetch already past its per-fetch timeout can outlive this bounded wait, and the
+        // thread then keeps running after the drop. The library was pinned when the worker
+        // started, so the host cannot unmap that code while the thread runs. Once revocation
+        // is first used, the library therefore stays loaded for the rest of the process.
         self.requests.take();
         let _ = in_runtime_blocking(|| self.exited.recv_timeout(self.timeout));
+    }
+}
+
+/// Pins the module that holds this crate, at most once per process, when the first CRL
+/// worker starts. A pinned module is never unmapped, so a host that unloads the library
+/// (an ODBC driver manager, or a napi addon's worker) cannot fault a CRL thread that is
+/// still running. A failed pin is logged at debug and changes nothing else: the connection
+/// proceeds as it did before pinning existed.
+fn pin_crate_module_once() {
+    static PINNED: std::sync::Once = std::sync::Once::new();
+    PINNED.call_once(|| {
+        if let Err(reason) = pin_crate_module() {
+            debug!("could not pin the kernel module for the CRL worker: {reason}");
+        }
+    });
+}
+
+/// Windows: `GetModuleHandleExW` with `FROM_ADDRESS | PIN` on the address of a function in
+/// this crate. The pinned handle is deliberately never released.
+#[cfg(windows)]
+fn pin_crate_module() -> std::result::Result<(), String> {
+    use windows_sys::Win32::Foundation::HMODULE;
+    use windows_sys::Win32::System::LibraryLoader::{
+        GetModuleHandleExW, GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_PIN,
+    };
+    let mut module: HMODULE = std::ptr::null_mut();
+    // SAFETY: with FROM_ADDRESS, the name argument is a code address rather than a string.
+    // It is the address of `pin_crate_module`, which lives in this crate, and `module` is a
+    // valid out-pointer.
+    let found = unsafe {
+        GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+            pin_crate_module as *const () as usize as *const u16,
+            &mut module,
+        )
+    };
+    if found == 0 {
+        return Err(format!(
+            "GetModuleHandleExW failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+/// Unix: `dladdr` finds the object that holds a function in this crate, then `dlopen` with
+/// `RTLD_NOLOAD` reopens that object without loading it again. `RTLD_NODELETE` makes a later
+/// `dlclose` a no-op, so the object is never unmapped. The handle is deliberately not closed.
+#[cfg(unix)]
+fn pin_crate_module() -> std::result::Result<(), String> {
+    use std::os::unix::ffi::OsStrExt;
+
+    // SAFETY: `Dl_info` is plain data, and dladdr writes it only on success.
+    let mut info: libc::Dl_info = unsafe { std::mem::zeroed() };
+    let address = pin_crate_module as *const () as *const libc::c_void;
+    // SAFETY: `address` is a code address in this process, and `info` is valid for writes.
+    if unsafe { libc::dladdr(address, &mut info) } == 0 || info.dli_fname.is_null() {
+        return Err("dladdr found no object for the kernel's code".to_owned());
+    }
+    // SAFETY: `dli_fname` is a NUL-terminated path from dladdr, valid for this call.
+    let path = unsafe { std::ffi::CStr::from_ptr(info.dli_fname) };
+    let path = std::path::Path::new(std::ffi::OsStr::from_bytes(path.to_bytes()));
+    // A program that holds the kernel is the main executable, which the host cannot unload.
+    // dladdr names it by argv[0], and RTLD_NOLOAD cannot reopen it by that name.
+    if let (Ok(object), Ok(exe)) = (
+        std::fs::canonicalize(path),
+        std::env::current_exe().and_then(std::fs::canonicalize),
+    ) {
+        if object == exe {
+            return Ok(());
+        }
+    }
+    // The flags request the already-loaded object only, and RTLD_NODELETE pins it.
+    let handle = unsafe {
+        libc::dlopen(
+            info.dli_fname,
+            libc::RTLD_NOW | libc::RTLD_NOLOAD | libc::RTLD_NODELETE,
+        )
+    };
+    if handle.is_null() {
+        // SAFETY: dlerror returns a NUL-terminated message, or null when there is none.
+        let detail = unsafe { libc::dlerror() };
+        let detail = if detail.is_null() {
+            "no detail".to_owned()
+        } else {
+            // SAFETY: checked non-null above; the message is read before any other dl call.
+            unsafe { std::ffi::CStr::from_ptr(detail) }
+                .to_string_lossy()
+                .into_owned()
+        };
+        return Err(format!("dlopen failed: {detail}"));
+    }
+    Ok(())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod pin_tests {
+    use super::*;
+
+    #[test]
+    fn crate_module_pin_succeeds_on_linux() {
+        assert_eq!(pin_crate_module(), Ok(()));
     }
 }
 
