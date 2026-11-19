@@ -37,6 +37,8 @@ use tokio_util::sync::CancellationToken;
 /// temporary storage followed by a non-atomic copy, which can fail partially.
 /// Download failure or cancellation before publication preserves existing bytes.
 /// Filesystem setup and publication are synchronous and can delay cancellation.
+/// Cancellation and close can also wait for another statement's GET publication
+/// in the same session.
 #[derive(Debug, Clone, Default)]
 pub struct VolumeOptions {
     pub allowed_paths: Vec<PathBuf>,
@@ -119,6 +121,7 @@ impl VolumeState {
                 };
                 if matches!(result, Ok(VolumeCompletion::NeedsInputStream)) {
                     self.started.store(false, Ordering::Release);
+                    // Leave the cell uninitialized so completion can resume with input bytes.
                     Err(VolumeCompletion::NeedsInputStream)
                 } else {
                     Ok(result)
