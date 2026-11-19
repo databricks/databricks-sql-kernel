@@ -35,6 +35,7 @@ use tokio_util::sync::CancellationToken;
 /// GET stages downloads before publication. Sibling staging permits atomic
 /// replacement; an existing writable file in a restricted directory uses private
 /// temporary storage followed by a non-atomic copy, which can fail partially.
+/// Atomic replacement copies mode bits, but not ownership, ACLs or extended attributes.
 /// Download failure or cancellation before publication preserves existing bytes.
 /// GET decodes gzip Content-Encoding before writing the downloaded bytes.
 /// Filesystem setup and publication are synchronous and can delay cancellation.
