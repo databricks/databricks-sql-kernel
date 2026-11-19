@@ -24,7 +24,7 @@ pub(super) struct TelemetryClientManager {
     clients: Mutex<HashMap<TelemetryClientKey, TelemetryClientHolder>>,
 }
 
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) struct TelemetryClientKey {
     host: String,
     http2_enabled: bool,

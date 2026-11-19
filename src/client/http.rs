@@ -395,6 +395,10 @@ impl DatabricksHttpClient {
     /// Auth provider must be set separately via `set_auth_provider()` before
     /// calling `execute()`. Use `execute_without_auth()` for requests that
     /// don't need authentication (e.g., OAuth token endpoint calls).
+    ///
+    /// HTTPS connections negotiate HTTP/2 with HTTP/1.1 fallback unless a proxy is configured.
+    /// This constructor has no protocol opt-out; session-created clients honor
+    /// [`HttpConfig::http2_enabled`](crate::HttpConfig::http2_enabled).
     pub fn new(
         config: HttpClientConfig,
         retry_configs: HashMap<RequestCategory, RetryConfig>,

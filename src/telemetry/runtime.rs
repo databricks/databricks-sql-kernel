@@ -67,7 +67,7 @@ impl TelemetryRuntime {
             auth_type: auth_type(auth),
         });
         let key = TelemetryClientKey::new(&connection.host, http_client.http2_enabled());
-        let (exporter, bypass_cache) = exporter_for_config(config, connection, http_client);
+        let (exporter, bypass_cache) = exporter_for_config(config, connection, http_client, &key);
         let Some(lease) =
             TelemetryClientManager::global().get_or_create(&key, config, exporter, bypass_cache)
         else {
@@ -322,24 +322,22 @@ fn exporter_for_config(
     config: &TelemetryConfig,
     connection: &ConnectionConfig,
     http_client: Arc<DatabricksHttpClient>,
+    key: &TelemetryClientKey,
 ) -> (Arc<dyn TelemetryExporter>, bool) {
     #[cfg(test)]
     {
         if let Some(exporter) = config.exporter.clone() {
-            // Test-injected exporters must not enter the global per-host cache:
+            // Test-injected exporters must not enter the shared telemetry cache:
             // parallel tests commonly reuse the same mock host with different
             // capturing exporters, and cache reuse would route events to the
             // exporter from whichever test created the host client first.
-            return (
-                maybe_wrap_exporter(&connection.host, config, exporter),
-                true,
-            );
+            return (maybe_wrap_exporter(key, config, exporter), true);
         }
     }
 
     (
         maybe_wrap_exporter(
-            &connection.host,
+            key,
             config,
             Arc::new(DatabricksTelemetryExporter::new(
                 &connection.host,
