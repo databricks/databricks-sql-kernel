@@ -13,7 +13,6 @@
 // limitations under the License.
 
 use super::exporter::{TelemetryExportResult, TelemetryExporter};
-use super::manager::TelemetryClientKey;
 use super::models::TelemetryRequest;
 use crate::config::TelemetryConfig;
 use std::collections::HashMap;
@@ -229,12 +228,31 @@ enum CircuitBreakerState {
     HalfOpen,
 }
 
-/// Protocol policies use separate breakers so one policy's failures cannot
-/// suppress the other's telemetry. Entries remain for the process lifetime;
-/// processes typically connect to a small, stable set of workspaces.
+/// Process-global registry of per-host circuit breakers.
+///
+/// The `breakers` map is keyed by `(host, config)` and holds one entry per
+/// distinct host a process talks to. Entries are never evicted, so the map
+/// grows monotonically for the process lifetime. This is intentional and
+/// bounded in practice: a kernel process connects to a small, stable set of
+/// Databricks workspaces, and each entry is tiny (a `String` key plus an
+/// `Arc<CircuitBreaker>` holding a `Mutex<CircuitState>`). If a future
+/// deployment ever exhibits high host cardinality, add an LRU bound or
+/// idle-based eviction here.
+///
+/// Note on the `config` component of the key: telemetry config is effectively
+/// **first-writer-wins per host** because `TelemetryClientManager` caches the
+/// `TelemetryClient` (and thus its wrapped exporter) by host alone. A second
+/// session to an already-connected host reuses the first session's client, so
+/// its freshly-built exporter — and the breaker it would have created — is
+/// discarded. In practice, then, only one `(host, config)` breaker is reached
+/// per host (matching the first-writer-wins behavior of other telemetry knobs
+/// such as `batch_size` and `flush_interval`). The `config` in the key is not
+/// dead code, though: it still differentiates breakers for `bypass_cache`
+/// (test-injected) exporters, which create unmanaged clients that skip the
+/// host-only cache.
 #[derive(Default)]
 struct CircuitBreakerManager {
-    breakers: Mutex<HashMap<(TelemetryClientKey, CircuitBreakerConfig), Arc<CircuitBreaker>>>,
+    breakers: Mutex<HashMap<(String, CircuitBreakerConfig), Arc<CircuitBreaker>>>,
 }
 
 impl CircuitBreakerManager {
@@ -243,25 +261,21 @@ impl CircuitBreakerManager {
         INSTANCE.get_or_init(Self::default)
     }
 
-    fn get_or_create(
-        &self,
-        key: &TelemetryClientKey,
-        config: CircuitBreakerConfig,
-    ) -> Arc<CircuitBreaker> {
+    fn get_or_create(&self, host: &str, config: CircuitBreakerConfig) -> Arc<CircuitBreaker> {
         let mut breakers = self
             .breakers
             .lock()
             .expect("poisoned telemetry circuit breakers");
         Arc::clone(
             breakers
-                .entry((key.clone(), config))
+                .entry((host.to_string(), config))
                 .or_insert_with(|| Arc::new(CircuitBreaker::new(config))),
         )
     }
 }
 
 pub(super) fn maybe_wrap_exporter(
-    key: &TelemetryClientKey,
+    host: &str,
     config: &TelemetryConfig,
     exporter: Arc<dyn TelemetryExporter>,
 ) -> Arc<dyn TelemetryExporter> {
@@ -271,27 +285,23 @@ pub(super) fn maybe_wrap_exporter(
 
     Arc::new(CircuitBreakerTelemetryExporter::new(
         exporter,
-        key,
+        host,
         circuit_config,
     ))
 }
 
 struct CircuitBreakerTelemetryExporter {
     inner: Arc<dyn TelemetryExporter>,
-    key: TelemetryClientKey,
+    host: String,
     breaker: Arc<CircuitBreaker>,
 }
 
 impl CircuitBreakerTelemetryExporter {
-    fn new(
-        inner: Arc<dyn TelemetryExporter>,
-        key: &TelemetryClientKey,
-        config: CircuitBreakerConfig,
-    ) -> Self {
+    fn new(inner: Arc<dyn TelemetryExporter>, host: &str, config: CircuitBreakerConfig) -> Self {
         Self {
             inner,
-            key: key.clone(),
-            breaker: CircuitBreakerManager::global().get_or_create(key, config),
+            host: host.to_string(),
+            breaker: CircuitBreakerManager::global().get_or_create(host, config),
         }
     }
 }
@@ -304,7 +314,7 @@ impl TelemetryExporter for CircuitBreakerTelemetryExporter {
         Box::pin(async move {
             let Some(guard) = self.breaker.before_export() else {
                 tracing::debug!(
-                    client = ?self.key,
+                    host = %self.host,
                     "telemetry circuit breaker open; dropping telemetry batch"
                 );
                 return Ok(());
@@ -336,7 +346,7 @@ mod tests {
         let inner = Arc::new(FailingExporter::default());
         let exporter = CircuitBreakerTelemetryExporter::new(
             inner.clone(),
-            &unique_key("open"),
+            unique_host("open"),
             CircuitBreakerConfig {
                 failure_threshold: 2,
                 open_timeout: Duration::from_secs(60),
@@ -364,7 +374,7 @@ mod tests {
         let inner = Arc::new(ScriptedExporter::new(vec![false, true]));
         let exporter = CircuitBreakerTelemetryExporter::new(
             inner.clone(),
-            &unique_key("recover"),
+            unique_host("recover"),
             CircuitBreakerConfig {
                 failure_threshold: 1,
                 open_timeout: Duration::from_millis(10),
@@ -389,7 +399,7 @@ mod tests {
         let inner = Arc::new(FailingExporter::default());
         let exporter = CircuitBreakerTelemetryExporter::new(
             inner.clone(),
-            &unique_key("reopen"),
+            unique_host("reopen"),
             CircuitBreakerConfig {
                 failure_threshold: 1,
                 open_timeout: Duration::from_millis(10),
@@ -409,7 +419,7 @@ mod tests {
         // Regression: a half-open probe future dropped mid-`await` (e.g. a
         // flush cancelled by `tokio::time::timeout` or an aborted timer task)
         // must not wedge the shared, process-global breaker in HalfOpen forever.
-        let key = unique_key("cancelled-probe");
+        let host = unique_host("cancelled-probe");
         let config = CircuitBreakerConfig {
             failure_threshold: 1,
             open_timeout: Duration::from_millis(10),
@@ -417,16 +427,16 @@ mod tests {
 
         // Trip the breaker open through a failing exporter.
         let failing = Arc::new(FailingExporter::default());
-        let failing_exporter = CircuitBreakerTelemetryExporter::new(failing.clone(), &key, config);
+        let failing_exporter = CircuitBreakerTelemetryExporter::new(failing.clone(), host, config);
         assert!(failing_exporter.export(sample_request()).await.is_err());
         assert_eq!(
             failing_exporter.breaker.state_for_test(),
             CircuitBreakerState::Open
         );
 
-        // A cancelled probe must release the breaker shared by both exporters.
+        // A second exporter to the same host+config shares the same breaker.
         let slow = Arc::new(SlowExporter::default());
-        let slow_exporter = CircuitBreakerTelemetryExporter::new(slow.clone(), &key, config);
+        let slow_exporter = CircuitBreakerTelemetryExporter::new(slow.clone(), host, config);
 
         // After the timeout, drive a half-open probe and cancel it mid-flight via
         // `timeout` — this transitions the breaker to HalfOpen and then drops the
@@ -542,7 +552,7 @@ mod tests {
         let failing = Arc::new(FailingExporter::default());
         let failing_exporter = CircuitBreakerTelemetryExporter::new(
             failing.clone(),
-            &unique_key("failing"),
+            unique_host("failing"),
             CircuitBreakerConfig {
                 failure_threshold: 1,
                 open_timeout: Duration::from_secs(60),
@@ -551,7 +561,7 @@ mod tests {
         let healthy = Arc::new(CapturingExporter::default());
         let healthy_exporter = CircuitBreakerTelemetryExporter::new(
             healthy.clone(),
-            &unique_key("healthy"),
+            unique_host("healthy"),
             CircuitBreakerConfig {
                 failure_threshold: 1,
                 open_timeout: Duration::from_secs(60),
@@ -572,31 +582,6 @@ mod tests {
         assert_eq!(healthy.calls.load(Ordering::SeqCst), 1);
     }
 
-    #[tokio::test]
-    async fn different_protocols_have_independent_breakers() {
-        let host = format!("telemetry-protocol-{}", std::process::id());
-        let config = CircuitBreakerConfig {
-            failure_threshold: 1,
-            open_timeout: Duration::from_secs(60),
-        };
-        let failing = CircuitBreakerTelemetryExporter::new(
-            Arc::new(FailingExporter::default()),
-            &TelemetryClientKey::new(&host, true),
-            config,
-        );
-        let healthy = Arc::new(CapturingExporter::default());
-        let exporter = CircuitBreakerTelemetryExporter::new(
-            healthy.clone(),
-            &TelemetryClientKey::new(&host, false),
-            config,
-        );
-
-        assert!(failing.export(sample_request()).await.is_err());
-        assert_eq!(failing.breaker.state_for_test(), CircuitBreakerState::Open);
-        exporter.export(sample_request()).await.unwrap();
-        assert_eq!(healthy.calls.load(Ordering::SeqCst), 1);
-    }
-
     fn sample_request() -> TelemetryRequest {
         TelemetryRequest {
             upload_time: 1,
@@ -604,8 +589,8 @@ mod tests {
         }
     }
 
-    fn unique_key(suffix: &str) -> TelemetryClientKey {
-        TelemetryClientKey::new(&format!("telemetry-{suffix}-{}", std::process::id()), true)
+    fn unique_host(suffix: &str) -> &'static str {
+        Box::leak(format!("telemetry-{suffix}-{}", std::process::id()).into_boxed_str())
     }
 
     #[derive(Default)]

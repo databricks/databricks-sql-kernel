@@ -126,7 +126,8 @@ until implemented) and `External` (a caller-supplied `TokenProvider`).
 ## `HttpConfig` — HTTP client (optional)
 
 `http2_enabled` covers all HTTPS traffic created by the session, including
-authentication, SQL, result downloads and telemetry. An explicit proxy URL or nonempty
+authentication, SQL and result downloads. Telemetry clients are shared per host
+and may reuse an earlier session's HTTP settings. An explicit proxy URL or nonempty
 `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` (including lowercase variants) forces
 HTTP/1.1, including destinations that bypass the proxy.
 

@@ -15,7 +15,7 @@
 use super::circuit_breaker::maybe_wrap_exporter;
 use super::databricks::{DatabricksTelemetryExporter, TelemetryEndpoint};
 use super::exporter::TelemetryExporter;
-use super::manager::{TelemetryClientKey, TelemetryClientLease, TelemetryClientManager};
+use super::manager::{TelemetryClientLease, TelemetryClientManager};
 use super::models::{
     unix_time_millis, DriverAuthFlow, DriverAuthMech, DriverConnectionParameters, DriverErrorInfo,
     DriverMode, DriverSystemConfiguration, FrontendLogContext, FrontendLogEntry, HostDetails,
@@ -66,11 +66,13 @@ impl TelemetryRuntime {
             connection_params: build_connection_params(connection, auth),
             auth_type: auth_type(auth),
         });
-        let key = TelemetryClientKey::new(&connection.host, http_client.http2_enabled());
-        let (exporter, bypass_cache) = exporter_for_config(config, connection, http_client, &key);
-        let Some(lease) =
-            TelemetryClientManager::global().get_or_create(&key, config, exporter, bypass_cache)
-        else {
+        let (exporter, bypass_cache) = exporter_for_config(config, connection, http_client);
+        let Some(lease) = TelemetryClientManager::global().get_or_create(
+            &connection.host,
+            config,
+            exporter,
+            bypass_cache,
+        ) else {
             return Self::disabled();
         };
 
@@ -322,22 +324,24 @@ fn exporter_for_config(
     config: &TelemetryConfig,
     connection: &ConnectionConfig,
     http_client: Arc<DatabricksHttpClient>,
-    key: &TelemetryClientKey,
 ) -> (Arc<dyn TelemetryExporter>, bool) {
     #[cfg(test)]
     {
         if let Some(exporter) = config.exporter.clone() {
-            // Test-injected exporters must not enter the shared telemetry cache:
+            // Test-injected exporters must not enter the global per-host cache:
             // parallel tests commonly reuse the same mock host with different
             // capturing exporters, and cache reuse would route events to the
             // exporter from whichever test created the host client first.
-            return (maybe_wrap_exporter(key, config, exporter), true);
+            return (
+                maybe_wrap_exporter(&connection.host, config, exporter),
+                true,
+            );
         }
     }
 
     (
         maybe_wrap_exporter(
-            key,
+            &connection.host,
             config,
             Arc::new(DatabricksTelemetryExporter::new(
                 &connection.host,

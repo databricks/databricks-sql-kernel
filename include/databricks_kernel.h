@@ -361,7 +361,7 @@ KernelStatusCode kernel_session_config_set_enable_geospatial_support(
 KernelStatusCode kernel_session_config_set_custom_header(KernelSessionConfig* config,
                                                          const char* name, const char* value);
 
-/* Negotiate HTTP/2 for all HTTPS requests, with HTTP/1.1 fallback.
+/* Negotiate HTTP/2 for session HTTPS requests, with HTTP/1.1 fallback.
  * Enabled by default. False or a configured proxy forces HTTP/1.1. */
 KernelStatusCode kernel_session_config_set_http2_enabled(
     KernelSessionConfig* config, bool enabled);

@@ -550,6 +550,9 @@ impl Session {
             None
         };
 
+        // Leave the builder's HTTP defaults intact unless a timeout, pool, retry,
+        // header, compression or protocol option was supplied.
+        //
         // `retry_max_attempts` is the **total** number of attempts
         // (matching the connector's `_retry_stop_after_attempts_count`
         // and JDBC's count semantics). The kernel's `retry_max_retries`

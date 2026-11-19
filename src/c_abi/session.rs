@@ -1532,12 +1532,16 @@ fn merge_http_config(
     request_timeout: Option<Duration>,
     max_connections: Option<usize>,
     retry: Option<RetrySpec>,
+    http2_enabled: Option<bool>,
 ) -> HttpConfig {
     let mut http = HttpConfig {
         custom_headers,
         sea_response_compression_enabled,
         ..HttpConfig::default()
     };
+    if let Some(enabled) = http2_enabled {
+        http.http2_enabled = enabled;
+    }
     if let Some(t) = request_timeout {
         http.request_timeout = t;
     }
@@ -1741,17 +1745,14 @@ fn build_session(config: KernelSessionConfig) -> Result<Session, KernelStatusCod
                 || max_connections.is_some()
                 || retry.is_some()
             {
-                let mut http = merge_http_config(
+                builder = builder.http(merge_http_config(
                     custom_headers,
                     sea_response_compression_enabled,
                     request_timeout,
                     max_connections,
                     retry,
-                );
-                if let Some(enabled) = http2_enabled {
-                    http.http2_enabled = enabled;
-                }
-                builder = builder.http(http);
+                    http2_enabled,
+                ));
             }
 
             // Programmatic proxy (env-var behaviour preserved when unset).
@@ -2697,6 +2698,26 @@ mod tests {
     }
 
     #[test]
+    fn set_http2_enabled_records_value() {
+        unsafe {
+            let mut config = std::ptr::null_mut();
+            assert_eq!(
+                kernel_session_config_new(&mut config),
+                KernelStatusCode::Success
+            );
+            assert_eq!(config.as_ref().unwrap().http2_enabled, None);
+            for enabled in [true, false] {
+                assert_eq!(
+                    kernel_session_config_set_http2_enabled(config, enabled),
+                    KernelStatusCode::Success
+                );
+                assert_eq!(config.as_ref().unwrap().http2_enabled, Some(enabled));
+            }
+            kernel_session_config_free(config);
+        }
+    }
+
+    #[test]
     fn set_sea_response_compression_records_value() {
         unsafe {
             let mut config = std::ptr::null_mut();
@@ -3341,6 +3362,14 @@ mod tests {
         }
     }
 
+    #[test]
+    fn merge_http_config_preserves_http2_default_and_opt_out() {
+        for (setting, expected) in [(None, true), (Some(true), true), (Some(false), false)] {
+            let http = merge_http_config(Vec::new(), false, None, None, None, setting);
+            assert_eq!(http.http2_enabled, expected);
+        }
+    }
+
     /// A `RetrySpec` maps field-for-field onto `HttpConfig`, and a `Some`
     /// `overall_timeout` overrides the default budget. This covers the merge
     /// that actually configures live retries — a min/max swap or a dropped
@@ -3358,6 +3387,7 @@ mod tests {
                 max_retries: 9,
                 overall_timeout: Some(Duration::from_millis(120_000)),
             }),
+            None,
         );
         assert_eq!(http.retry_min_wait, Duration::from_millis(500));
         assert_eq!(http.retry_max_wait, Duration::from_millis(30_000));
@@ -3382,6 +3412,7 @@ mod tests {
                 max_retries: 2,
                 overall_timeout: None,
             }),
+            None,
         );
         assert_eq!(
             http.overall_timeout, default_budget,
@@ -3408,6 +3439,7 @@ mod tests {
                 max_retries: 4,
                 overall_timeout: None,
             }),
+            None,
         );
         assert!(retry_only.custom_headers.is_empty());
         assert_eq!(retry_only.retry_min_wait, Duration::from_millis(250));
@@ -3418,6 +3450,7 @@ mod tests {
         let headers_only = merge_http_config(
             vec![("X-Test".to_string(), "1".to_string())],
             false,
+            None,
             None,
             None,
             None,
@@ -3441,6 +3474,7 @@ mod tests {
             Some(Duration::from_millis(4_500)),
             None,
             None,
+            None,
         );
         assert_eq!(http.request_timeout, Duration::from_millis(4_500));
         assert_eq!(http.retry_min_wait, default.retry_min_wait);
@@ -3450,7 +3484,7 @@ mod tests {
     #[test]
     fn merge_http_config_maps_max_connections_and_preserves_other_defaults() {
         let default = HttpConfig::default();
-        let http = merge_http_config(Vec::new(), false, None, Some(23), None);
+        let http = merge_http_config(Vec::new(), false, None, Some(23), None, None);
         assert_eq!(http.pool_max_idle_per_host, 23);
         assert_eq!(http.request_timeout, default.request_timeout);
         assert_eq!(http.retry_max_retries, default.retry_max_retries);

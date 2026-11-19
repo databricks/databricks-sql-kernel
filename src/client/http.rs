@@ -491,20 +491,10 @@ impl DatabricksHttpClient {
             })?;
         }
 
-        // Keep proxy TLS compatible with reqwest's HTTP/1.1 CONNECT handshake.
-        let proxy_configured = config.proxy.url.is_some()
-            || [
-                "HTTP_PROXY",
-                "http_proxy",
-                "HTTPS_PROXY",
-                "https_proxy",
-                "ALL_PROXY",
-                "all_proxy",
-            ]
-            .iter()
-            .any(|key| std::env::var_os(key).is_some_and(|value| !value.is_empty()));
-
-        let http2_enabled = http2_enabled && !proxy_configured;
+        // Use one HTTP/1.1 policy for every configured proxy, including bypassed
+        // destinations. This avoids reqwest's HTTPS-proxy ALPN/CONNECT mismatch.
+        let http2_enabled =
+            resolve_http2(http2_enabled, &config.proxy, |key| std::env::var_os(key));
 
         // Follow redirects for normal traffic (reqwest's default policy).
         let client = Self::build_reqwest_client(
@@ -538,8 +528,12 @@ impl DatabricksHttpClient {
         })
     }
 
-    /// Discovery needs the first redirect's `Location` while retaining the same
-    /// protocol, TLS, proxy, timeout and user-agent settings as normal requests.
+    /// Build a `reqwest::Client` from `config` with the given redirect policy.
+    ///
+    /// Factored out of `new()` so tenant discovery can obtain a client that
+    /// does NOT follow redirects (to read the first `/aad/auth` hop's
+    /// `Location`) while still honouring the workspace's protocol, TLS, proxy,
+    /// timeout and user-agent configuration.
     fn build_reqwest_client(
         config: &HttpClientConfig,
         http2_enabled: bool,
@@ -765,10 +759,6 @@ impl DatabricksHttpClient {
         &self.config
     }
 
-    pub(crate) fn http2_enabled(&self) -> bool {
-        self.http2_enabled
-    }
-
     /// Returns the underlying reqwest client for building requests.
     pub fn inner(&self) -> &Client {
         &self.client
@@ -973,24 +963,20 @@ impl DatabricksHttpClient {
                 Error::invalid_argument().message(format!("Failed to build request: {e}"))
             })?;
 
-            debug!(
-                "{:?}: {} {} (attempt {}/{})",
-                request_type,
-                method,
-                url.as_str().split('?').next().unwrap_or_default(),
-                attempts,
-                max_attempts
-            );
-
             match self.client.execute(request).await {
                 Ok(response) => {
+                    let status = response.status();
                     debug!(
                         request_type = ?request_type,
                         host = ?response.url().host_str(),
                         http_version = ?response.version(),
+                        %method,
+                        url = url.as_str().split('?').next().unwrap_or_default(),
+                        attempt = attempts,
+                        max_attempts,
+                        status = status.as_u16(),
                         "received HTTP response"
                     );
-                    let status = response.status();
 
                     if status.is_success() {
                         if attempts > 1 {
@@ -1068,6 +1054,14 @@ impl DatabricksHttpClient {
                     ));
                 }
                 Err(mut e) => {
+                    debug!(
+                        "{:?}: {} {} (attempt {}/{})",
+                        request_type,
+                        method,
+                        url.as_str().split('?').next().unwrap_or_default(),
+                        attempts,
+                        max_attempts
+                    );
                     // reqwest's Display prints the request URL; a presigned URL's query is its credential.
                     if let Some(url) = e.url_mut() {
                         url.set_query(None);
@@ -1125,6 +1119,25 @@ impl DatabricksHttpClient {
             }
         }
     }
+}
+
+fn resolve_http2(
+    requested: bool,
+    proxy: &ProxyConfig,
+    lookup: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> bool {
+    requested
+        && proxy.url.is_none()
+        && ![
+            "HTTP_PROXY",
+            "http_proxy",
+            "HTTPS_PROXY",
+            "https_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+        ]
+        .iter()
+        .any(|key| lookup(key).is_some_and(|value| !value.is_empty()))
 }
 
 #[cfg(test)]

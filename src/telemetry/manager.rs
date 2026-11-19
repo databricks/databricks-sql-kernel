@@ -21,22 +21,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 #[derive(Default)]
 pub(super) struct TelemetryClientManager {
-    clients: Mutex<HashMap<TelemetryClientKey, TelemetryClientHolder>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(super) struct TelemetryClientKey {
-    host: String,
-    http2_enabled: bool,
-}
-
-impl TelemetryClientKey {
-    pub(super) fn new(host: &str, http2_enabled: bool) -> Self {
-        Self {
-            host: host.to_string(),
-            http2_enabled,
-        }
-    }
+    clients: Mutex<HashMap<String, TelemetryClientHolder>>,
 }
 
 impl TelemetryClientManager {
@@ -47,7 +32,7 @@ impl TelemetryClientManager {
 
     pub(super) fn get_or_create(
         &'static self,
-        key: &TelemetryClientKey,
+        host: &str,
         config: &TelemetryConfig,
         exporter: Arc<dyn TelemetryExporter>,
         bypass_cache: bool,
@@ -62,11 +47,11 @@ impl TelemetryClientManager {
         }
 
         let mut clients = self.clients.lock().expect("poisoned telemetry clients");
-        if let Some(holder) = clients.get_mut(key) {
+        if let Some(holder) = clients.get_mut(host) {
             holder.session_count += 1;
             holder.lease_count += 1;
             return Some(TelemetryClientLease::managed(
-                key,
+                host,
                 Arc::clone(&holder.client),
                 self,
             ));
@@ -74,14 +59,14 @@ impl TelemetryClientManager {
 
         let client = TelemetryClient::new(config, exporter)?;
         clients.insert(
-            key.clone(),
+            host.to_string(),
             TelemetryClientHolder {
                 client: Arc::clone(&client),
                 session_count: 1,
                 lease_count: 1,
             },
         );
-        Some(TelemetryClientLease::managed(key, client, self))
+        Some(TelemetryClientLease::managed(host, client, self))
     }
 
     #[cfg(test)]
@@ -92,18 +77,13 @@ impl TelemetryClientManager {
         exporter: Arc<dyn TelemetryExporter>,
         bypass_cache: bool,
     ) -> TelemetryClientLease {
-        self.get_or_create(
-            &TelemetryClientKey::new(host, true),
-            config,
-            exporter,
-            bypass_cache,
-        )
-        .expect("telemetry runtime should start")
+        self.get_or_create(host, config, exporter, bypass_cache)
+            .expect("telemetry runtime should start")
     }
 
-    fn release_session(&self, key: &TelemetryClientKey) -> Option<Arc<TelemetryClient>> {
+    fn release_session(&self, host: &str) -> Option<Arc<TelemetryClient>> {
         let mut clients = self.clients.lock().expect("poisoned telemetry clients");
-        let holder = clients.get_mut(key)?;
+        let holder = clients.get_mut(host)?;
         debug_assert!(holder.session_count > 0);
         // saturating_sub (not `-= 1`) so a future double-decrement degrades
         // gracefully in release builds, where the debug_assert is compiled out.
@@ -115,9 +95,9 @@ impl TelemetryClientManager {
         }
     }
 
-    fn release_lease(&self, key: &TelemetryClientKey, session_released: bool) -> LeaseDropAction {
+    fn release_lease(&self, host: &str, session_released: bool) -> LeaseDropAction {
         let mut clients = self.clients.lock().expect("poisoned telemetry clients");
-        let Some(holder) = clients.get_mut(key) else {
+        let Some(holder) = clients.get_mut(host) else {
             return LeaseDropAction::None;
         };
         if !session_released {
@@ -132,7 +112,7 @@ impl TelemetryClientManager {
         holder.lease_count = holder.lease_count.saturating_sub(1);
         if holder.lease_count == 0 {
             return clients
-                .remove(key)
+                .remove(host)
                 .map(|holder| LeaseDropAction::Close(holder.client))
                 .unwrap_or(LeaseDropAction::None);
         }
@@ -156,7 +136,7 @@ impl TelemetryClientManager {
         self.clients
             .lock()
             .expect("poisoned telemetry clients")
-            .get(&TelemetryClientKey::new(host, true))
+            .get(host)
             .map(|holder| holder.session_count)
     }
 }
@@ -178,7 +158,7 @@ enum LeaseDropAction {
 }
 
 pub(super) struct TelemetryClientLease {
-    key: Option<TelemetryClientKey>,
+    host: Option<String>,
     client: Arc<TelemetryClient>,
     manager: Option<&'static TelemetryClientManager>,
     session_released: AtomicBool,
@@ -186,12 +166,12 @@ pub(super) struct TelemetryClientLease {
 
 impl TelemetryClientLease {
     fn managed(
-        key: &TelemetryClientKey,
+        host: &str,
         client: Arc<TelemetryClient>,
         manager: &'static TelemetryClientManager,
     ) -> Self {
         Self {
-            key: Some(key.clone()),
+            host: Some(host.to_string()),
             client,
             manager: Some(manager),
             session_released: AtomicBool::new(false),
@@ -200,7 +180,7 @@ impl TelemetryClientLease {
 
     fn unmanaged(client: Arc<TelemetryClient>) -> Self {
         Self {
-            key: None,
+            host: None,
             client,
             manager: None,
             session_released: AtomicBool::new(false),
@@ -216,8 +196,8 @@ impl TelemetryClientLease {
             return;
         }
 
-        let client_to_flush = match (self.manager, self.key.as_ref()) {
-            (Some(manager), Some(key)) => manager.release_session(key),
+        let client_to_flush = match (self.manager, self.host.as_deref()) {
+            (Some(manager), Some(host)) => manager.release_session(host),
             _ => Some(Arc::clone(&self.client)),
         };
         if let Some(client) = client_to_flush {
@@ -230,8 +210,8 @@ impl TelemetryClientLease {
 impl Drop for TelemetryClientLease {
     fn drop(&mut self) {
         let session_released = self.session_released.swap(true, Ordering::AcqRel);
-        let action = match (self.manager, self.key.as_ref()) {
-            (Some(manager), Some(key)) => manager.release_lease(key, session_released),
+        let action = match (self.manager, self.host.as_deref()) {
+            (Some(manager), Some(host)) => manager.release_lease(host, session_released),
             _ => LeaseDropAction::Close(Arc::clone(&self.client)),
         };
         match action {
