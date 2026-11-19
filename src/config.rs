@@ -1046,6 +1046,11 @@ pub struct TlsConfig {
     /// points. Default off. Revoked certificates are always rejected. Requires
     /// the `tls-rustls` backend; `tls-native` fails session open with
     /// `InvalidArgument`. Disabled by [`Self::accept_self_signed`].
+    ///
+    /// Each handshake waits, up to a 10 s budget per chain, for the CRLs it needs. The
+    /// kernel's own runtimes are multi-thread (C ABI, telemetry, pyo3 and napi), where that
+    /// wait moves the runtime's other tasks off the thread. Only a caller that drives the
+    /// kernel on its own `current_thread` runtime can be stalled by it.
     pub check_certificate_revocation: Option<bool>,
 
     /// With [`Self::check_certificate_revocation`] on, accept a chain whose status

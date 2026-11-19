@@ -42,6 +42,7 @@ use rustls::{
 use super::http::{CrlFetchLimits, ProxyConfig, TlsConfig};
 use crate::kernel_error::{Error, Result};
 use crate::klog::debug;
+use crate::util::runtime::{ambient_rust_min_stack, runtime_thread_stack_size};
 
 const TAG_INTEGER: u8 = 0x02;
 const TAG_UTC_TIME: u8 = 0x17;
@@ -57,7 +58,31 @@ const TAG_CONTEXT_3: u8 = 0xA3;
 const TAG_URI: u8 = 0x86;
 /// OID 2.5.29.31, the CRL distribution points extension (content octets).
 const OID_CRL_DISTRIBUTION_POINTS: &[u8] = &[0x55, 0x1D, 0x1F];
-const CRL_MAX_REDIRECTS: usize = 3;
+/// How long a failed fetch is remembered, so an unreachable endpoint is not waited on again
+/// by every handshake.
+const FAILED_FETCH_TTL: Duration = Duration::from_secs(60);
+/// Caps on the cached CRLs, by count and by total bytes.
+const MAX_CACHED_CRLS: usize = 64;
+const MAX_CACHED_BYTES: usize = 16 * 1024 * 1024;
+
+/// A verification failure the verifier raises itself. It carries a message for the caller
+/// and is classified as a certificate-verification failure.
+#[derive(Debug)]
+struct VerifierError(String);
+
+impl std::fmt::Display for VerifierError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for VerifierError {}
+
+fn verifier_error(message: String) -> rustls::Error {
+    rustls::Error::InvalidCertificate(CertificateError::Other(rustls::OtherError(Arc::new(
+        VerifierError(message),
+    ))))
+}
 
 // Tests set a per-thread fetch bound here. The client is built on the calling thread, so
 // the bound in effect at construction is the one the fetcher keeps.
@@ -233,7 +258,27 @@ fn classify(der: &[u8], cert_issuer: &[u8], now: u64) -> Verdict {
 /// A cached CRL and its nextUpdate in Unix seconds.
 type CachedCrl = (Arc<Vec<u8>>, u64);
 
-/// Fetches CRLs and caches each until its `nextUpdate`.
+/// Drops expired CRLs, then the ones that expire soonest until the count and byte caps hold.
+fn trim_cache(cache: &mut HashMap<String, CachedCrl>, now: u64) {
+    cache.retain(|_, (_, next)| now <= *next);
+    while cache.len() > MAX_CACHED_CRLS || cached_bytes(cache) > MAX_CACHED_BYTES {
+        let Some(soonest) = cache
+            .iter()
+            .min_by_key(|(_, (_, next))| *next)
+            .map(|(url, _)| url.clone())
+        else {
+            break;
+        };
+        cache.remove(&soonest);
+    }
+}
+
+fn cached_bytes(cache: &HashMap<String, CachedCrl>) -> usize {
+    cache.values().map(|(der, _)| der.len()).sum()
+}
+
+/// Fetches CRLs through one worker. Each CRL is cached until its `nextUpdate`, within the
+/// caps, and a failed fetch is remembered for `FAILED_FETCH_TTL`.
 #[derive(Debug)]
 struct CrlFetcher {
     proxy: ProxyConfig,
@@ -242,52 +287,73 @@ struct CrlFetcher {
     custom_roots: Vec<reqwest::Certificate>,
     /// URL to (CRL bytes, nextUpdate in Unix seconds).
     cache: Mutex<HashMap<String, CachedCrl>>,
+    /// URL to the time its last fetch failed.
+    failed: Mutex<HashMap<String, Instant>>,
+    /// Started on the first fetch, then reused for every chain this fetcher verifies.
+    worker: Mutex<Option<CrlWorker>>,
 }
 
 impl CrlFetcher {
-    /// The CRL at `url`, from cache while current, otherwise freshly fetched.
-    /// `None` means the fetch failed. Only a CRL with a future `nextUpdate` is cached.
-    fn get(
-        &self,
-        url: &str,
-        now: u64,
-        budget: Duration,
-        worker: &mut Option<CrlWorker>,
-    ) -> Option<Arc<Vec<u8>>> {
-        let cached = self
-            .cache
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(url)
-            .filter(|(_, next)| now <= *next)
-            .map(|(der, _)| Arc::clone(der));
-        if cached.is_some() {
-            return cached;
+    /// The CRL at `url`, from cache while current, otherwise fetched within `budget`.
+    /// `None` means the fetch failed, no budget was left, or the URL failed recently.
+    fn get(&self, url: &str, now: u64, budget: Duration) -> Option<Arc<Vec<u8>>> {
+        {
+            let mut cache = self.cache.lock().unwrap_or_else(PoisonError::into_inner);
+            trim_cache(&mut cache, now);
+            if let Some((der, _)) = cache.get(url) {
+                return Some(Arc::clone(der));
+            }
         }
-        self.evict(url);
-        if budget.is_zero() {
+        if budget.is_zero() || self.failed_recently(url) {
             return None;
         }
-        let worker = worker.get_or_insert_with(|| {
-            CrlWorker::start(self.proxy.clone(), self.limits, self.custom_roots.clone())
-        });
-        let der = match worker.fetch(url, budget) {
+        let fetched = {
+            let mut worker = self.worker.lock().unwrap_or_else(PoisonError::into_inner);
+            if worker.is_none() {
+                match CrlWorker::start(self.proxy.clone(), self.limits, self.custom_roots.clone()) {
+                    Ok(started) => *worker = Some(started),
+                    Err(reason) => {
+                        debug!("CRL worker failed to start: {reason}");
+                        return None;
+                    }
+                }
+            }
+            worker.as_ref()?.fetch(url, budget)
+        };
+        let der = match fetched {
             Ok(der) => Arc::new(der),
             Err(reason) => {
                 debug!("CRL fetch failed for {}: {reason}", redacted(url));
+                // A fetch given only a sliver of the chain's budget says little about the
+                // endpoint, so only a fetch with most of its time is remembered.
+                if budget >= self.limits.timeout / 2 {
+                    self.failed
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .insert(url.to_owned(), Instant::now());
+                }
                 return None;
             }
         };
+        self.failed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(url);
         if let Some(next) = parse_crl(&der)
             .and_then(|crl| crl.next_update)
             .filter(|next| now <= *next)
         {
-            self.cache
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .insert(url.to_owned(), (Arc::clone(&der), next));
+            let mut cache = self.cache.lock().unwrap_or_else(PoisonError::into_inner);
+            cache.insert(url.to_owned(), (Arc::clone(&der), next));
+            trim_cache(&mut cache, now);
         }
         Some(der)
+    }
+
+    fn failed_recently(&self, url: &str) -> bool {
+        let mut failed = self.failed.lock().unwrap_or_else(PoisonError::into_inner);
+        failed.retain(|_, at| at.elapsed() < FAILED_FETCH_TTL);
+        failed.contains_key(url)
     }
 
     fn evict(&self, url: &str) {
@@ -305,63 +371,65 @@ type CrlRequest = (
     std::sync::mpsc::Sender<std::result::Result<Vec<u8>, String>>,
 );
 
-/// The CRL client for one chain verification: one thread, one current-thread runtime and
-/// one reqwest client, shared by that chain's fetches. Dropping it ends the thread.
+/// The thread that runs a fetcher's CRL fetches: one current-thread runtime and one reqwest
+/// client, shared by all of them. Dropping the worker closes its request channel. The
+/// thread then exits once its queue is empty, and the drop does not wait for it, so it
+/// cannot run past a chain's deadline.
 struct CrlWorker {
-    requests: Option<std::sync::mpsc::Sender<CrlRequest>>,
-    thread: Option<std::thread::JoinHandle<()>>,
+    requests: std::sync::mpsc::Sender<CrlRequest>,
+}
+
+impl std::fmt::Debug for CrlWorker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CrlWorker")
+    }
 }
 
 impl CrlWorker {
-    fn start(proxy: ProxyConfig, limits: CrlFetchLimits, roots: Vec<reqwest::Certificate>) -> Self {
+    fn start(
+        proxy: ProxyConfig,
+        limits: CrlFetchLimits,
+        roots: Vec<reqwest::Certificate>,
+    ) -> std::io::Result<Self> {
         let (requests, inbox) = std::sync::mpsc::channel::<CrlRequest>();
-        let thread = std::thread::spawn(move || {
-            // The caller's runtime is never re-entered, so a current-thread caller cannot
-            // deadlock.
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build();
-            let client = build_client(&proxy, limits, &roots);
-            for (url, budget, answer) in inbox {
-                let result = match (&runtime, &client) {
-                    (Ok(runtime), Ok(client)) => {
-                        runtime.block_on(fetch(client, &url, limits.max_bytes, budget))
-                    }
-                    (Err(e), _) => Err(e.to_string()),
-                    (_, Err(e)) => Err(e.clone()),
-                };
-                let _ = answer.send(result);
-            }
-        });
-        Self {
-            requests: Some(requests),
-            thread: Some(thread),
-        }
+        // The JoinHandle is dropped, which detaches the thread.
+        std::thread::Builder::new()
+            .name("databricks-crl".to_owned())
+            .stack_size(runtime_thread_stack_size(ambient_rust_min_stack()))
+            .spawn(move || {
+                // The caller's runtime is never re-entered, so a current-thread caller
+                // cannot deadlock.
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build();
+                let client = build_client(&proxy, limits, &roots);
+                for (url, budget, answer) in inbox {
+                    let result = match (&runtime, &client) {
+                        (Ok(runtime), Ok(client)) => {
+                            runtime.block_on(fetch(client, &url, limits.max_bytes, budget))
+                        }
+                        (Err(e), _) => Err(e.to_string()),
+                        (_, Err(e)) => Err(e.clone()),
+                    };
+                    let _ = answer.send(result);
+                }
+            })?;
+        Ok(Self { requests })
     }
 
     /// Runs one fetch on the worker and waits for its answer. The wait is bounded by
     /// `budget`, because the fetch itself is.
     fn fetch(&self, url: &str, budget: Duration) -> std::result::Result<Vec<u8>, String> {
         let (answer, received) = std::sync::mpsc::channel();
-        let sent = self
+        if self
             .requests
-            .as_ref()
-            .is_some_and(|requests| requests.send((url.to_owned(), budget, answer)).is_ok());
-        if !sent {
+            .send((url.to_owned(), budget, answer))
+            .is_err()
+        {
             return Err("CRL worker is not running".to_owned());
         }
         in_runtime_blocking(|| received.recv())
             .unwrap_or_else(|_| Err("CRL worker stopped".to_owned()))
-    }
-}
-
-impl Drop for CrlWorker {
-    fn drop(&mut self) {
-        // Closing the request channel ends the worker once its queue is empty.
-        self.requests.take();
-        if let Some(thread) = self.thread.take() {
-            let _ = in_runtime_blocking(|| thread.join());
-        }
     }
 }
 
@@ -388,7 +456,9 @@ fn build_client(
     let mut builder = reqwest::Client::builder()
         .connect_timeout(limits.timeout)
         .timeout(limits.timeout)
-        .redirect(reqwest::redirect::Policy::limited(CRL_MAX_REDIRECTS));
+        // Redirects are not followed. A plaintext CRL response could otherwise send the
+        // fetch to an internal endpoint. A 3xx is not a 200, so the status is undetermined.
+        .redirect(reqwest::redirect::Policy::none());
     for root in roots {
         builder = builder.add_root_certificate(root.clone());
     }
@@ -513,7 +583,7 @@ impl RevocationVerifier {
         const MAX_PRESENTED: usize = 6;
         let n = intermediates.len();
         if n > MAX_PRESENTED {
-            return Err(rustls::Error::General(format!(
+            return Err(verifier_error(format!(
                 "the server presented {n} intermediates; revocation checking supports at most {MAX_PRESENTED}"
             )));
         }
@@ -568,8 +638,6 @@ impl ServerCertVerifier for RevocationVerifier {
         // One deadline bounds every fetch for this chain, so the total wait is at
         // most one per-fetch timeout however many distribution points there are.
         let deadline = Instant::now() + self.fetcher.limits.timeout;
-        // One CRL client for this chain, started on the first fetch that needs it.
-        let mut worker = None;
         let mut crls = Vec::new();
         let mut used_urls = Vec::new();
         let mut undetermined = false;
@@ -584,8 +652,12 @@ impl ServerCertVerifier for RevocationVerifier {
             }
             let mut covered = false;
             for url in &parsed.crl_uris {
+                // One usable CRL covers the certificate, so the other URLs are not fetched.
+                if covered {
+                    break;
+                }
                 let budget = deadline.saturating_duration_since(Instant::now());
-                let Some(der) = self.fetcher.get(url, now_secs, budget, &mut worker) else {
+                let Some(der) = self.fetcher.get(url, now_secs, budget) else {
                     continue;
                 };
                 match classify(&der, parsed.issuer, now_secs) {
@@ -621,7 +693,7 @@ impl ServerCertVerifier for RevocationVerifier {
         }
         let verifier = builder
             .build()
-            .map_err(|e| rustls::Error::General(format!("revocation verifier setup: {e}")))?;
+            .map_err(|e| verifier_error(format!("revocation verifier setup: {e}")))?;
         // The final verification sees only the checked path. Webpki then cannot build a
         // path through a presented intermediate whose CRLs were not checked.
         let checked: Vec<CertificateDer<'_>> =
@@ -739,6 +811,8 @@ pub(crate) fn client_config(
             limits: crl_fetch_limits(),
             custom_roots,
             cache: Mutex::new(HashMap::new()),
+            failed: Mutex::new(HashMap::new()),
+            worker: Mutex::new(None),
         },
         accept_undetermined,
         allow_hostname_mismatch: tls.allow_hostname_mismatch.unwrap_or(false),
@@ -762,6 +836,9 @@ pub(crate) fn client_config(
         _ => builder.with_no_client_auth(),
     };
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    // Resumed sessions skip `verify_server_cert`, so a certificate revoked after the first
+    // handshake would stay accepted. Every handshake therefore runs the check.
+    config.resumption = rustls::client::Resumption::disabled();
     Ok(config)
 }
 

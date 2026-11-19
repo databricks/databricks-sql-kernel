@@ -17,13 +17,17 @@
 //! TLS on loopback. A forward-proxy stub can sit in front of the CRL fetches.
 
 use super::*;
-use crate::client::http::{CrlFetchLimits, DatabricksHttpClient, HttpClientConfig};
+use crate::client::http::{
+    CrlFetchLimits, DatabricksHttpClient, HttpClientConfig, RevocationPolicy,
+};
+use crate::client::retry::{build_retry_configs, RetryConfig};
 use rcgen::{
     date_time_ymd, BasicConstraints, CertificateParams, CertificateRevocationListParams,
     CrlDistributionPoint, CustomExtension, DnType, IsCa, Issuer, KeyIdMethod, KeyPair,
     RevokedCertParams, SerialNumber, SigningKey,
 };
 use rustls::pki_types::PrivatePkcs8KeyDer;
+use rustls::HandshakeKind;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
@@ -548,6 +552,8 @@ struct Route {
 struct CrlServer {
     addr: SocketAddr,
     routes: Arc<Mutex<HashMap<String, Route>>>,
+    /// Paths that answer `302 Found` with the given `Location`.
+    redirects: Arc<Mutex<HashMap<String, String>>>,
     requests: Arc<Mutex<Vec<(String, String)>>>,
 }
 
@@ -557,6 +563,7 @@ impl CrlServer {
         let server = Self {
             addr: listener.local_addr().unwrap(),
             routes: Arc::new(Mutex::new(HashMap::new())),
+            redirects: Arc::new(Mutex::new(HashMap::new())),
             requests: Arc::new(Mutex::new(Vec::new())),
         };
         let accept_side = server.clone();
@@ -575,6 +582,13 @@ impl CrlServer {
 
     fn set(&self, path: &str, route: Route) {
         self.routes.lock().unwrap().insert(path.to_owned(), route);
+    }
+
+    fn redirect(&self, path: &str, target: String) {
+        self.redirects
+            .lock()
+            .unwrap()
+            .insert(path.to_owned(), target);
     }
 
     /// Requests received for `path`.
@@ -608,6 +622,15 @@ impl CrlServer {
             .unwrap_or("/")
             .to_owned();
         self.requests.lock().unwrap().push((path.clone(), head));
+        if let Some(target) = self.redirects.lock().unwrap().get(&path).cloned() {
+            let _ = stream.write_all(
+                format!(
+                    "HTTP/1.1 302 Found\r\nLocation: {target}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            );
+            return;
+        }
         let route = self
             .routes
             .lock()
@@ -741,12 +764,19 @@ fn set_fetch_limits(limits: CrlFetchLimits) {
     TEST_CRL_LIMITS.with(|cell| cell.set(Some(limits)));
 }
 
-/// Config that trusts the test root, asks for revocation, and fetches with short bounds.
-fn revocation_config(root_pem: &str, accept_undetermined: bool) -> HttpClientConfig {
+/// The revocation policy for a test client: checking on, and an undetermined status
+/// accepted when `accept_undetermined` is set.
+fn policy(accept_undetermined: bool) -> Option<RevocationPolicy> {
+    Some(RevocationPolicy {
+        accept_undetermined,
+    })
+}
+
+/// Config that trusts the test root and fetches with short bounds. The revocation policy
+/// is passed separately, as [`policy`].
+fn revocation_config(root_pem: &str) -> HttpClientConfig {
     let mut config = HttpClientConfig::default();
     config.tls.trusted_certificate_pem = Some(root_pem.as_bytes().to_vec());
-    config.tls.check_certificate_revocation = Some(true);
-    config.tls.accept_undetermined_certificate_revocation = Some(accept_undetermined);
     set_fetch_limits(CrlFetchLimits {
         timeout: Duration::from_millis(500),
         max_bytes: 64 * 1024,
@@ -756,8 +786,22 @@ fn revocation_config(root_pem: &str, accept_undetermined: bool) -> HttpClientCon
     config
 }
 
-async fn get(config: HttpClientConfig, addr: SocketAddr) -> std::result::Result<(), String> {
-    let client = DatabricksHttpClient::with_default_retry(config).unwrap();
+/// A client built from `config` and `revocation`, with default retry configs.
+fn client(config: HttpClientConfig, revocation: Option<RevocationPolicy>) -> DatabricksHttpClient {
+    DatabricksHttpClient::with_revocation(
+        config,
+        build_retry_configs(&RetryConfig::default(), &HashMap::new()),
+        revocation,
+    )
+    .unwrap()
+}
+
+async fn get(
+    config: HttpClientConfig,
+    revocation: Option<RevocationPolicy>,
+    addr: SocketAddr,
+) -> std::result::Result<(), String> {
+    let client = client(config, revocation);
     client
         .inner()
         .get(format!("https://{addr}/"))
@@ -783,7 +827,7 @@ fn error_text(error: &dyn std::error::Error) -> String {
 async fn check(scenario: &Scenario, accept: bool, want: Outcome) {
     let fx = fixture(scenario.leaf, scenario.intermediate, "127.0.0.1");
     let proxy = scenario.relay.map(ForwardProxy::start);
-    let mut config = revocation_config(&fx.pki.root_pem, accept);
+    let mut config = revocation_config(&fx.pki.root_pem);
     config.custom_headers = vec![("X-Kernel-Secret".to_owned(), "hunter2".to_owned())];
     config.org_id = Some("1234".to_owned());
     if let Some(proxy) = &proxy {
@@ -791,7 +835,7 @@ async fn check(scenario: &Scenario, accept: bool, want: Outcome) {
     }
 
     let label = format!("{} (accept_undetermined={accept})", scenario.name);
-    let result = get(config, fx.addr).await;
+    let result = get(config, policy(accept), fx.addr).await;
     match (want, &result) {
         (Outcome::Pass, Ok(())) => {}
         (Outcome::Revoked, Err(err)) => assert!(err.contains("revoked"), "{label}: {err}"),
@@ -850,12 +894,9 @@ async fn revocation_outcomes_follow_the_policy_table() {
 #[tokio::test]
 async fn current_crl_is_fetched_once_and_a_rejected_one_is_refetched() {
     let fx = fixture(Some(Served::Good), Served::Good, "127.0.0.1");
-    let client =
-        DatabricksHttpClient::with_default_retry(revocation_config(&fx.pki.root_pem, false))
-            .unwrap();
+    let http = client(revocation_config(&fx.pki.root_pem), policy(false));
     for _ in 0..2 {
-        client
-            .inner()
+        http.inner()
             .get(format!("https://{}/", fx.addr))
             .send()
             .await
@@ -869,11 +910,9 @@ async fn current_crl_is_fetched_once_and_a_rejected_one_is_refetched() {
     assert_eq!(fx.crl.hits("/intermediate.crl"), 1);
 
     let fx = fixture(Some(Served::WrongKey), Served::Good, "127.0.0.1");
-    let client =
-        DatabricksHttpClient::with_default_retry(revocation_config(&fx.pki.root_pem, false))
-            .unwrap();
+    let http = client(revocation_config(&fx.pki.root_pem), policy(false));
     for _ in 0..2 {
-        assert!(client
+        assert!(http
             .inner()
             .get(format!("https://{}/", fx.addr))
             .send()
@@ -890,12 +929,12 @@ async fn current_crl_is_fetched_once_and_a_rejected_one_is_refetched() {
 #[tokio::test]
 async fn hostname_mismatch_is_rejected_unless_allowed() {
     let fx = fixture(Some(Served::Good), Served::Good, "wrong-host.invalid");
-    get(revocation_config(&fx.pki.root_pem, false), fx.addr)
+    get(revocation_config(&fx.pki.root_pem), policy(false), fx.addr)
         .await
         .expect_err("a name mismatch is rejected by default");
-    let mut config = revocation_config(&fx.pki.root_pem, false);
+    let mut config = revocation_config(&fx.pki.root_pem);
     config.tls.allow_hostname_mismatch = Some(true);
-    get(config, fx.addr)
+    get(config, policy(false), fx.addr)
         .await
         .expect("allow_hostname_mismatch passes a good chain with revocation still checked");
 }
@@ -904,16 +943,16 @@ async fn hostname_mismatch_is_rejected_unless_allowed() {
 async fn client_identity_and_custom_ca_work_with_revocation() {
     let fx = fixture(Some(Served::Good), Served::Good, "127.0.0.1");
     let mtls_addr = spawn_tls_server(&fx.pki, true);
-    let mut config = revocation_config(&fx.pki.root_pem, false);
+    let mut config = revocation_config(&fx.pki.root_pem);
     config.tls.client_cert_pem = Some(fx.pki.client_cert_pem.clone().into_bytes());
     config.tls.client_key_pem = Some(fx.pki.client_key_pem.clone().into_bytes());
-    get(config.clone(), mtls_addr)
+    get(config.clone(), policy(false), mtls_addr)
         .await
         .expect("mTLS identity passes with revocation");
 
     config.tls.client_cert_pem = None;
     config.tls.client_key_pem = None;
-    get(config, mtls_addr)
+    get(config, policy(false), mtls_addr)
         .await
         .expect_err("the mTLS server rejects a client without an identity");
 }
@@ -921,15 +960,13 @@ async fn client_identity_and_custom_ca_work_with_revocation() {
 #[tokio::test]
 async fn policy_off_and_accept_self_signed_skip_revocation() {
     let fx = fixture(Some(Served::Revoked), Served::Good, "127.0.0.1");
-    let mut off = revocation_config(&fx.pki.root_pem, false);
-    off.tls.check_certificate_revocation = None;
-    get(off, fx.addr)
+    get(revocation_config(&fx.pki.root_pem), None, fx.addr)
         .await
         .expect("policy off passes a revoked leaf");
 
-    let mut self_signed = revocation_config(&fx.pki.root_pem, false);
+    let mut self_signed = revocation_config(&fx.pki.root_pem);
     self_signed.tls.allow_self_signed = Some(true);
-    get(self_signed, fx.addr)
+    get(self_signed, policy(false), fx.addr)
         .await
         .expect("accept_self_signed turns revocation off");
 
@@ -974,7 +1011,7 @@ async fn unrelated_appended_certificate_is_never_fetched() {
         unrelated,
     ];
     let addr = spawn_tls_chain(chain, fx.pki.leaf_key_der.clone(), None);
-    get(revocation_config(&fx.pki.root_pem, false), addr)
+    get(revocation_config(&fx.pki.root_pem), policy(false), addr)
         .await
         .expect("the good path verifies; the appended certificate is not on it");
     assert_eq!(
@@ -1017,22 +1054,23 @@ fn same_name_certificate_with_another_key_is_not_a_trust_anchor() {
 #[tokio::test]
 async fn one_timeout_budget_bounds_all_fetches_for_a_chain() {
     // Both distribution points hang past the per-fetch timeout. Without a shared budget
-    // the two fetches take about two timeouts (about 2 s). With it, the chain takes about
-    // one (about 1 s). The bound sits between the two, with slack on each side.
+    // the two fetches take about two timeouts (about 4 s). With it, the chain takes about
+    // one (about 2 s). The bound of 3 s sits between the two, with about a second of slack
+    // on each side.
     let fx = fixture(Some(Served::Timeout), Served::Timeout, "127.0.0.1");
-    let config = revocation_config(&fx.pki.root_pem, false);
+    let config = revocation_config(&fx.pki.root_pem);
     set_fetch_limits(CrlFetchLimits {
-        timeout: Duration::from_millis(1000),
+        timeout: Duration::from_millis(2000),
         max_bytes: 64 * 1024,
     });
     let started = Instant::now();
-    let err = get(config, fx.addr)
+    let err = get(config, policy(false), fx.addr)
         .await
         .expect_err("undetermined under strict");
     let elapsed = started.elapsed();
     assert!(err.contains(UNDETERMINED), "{err}");
     assert!(
-        elapsed < Duration::from_millis(1500),
+        elapsed < Duration::from_millis(3000),
         "the fetches share one budget, but the check took {elapsed:?}"
     );
 }
@@ -1095,7 +1133,7 @@ async fn final_verify_uses_only_the_checked_path() {
         leaf_key.serialize_der(),
         None,
     );
-    get(revocation_config(&root_pem, false), addr)
+    get(revocation_config(&root_pem), policy(false), addr)
         .await
         .expect("the checked path verifies; the unused revoked intermediate is ignored");
     assert_eq!(
@@ -1151,6 +1189,8 @@ fn intermediate_cap_allows_six_and_rejects_seven() {
             limits: CrlFetchLimits::default(),
             custom_roots: Vec::new(),
             cache: Mutex::new(HashMap::new()),
+            failed: Mutex::new(HashMap::new()),
+            worker: Mutex::new(None),
         },
         accept_undetermined: false,
         allow_hostname_mismatch: false,
@@ -1170,10 +1210,223 @@ fn intermediate_cap_allows_six_and_rejects_seven() {
 
     let seven = vec![fx.pki.intermediate_der.clone(); 7];
     match verifier.path_intermediates(end, &seven, &server_name, &[], now) {
-        Err(rustls::Error::General(message)) => assert_eq!(
-            message,
-            "the server presented 7 intermediates; revocation checking supports at most 6"
+        Err(error @ rustls::Error::InvalidCertificate(_)) => assert!(
+            error.to_string().contains(
+                "the server presented 7 intermediates; revocation checking supports at most 6"
+            ),
+            "unexpected message: {error}"
         ),
         other => panic!("seven intermediates must fail at the cap, got {other:?}"),
     }
+}
+
+/// A TLS server that allows session resumption and records the kind of each handshake.
+fn spawn_resuming_server(pki: &Pki) -> (SocketAddr, Arc<Mutex<Vec<HandshakeKind>>>) {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut config = rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![pki.leaf_der.clone(), pki.intermediate_der.clone()],
+            PrivatePkcs8KeyDer::from(pki.leaf_key_der.clone()).into(),
+        )
+        .unwrap();
+    config.session_storage = rustls::server::ServerSessionMemoryCache::new(32);
+    config.ticketer = rustls::crypto::ring::Ticketer::new().unwrap();
+    let config = Arc::new(config);
+    let kinds = Arc::new(Mutex::new(Vec::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let recorded = Arc::clone(&kinds);
+    thread::spawn(move || {
+        for tcp in listener.incoming().flatten() {
+            let config = Arc::clone(&config);
+            let recorded = Arc::clone(&recorded);
+            thread::spawn(move || {
+                let Ok(conn) = rustls::ServerConnection::new(config) else {
+                    return;
+                };
+                let mut stream = rustls::StreamOwned::new(conn, tcp);
+                if read_head(&mut stream).is_some() {
+                    if let Some(kind) = stream.conn.handshake_kind() {
+                        recorded.lock().unwrap().push(kind);
+                    }
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                    );
+                    let _ = stream.flush();
+                }
+            });
+        }
+    });
+    (addr, kinds)
+}
+
+#[tokio::test]
+async fn every_handshake_runs_the_revocation_check() {
+    // A resumed session skips `verify_server_cert`. With resumption disabled on the client,
+    // both connections are full handshakes, and so both run the check.
+    let fx = fixture(Some(Served::Good), Served::Good, "127.0.0.1");
+    let (addr, kinds) = spawn_resuming_server(&fx.pki);
+    let http = client(revocation_config(&fx.pki.root_pem), policy(false));
+    for _ in 0..2 {
+        http.inner()
+            .get(format!("https://{addr}/"))
+            .send()
+            .await
+            .expect("good chain");
+    }
+    assert_eq!(
+        *kinds.lock().unwrap(),
+        vec![HandshakeKind::Full, HandshakeKind::Full],
+        "a resumed handshake would skip the revocation check"
+    );
+}
+
+#[tokio::test]
+async fn a_crl_redirect_is_not_followed_and_is_undetermined() {
+    // A redirect from the CRL endpoint could send the fetch to an internal address, so it is
+    // not followed. The 302 is undetermined: strict rejects, accept passes, and the target
+    // is never requested.
+    let fx = fixture(Some(Served::Good), Served::Good, "127.0.0.1");
+    fx.crl.redirect("/leaf.crl", fx.crl.url("/target.crl"));
+    fx.crl.set(
+        "/target.crl",
+        route(
+            Served::Good,
+            &fx.pki.intermediate_issuer,
+            INTERMEDIATE_CN,
+            LEAF_SERIAL,
+            &fx.pki.root_issuer,
+        ),
+    );
+    let err = get(revocation_config(&fx.pki.root_pem), policy(false), fx.addr)
+        .await
+        .expect_err("a redirected CRL is undetermined under strict");
+    assert!(err.contains(UNDETERMINED), "{err}");
+    get(revocation_config(&fx.pki.root_pem), policy(true), fx.addr)
+        .await
+        .expect("a redirected CRL passes under accept-undetermined");
+    assert_eq!(
+        fx.crl.hits("/target.crl"),
+        0,
+        "the redirect target is never requested"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_crl_fetch_is_not_retried_within_its_ttl() {
+    // The leaf's CRL endpoint returns 503. The first handshake waits for it and fails. The
+    // second, on the same client, does not ask again.
+    let fx = fixture(Some(Served::Status(503)), Served::Good, "127.0.0.1");
+    let http = client(revocation_config(&fx.pki.root_pem), policy(false));
+    for _ in 0..2 {
+        assert!(http
+            .inner()
+            .get(format!("https://{}/", fx.addr))
+            .send()
+            .await
+            .is_err());
+    }
+    assert_eq!(
+        fx.crl.hits("/leaf.crl"),
+        1,
+        "a failed fetch is remembered for its TTL"
+    );
+}
+
+#[tokio::test]
+async fn a_usable_crl_stops_the_other_distribution_points() {
+    // The leaf names two distribution points. The first serves a usable CRL, so the
+    // second, which would hang, is never requested.
+    let crl = CrlServer::start();
+    let pki = build_pki(
+        LeafCdp::Uris(vec![crl.url("/good.crl"), crl.url("/slow.crl")]),
+        crl.url("/intermediate.crl"),
+        "127.0.0.1",
+    );
+    crl.set(
+        "/good.crl",
+        route(
+            Served::Good,
+            &pki.intermediate_issuer,
+            INTERMEDIATE_CN,
+            LEAF_SERIAL,
+            &pki.root_issuer,
+        ),
+    );
+    crl.set(
+        "/slow.crl",
+        route(
+            Served::Timeout,
+            &pki.intermediate_issuer,
+            INTERMEDIATE_CN,
+            LEAF_SERIAL,
+            &pki.root_issuer,
+        ),
+    );
+    crl.set(
+        "/intermediate.crl",
+        route(
+            Served::Good,
+            &pki.root_issuer,
+            ROOT_CN,
+            INTERMEDIATE_SERIAL,
+            &pki.intermediate_issuer,
+        ),
+    );
+    let addr = spawn_tls_server(&pki, false);
+    get(revocation_config(&pki.root_pem), policy(false), addr)
+        .await
+        .expect("the usable CRL covers the leaf");
+    assert_eq!(
+        crl.hits("/slow.crl"),
+        0,
+        "a second distribution point is not fetched once a CRL is usable"
+    );
+}
+
+#[test]
+fn crl_cache_drops_expired_entries_and_stays_within_its_caps() {
+    let mut cache: HashMap<String, CachedCrl> = HashMap::new();
+    cache.insert("expired".to_owned(), (Arc::new(vec![0_u8; 8]), 5));
+    for i in 0..(MAX_CACHED_CRLS + 10) {
+        cache.insert(format!("crl{i}"), (Arc::new(vec![0_u8; 8]), 100 + i as u64));
+    }
+    trim_cache(&mut cache, 10);
+    assert!(
+        !cache.contains_key("expired"),
+        "expired entries are dropped"
+    );
+    assert_eq!(
+        cache.len(),
+        MAX_CACHED_CRLS,
+        "the count cap keeps the entries that expire last"
+    );
+    assert!(cache.contains_key(&format!("crl{}", MAX_CACHED_CRLS + 9)));
+    assert!(
+        !cache.contains_key("crl0"),
+        "the soonest to expire goes first"
+    );
+
+    // The byte cap: three 8 MiB entries exceed 16 MiB, so the soonest-expiring one goes.
+    let mut big: HashMap<String, CachedCrl> = HashMap::new();
+    for i in 0..3_u64 {
+        big.insert(
+            format!("big{i}"),
+            (Arc::new(vec![0_u8; 8 * 1024 * 1024]), 100 + i),
+        );
+    }
+    trim_cache(&mut big, 10);
+    assert_eq!(big.len(), 2, "the byte cap keeps the cache under 16 MiB");
+    assert!(!big.contains_key("big0"));
+}
+
+#[test]
+fn verifier_errors_are_certificate_verification_failures() {
+    let error = verifier_error("the server presented 7 intermediates".to_owned());
+    assert!(crate::client::retry::is_certificate_verification_failure(
+        &error
+    ));
 }

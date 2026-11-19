@@ -368,12 +368,17 @@ impl Session {
         let http_client_config = build_http_client_config(&config, org_id);
         // Checked before the client-construction wrapping below, so the
         // configuration error keeps its InvalidArgument category.
-        crate::client::http::check_revocation_support(&http_client_config.tls)?;
+        let revocation = crate::client::http::RevocationPolicy::from_options(
+            config.tls.check_certificate_revocation,
+            config.tls.accept_undetermined_certificate_revocation,
+        );
+        crate::client::http::check_revocation_support(&http_client_config.tls, revocation)?;
         let retry_configs = build_retry_configs_for_session(&config);
         let http_client = Arc::new(
-            DatabricksHttpClient::new(http_client_config, retry_configs).map_err(|e| {
-                Error::network_error().message(format!("Failed to construct HTTP client: {e}"))
-            })?,
+            DatabricksHttpClient::with_revocation(http_client_config, retry_configs, revocation)
+                .map_err(|e| {
+                    Error::network_error().message(format!("Failed to construct HTTP client: {e}"))
+                })?,
         );
 
         // 2. Auth provider — async because OAuth flows hit the OIDC

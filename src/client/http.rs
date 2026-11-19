@@ -197,11 +197,6 @@ pub struct TlsConfig {
     /// Populated from [`crate::config::TlsConfig::client_key_pem`].
     /// Secret material — redacted in `Debug`.
     pub client_key_pem: Option<Vec<u8>>,
-    /// Check the chain's revocation status against its CRL distribution
-    /// points (tls-rustls only). `None` / `Some(false)` = off.
-    pub check_certificate_revocation: Option<bool>,
-    /// With revocation checking on, accept an undetermined status.
-    pub accept_undetermined_certificate_revocation: Option<bool>,
 }
 
 /// Bounds applied to each CRL HTTP fetch.
@@ -222,29 +217,39 @@ impl Default for CrlFetchLimits {
     }
 }
 
+/// Revocation checking for one client: whether an undetermined status is accepted.
+/// It is carried next to [`TlsConfig`], not inside it, so that struct keeps its
+/// published shape.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RevocationPolicy {
+    pub(crate) accept_undetermined: bool,
+}
+
+impl RevocationPolicy {
+    /// The policy for the public options, or `None` when checking is off (unset or
+    /// `false`).
+    pub(crate) fn from_options(
+        check: Option<bool>,
+        accept_undetermined: Option<bool>,
+    ) -> Option<Self> {
+        (check == Some(true)).then(|| Self {
+            accept_undetermined: accept_undetermined == Some(true),
+        })
+    }
+}
+
 /// Rejects a revocation request the backend cannot honour. Shared by session
 /// open (which must report `InvalidArgument` unwrapped) and the HTTP client.
 /// `allow_self_signed` turns revocation off, so it is not an error.
-pub(crate) fn check_revocation_support(tls: &TlsConfig) -> Result<()> {
-    if cfg!(feature = "tls-rustls")
-        || tls.check_certificate_revocation != Some(true)
-        || tls.allow_self_signed == Some(true)
-    {
+pub(crate) fn check_revocation_support(
+    tls: &TlsConfig,
+    revocation: Option<RevocationPolicy>,
+) -> Result<()> {
+    if cfg!(feature = "tls-rustls") || revocation.is_none() || tls.allow_self_signed == Some(true) {
         return Ok(());
     }
     Err(Error::invalid_argument()
         .message("certificate revocation checking requires the tls-rustls backend"))
-}
-
-/// The accept-undetermined flag when revocation checking applies. `allow_self_signed`
-/// turns it off, as Simba does.
-#[cfg(feature = "tls-rustls")]
-fn revocation_policy(tls: &TlsConfig) -> Option<bool> {
-    (tls.check_certificate_revocation == Some(true) && !tls.allow_self_signed.unwrap_or(false))
-        .then(|| {
-            tls.accept_undetermined_certificate_revocation
-                .unwrap_or(false)
-        })
 }
 
 impl std::fmt::Debug for TlsConfig {
@@ -280,14 +285,6 @@ impl std::fmt::Debug for TlsConfig {
                 "client_key_pem",
                 &self.client_key_pem.as_ref().map(|_| "<redacted>"),
             )
-            .field(
-                "check_certificate_revocation",
-                &self.check_certificate_revocation,
-            )
-            .field(
-                "accept_undetermined_certificate_revocation",
-                &self.accept_undetermined_certificate_revocation,
-            )
             .finish()
     }
 }
@@ -316,9 +313,6 @@ impl TlsConfig {
             trusted_certificate_pem: cfg.custom_ca_cert.clone(),
             client_cert_pem: cfg.client_cert_pem.clone(),
             client_key_pem: cfg.client_key_pem.clone(),
-            check_certificate_revocation: cfg.check_certificate_revocation,
-            accept_undetermined_certificate_revocation: cfg
-                .accept_undetermined_certificate_revocation,
         }
     }
 }
@@ -445,6 +439,7 @@ pub struct DatabricksHttpClient {
     config: HttpClientConfig,
     auth_provider: OnceLock<Arc<dyn AuthProvider>>,
     retry_configs: HashMap<RequestCategory, RetryConfig>,
+    revocation: Option<RevocationPolicy>,
 }
 
 impl DatabricksHttpClient {
@@ -454,8 +449,19 @@ impl DatabricksHttpClient {
     /// calling `execute()`. Use `execute_without_auth()` for requests that
     /// don't need authentication (e.g., OAuth token endpoint calls).
     pub fn new(
+        config: HttpClientConfig,
+        retry_configs: HashMap<RequestCategory, RetryConfig>,
+    ) -> Result<Self> {
+        Self::with_revocation(config, retry_configs, None)
+    }
+
+    /// Like [`Self::new`], with a revocation policy applied to every connection this client
+    /// makes. The policy is kept outside [`TlsConfig`], so that struct keeps its published
+    /// shape.
+    pub(crate) fn with_revocation(
         mut config: HttpClientConfig,
         retry_configs: HashMap<RequestCategory, RetryConfig>,
+        revocation: Option<RevocationPolicy>,
     ) -> Result<Self> {
         // Fold any caller-supplied `User-Agent` custom header into the
         // effective UA, and remove it from `custom_headers` so it isn't
@@ -538,7 +544,8 @@ impl DatabricksHttpClient {
         }
 
         // Follow redirects for normal traffic (reqwest's default policy).
-        let client = Self::build_reqwest_client(&config, reqwest::redirect::Policy::default())?;
+        let client =
+            Self::build_reqwest_client(&config, reqwest::redirect::Policy::default(), revocation)?;
 
         // Surface which TLS backend was compiled in so oncall debugging
         // a handshake / unknown-CA report can tell at a glance whether
@@ -561,6 +568,7 @@ impl DatabricksHttpClient {
             config,
             auth_provider: OnceLock::new(),
             retry_configs,
+            revocation,
         })
     }
 
@@ -573,8 +581,9 @@ impl DatabricksHttpClient {
     fn build_reqwest_client(
         config: &HttpClientConfig,
         redirect: reqwest::redirect::Policy,
+        revocation: Option<RevocationPolicy>,
     ) -> Result<Client> {
-        check_revocation_support(&config.tls)?;
+        check_revocation_support(&config.tls, revocation)?;
         let mut builder = Client::builder()
             .connect_timeout(config.connect_timeout)
             // `read_timeout` is a historical name; reqwest applies this as
@@ -763,11 +772,12 @@ impl DatabricksHttpClient {
         // With revocation on, the verifier replaces reqwest's trust roots and
         // identity. Those were already validated above.
         #[cfg(feature = "tls-rustls")]
-        if let Some(accept_undetermined) = revocation_policy(&config.tls) {
+        // `allow_self_signed` turns revocation off, as Simba does.
+        if let Some(policy) = revocation.filter(|_| config.tls.allow_self_signed != Some(true)) {
             builder = builder.use_preconfigured_tls(super::tls_revocation::client_config(
                 &config.tls,
                 &config.proxy,
-                accept_undetermined,
+                policy.accept_undetermined,
             )?);
         }
 
@@ -876,7 +886,11 @@ impl DatabricksHttpClient {
     /// `azure_tenant_id` (which skips discovery entirely). A single hop is
     /// sufficient for discovery, so no retry is attempted here.
     pub async fn first_redirect_location(&self, url: &str) -> Result<Option<String>> {
-        let client = Self::build_reqwest_client(&self.config, reqwest::redirect::Policy::none())?;
+        let client = Self::build_reqwest_client(
+            &self.config,
+            reqwest::redirect::Policy::none(),
+            self.revocation,
+        )?;
         let response = client.get(url).send().await.map_err(|e| {
             Error::network_error().message(format!("Redirect-probe request to {url} failed: {e}"))
         })?;

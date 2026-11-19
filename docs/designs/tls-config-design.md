@@ -254,6 +254,7 @@ The Rust driver uses `databricks.http.tls.*` while the C# driver uses `adbc.http
 ### Scope Exclusions
 
 - **Certificate revocation mode**: implemented in the kernel's tls-rustls verifier (CRL checks, opt-in, default off), not through reqwest. The ADBC `adbc.http_options.tls.revocation_mode` mapping is out of scope by the user's decision, so the ADBC driver gets no mapping.
+- **Revocation and runtime flavor**: the rustls verifier is synchronous, so a handshake with revocation on waits, up to one 10 s budget per chain, for the CRLs it needs. The kernel's own runtimes are multi-thread (C ABI, telemetry, pyo3, napi). Only an external caller that drives the kernel on its own `current_thread` runtime can be stalled by that wait.
 - **Client certificates (mTLS)**: Not needed per current requirements. Could be added later via `reqwest::ClientBuilder::identity()`.
 - **TLS version pinning**: Not needed. reqwest/native-tls negotiate the highest supported version automatically.
 
