@@ -16,6 +16,8 @@ use crate::auth::PersonalAccessToken;
 use crate::client::{
     build_retry_configs, DatabricksHttpClient, HttpClientConfig, RequestType, RetryConfig,
 };
+use crate::config::{AuthConfig, HttpConfig, TelemetryConfig, TlsConfig};
+use crate::Session;
 use bytes::Bytes;
 use http::Version;
 use rustls::pki_types::PrivatePkcs8KeyDer;
@@ -26,6 +28,8 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_rustls::TlsAcceptor;
+
+use super::{resolve_http2, ProxyConfig};
 
 struct HttpsServer {
     url: String,
@@ -87,7 +91,7 @@ impl HttpsServer {
                                         .body(())
                                         .unwrap();
                                     response.send_response(response_head, false).unwrap()
-                                        .send_data(Bytes::from_static(b"ok"), true)
+                                        .send_data(Bytes::from_static(br#"{"session_id":"http2-test"}"#), true)
                                         .unwrap();
                                 }
                             } else {
@@ -101,7 +105,7 @@ impl HttpsServer {
                                 }
                                 versions.send(Version::HTTP_11).unwrap();
                                 let redirect = request.starts_with(b"GET /redirect ");
-                                let body = "ok";
+                                let body = r#"{"session_id":"http2-test"}"#;
                                 let response = format!(
                                     "HTTP/1.1 {}\r\nLocation: https://example.invalid/authorize\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                                     if redirect { "302 Found" } else { "200 OK" }, body.len(), body
@@ -159,6 +163,10 @@ impl HttpsServer {
 
 #[tokio::test]
 async fn https_negotiates_http2_with_http1_fallback_and_opt_out() {
+    assert!(
+        resolve_http2(true, &ProxyConfig::default(), |key| std::env::var_os(key)),
+        "unset HTTP(S)_PROXY/ALL_PROXY and lowercase equivalents to test direct HTTP/2"
+    );
     for (server_http2, enabled, expected) in [
         (true, true, Version::HTTP_2),
         (false, true, Version::HTTP_11),
@@ -183,6 +191,41 @@ async fn https_negotiates_http2_with_http1_fallback_and_opt_out() {
         );
         server.assert_version(expected).await;
     }
+}
+
+#[tokio::test]
+async fn session_http2_opt_out_reaches_the_first_request() {
+    assert!(
+        resolve_http2(true, &ProxyConfig::default(), |key| std::env::var_os(key)),
+        "unset HTTP(S)_PROXY/ALL_PROXY and lowercase equivalents to test direct HTTP/2"
+    );
+    let mut server = HttpsServer::start(true).await;
+    let session = Session::builder()
+        .http_path(&server.url, "/sql/1.0/warehouses/test")
+        .auth(AuthConfig::Pat {
+            token: "test-token".into(),
+            identity_federation_client_id: None,
+        })
+        .http(HttpConfig {
+            http2_enabled: false,
+            request_timeout: Duration::from_secs(5),
+            overall_timeout: Duration::from_secs(5),
+            retry_max_retries: 0,
+            ..HttpConfig::default()
+        })
+        .tls(TlsConfig {
+            custom_ca_cert: Some(server.certificate.clone()),
+            ..TlsConfig::default()
+        })
+        .telemetry(TelemetryConfig {
+            enabled: Some(false),
+            ..TelemetryConfig::default()
+        })
+        .open()
+        .await
+        .unwrap();
+    server.assert_version(Version::HTTP_11).await;
+    session.close().await.unwrap();
 }
 
 async fn tunnel<S: AsyncRead + AsyncWrite + Unpin>(
@@ -241,8 +284,6 @@ async fn https_uses_http1_through_an_https_proxy() {
 
 #[test]
 fn resolves_http2_from_request_and_proxy_configuration() {
-    use super::{resolve_http2, ProxyConfig};
-
     for (requested, url, bypass, expected) in [
         (true, None, None, true),
         (false, None, None, false),

@@ -72,7 +72,6 @@ Canonical `adbc.databricks.*` names take precedence over compatibility aliases.
 HTTPS requests negotiate HTTP/2 with HTTP/1.1 fallback by default. Set
 `adbc.databricks.http.http2_enabled` to `false` to force HTTP/1.1 for session
 HTTPS traffic. Configured proxies force HTTP/1.1, including bypassed destinations.
-Telemetry may reuse an earlier session's HTTP client for the same host.
 
 ## Authentication
 

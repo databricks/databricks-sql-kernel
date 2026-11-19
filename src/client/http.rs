@@ -963,6 +963,15 @@ impl DatabricksHttpClient {
                 Error::invalid_argument().message(format!("Failed to build request: {e}"))
             })?;
 
+            debug!(
+                "{:?}: {} {} (attempt {}/{})",
+                request_type,
+                method,
+                url.as_str().split('?').next().unwrap_or_default(),
+                attempts,
+                max_attempts
+            );
+
             match self.client.execute(request).await {
                 Ok(response) => {
                     let status = response.status();
@@ -970,10 +979,6 @@ impl DatabricksHttpClient {
                         request_type = ?request_type,
                         host = ?response.url().host_str(),
                         http_version = ?response.version(),
-                        %method,
-                        url = url.as_str().split('?').next().unwrap_or_default(),
-                        attempt = attempts,
-                        max_attempts,
                         status = status.as_u16(),
                         "received HTTP response"
                     );
@@ -1054,14 +1059,6 @@ impl DatabricksHttpClient {
                     ));
                 }
                 Err(mut e) => {
-                    debug!(
-                        "{:?}: {} {} (attempt {}/{})",
-                        request_type,
-                        method,
-                        url.as_str().split('?').next().unwrap_or_default(),
-                        attempts,
-                        max_attempts
-                    );
                     // reqwest's Display prints the request URL; a presigned URL's query is its credential.
                     if let Some(url) = e.url_mut() {
                         url.set_query(None);

@@ -766,13 +766,11 @@ pub struct HttpConfig {
     /// Retrying stops once cumulative elapsed time exceeds this.
     pub overall_timeout: Duration,
 
-    /// Connection pool size (max idle warm sockets per remote host).
-    ///
-    /// Defaults to `100`, matching the JDBC driver's `HttpConnectionPoolSize`
-    /// default. Raise this for workloads that burst many concurrent
-    /// `executeStatement` calls or CloudFetch chunk downloads against a
-    /// single host; too low a value forces fresh TLS handshakes when the
-    /// pool fills.
+    /// Maximum idle connections retained per host, defaulting to `100`,
+    /// matching the JDBC driver's `HttpConnectionPoolSize`.
+    /// Higher values preserve more warm HTTP/1.1 connections between bursts.
+    /// HTTP/2 requests multiplex on a shared connection; this does not
+    /// limit active requests or HTTP/2 streams.
     pub pool_max_idle_per_host: usize,
 
     /// Minimum backoff wait between retry attempts. Also the floor for

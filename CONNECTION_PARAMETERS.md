@@ -139,7 +139,7 @@ a proxy is configured. They do not expose a protocol opt-out.
 | `http2_enabled` | HTTP/2 with HTTP/1.1 fallback; `false` forces HTTP/1.1. | `true` |
 | `request_timeout` | Per-request timeout (connect + body). | `120s` |
 | `overall_timeout` | Maximum total time across retries for one logical RPC. | `900s` |
-| `pool_max_idle_per_host` | Connection-pool size (max idle warm sockets per host). Raise for bursty concurrent workloads. | `100` |
+| `pool_max_idle_per_host` | Maximum idle connections retained per host. HTTP/1.1 concurrency can use multiple sockets; HTTP/2 multiplexes requests on a shared connection. This does not limit active requests or HTTP/2 streams. | `100` |
 | `retry_min_wait` | Minimum backoff between retries; also the floor for a server `Retry-After` and the base of exponential backoff (`min_wait × 2^attempt`). | `1s` |
 | `retry_max_wait` | Maximum backoff between retries; caps both the exponential backoff and a server `Retry-After`. | `60s` |
 | `retry_max_retries` | Max retries **after** the first attempt — a request is tried at most `retry_max_retries + 1` times. | `5` (→ 6 total attempts) |
