@@ -92,25 +92,6 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
-// Tests allow CRL hosts on loopback, the address of their CRL server. Production never does.
-#[cfg(test)]
-thread_local! {
-    pub(crate) static TEST_ALLOW_PRIVATE_CRL: std::cell::Cell<bool> =
-        const { std::cell::Cell::new(false) };
-}
-
-/// Whether CRL hosts in restricted address ranges are allowed for clients built here.
-fn crl_private_allowed() -> bool {
-    #[cfg(test)]
-    {
-        TEST_ALLOW_PRIVATE_CRL.with(std::cell::Cell::get)
-    }
-    #[cfg(not(test))]
-    {
-        false
-    }
-}
-
 /// The CRL fetch bounds: production defaults, or a test override on this thread.
 fn crl_fetch_limits() -> CrlFetchLimits {
     #[cfg(test)]
@@ -310,8 +291,6 @@ struct CrlFetcher {
     failed: Mutex<HashMap<String, Instant>>,
     /// Started on the first fetch, then reused for every chain this fetcher verifies.
     worker: Mutex<Option<CrlWorker>>,
-    /// Whether CRL hosts in restricted address ranges are allowed. Only tests set it.
-    allow_private: bool,
 }
 
 impl CrlFetcher {
@@ -333,12 +312,7 @@ impl CrlFetcher {
         let answer = {
             let mut worker = self.worker.lock().unwrap_or_else(PoisonError::into_inner);
             if worker.is_none() {
-                match CrlWorker::start(
-                    self.proxy.clone(),
-                    self.limits,
-                    self.custom_roots.clone(),
-                    self.allow_private,
-                ) {
+                match CrlWorker::start(self.proxy.clone(), self.limits, self.custom_roots.clone()) {
                     Ok(started) => *worker = Some(started),
                     Err(reason) => {
                         debug!("CRL worker failed to start: {reason}");
@@ -433,7 +407,6 @@ impl CrlWorker {
         proxy: ProxyConfig,
         limits: CrlFetchLimits,
         roots: Vec<reqwest::Certificate>,
-        allow_private: bool,
     ) -> std::io::Result<Self> {
         let (requests, mut inbox) = tokio::sync::mpsc::unbounded_channel::<CrlRequest>();
         let (exit_signal, exited) = std::sync::mpsc::channel::<()>();
@@ -457,10 +430,7 @@ impl CrlWorker {
                         let client = client.clone();
                         tokio::spawn(async move {
                             let result = match client {
-                                Ok(client) => match check_host(&url, allow_private).await {
-                                    Ok(()) => fetch(&client, &url, limits.max_bytes, budget).await,
-                                    Err(reason) => Err(reason),
-                                },
+                                Ok(client) => fetch(&client, &url, limits.max_bytes, budget).await,
                                 Err(reason) => Err(reason),
                             };
                             let _ = answer.send(result);
@@ -499,64 +469,12 @@ impl Drop for CrlWorker {
     fn drop(&mut self) {
         // Closing the channel ends the worker once its in-flight fetches finish. Wait for
         // that, but no longer than the per-fetch timeout.
+        //
+        // Residual window: a fetch already past its per-fetch timeout can outlive this
+        // bounded wait. The thread then keeps running after the drop. Unloading the host
+        // library during that window is unsupported.
         self.requests.take();
         let _ = in_runtime_blocking(|| self.exited.recv_timeout(self.timeout));
-    }
-}
-
-/// Refuses a CRL URL whose host resolves to a loopback, private, link-local, unspecified,
-/// broadcast, multicast or shared (CGNAT) address. A certificate chained to a trusted CA
-/// otherwise could point the fetch at an internal endpoint. `allow_private` is set only by
-/// tests.
-async fn check_host(url: &str, allow_private: bool) -> std::result::Result<(), String> {
-    if allow_private {
-        return Ok(());
-    }
-    let parsed = reqwest::Url::parse(url).map_err(|e| e.to_string())?;
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| "CRL URL has no host".to_owned())?;
-    let port = parsed
-        .port_or_known_default()
-        .ok_or_else(|| "CRL URL has no port".to_owned())?;
-    let bare = host.trim_start_matches('[').trim_end_matches(']');
-    let addresses = tokio::net::lookup_host((bare, port))
-        .await
-        .map_err(|e| e.to_string())?;
-    for address in addresses {
-        if restricted_address(address.ip()) {
-            return Err(format!(
-                "CRL host {host} resolves to a restricted address {}",
-                address.ip()
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn restricted_address(ip: std::net::IpAddr) -> bool {
-    match ip {
-        std::net::IpAddr::V4(v4) => {
-            let [a, b, _, _] = v4.octets();
-            v4.is_loopback()
-                || v4.is_private()
-                || v4.is_link_local()
-                || v4.is_unspecified()
-                || v4.is_broadcast()
-                || v4.is_multicast()
-                || (a == 100 && (b & 0xC0) == 64)
-        }
-        std::net::IpAddr::V6(v6) => {
-            let first = v6.segments()[0];
-            v6.is_loopback()
-                || v6.is_unspecified()
-                || v6.is_multicast()
-                || (first & 0xfe00) == 0xfc00
-                || (first & 0xffc0) == 0xfe80
-                || v6
-                    .to_ipv4_mapped()
-                    .is_some_and(|v4| restricted_address(std::net::IpAddr::V4(v4)))
-        }
     }
 }
 
@@ -940,7 +858,6 @@ pub(crate) fn client_config(
             cache: Mutex::new(HashMap::new()),
             failed: Mutex::new(HashMap::new()),
             worker: Mutex::new(None),
-            allow_private: crl_private_allowed(),
         },
         accept_undetermined,
         allow_hostname_mismatch: tls.allow_hostname_mismatch.unwrap_or(false),

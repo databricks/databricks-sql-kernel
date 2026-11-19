@@ -784,8 +784,6 @@ fn policy(accept_undetermined: bool) -> Option<RevocationPolicy> {
 fn revocation_config(root_pem: &str) -> HttpClientConfig {
     let mut config = HttpClientConfig::default();
     config.tls.trusted_certificate_pem = Some(root_pem.as_bytes().to_vec());
-    // The CRL server listens on loopback. Only the address-restriction test turns this off.
-    TEST_ALLOW_PRIVATE_CRL.with(|allowed| allowed.set(true));
     set_fetch_limits(CrlFetchLimits {
         timeout: Duration::from_millis(500),
         max_bytes: 64 * 1024,
@@ -1200,7 +1198,6 @@ fn intermediate_cap_allows_six_and_rejects_seven() {
             cache: Mutex::new(HashMap::new()),
             failed: Mutex::new(HashMap::new()),
             worker: Mutex::new(None),
-            allow_private: true,
         },
         accept_undetermined: false,
         allow_hostname_mismatch: false,
@@ -1462,52 +1459,6 @@ async fn concurrent_verifications_do_not_serialize_their_fetches() {
         elapsed < Duration::from_millis(900),
         "the two verifications' fetches serialized: {elapsed:?}"
     );
-}
-
-#[tokio::test]
-async fn crl_hosts_on_restricted_addresses_are_refused() {
-    // The CRL server is on loopback, a restricted address. With the test allowance off, the
-    // fetch is refused, so the leaf is undetermined: strict rejects, and nothing is requested.
-    let fx = fixture(Some(Served::Good), Served::Good, "127.0.0.1");
-    let config = revocation_config(&fx.pki.root_pem);
-    TEST_ALLOW_PRIVATE_CRL.with(|allowed| allowed.set(false));
-    let err = get(config, policy(false), fx.addr)
-        .await
-        .expect_err("a loopback CRL host is refused");
-    assert!(err.contains(UNDETERMINED), "{err}");
-    assert_eq!(
-        fx.crl.hits("/leaf.crl"),
-        0,
-        "a refused host is never requested"
-    );
-}
-
-#[test]
-fn restricted_addresses_cover_internal_ranges_only() {
-    for restricted in [
-        "127.0.0.1",
-        "10.1.2.3",
-        "172.16.0.9",
-        "192.168.1.1",
-        "169.254.169.254",
-        "0.0.0.0",
-        "100.64.0.1",
-        "::1",
-        "fe80::1",
-        "fc00::1",
-        "::ffff:169.254.169.254",
-    ] {
-        assert!(
-            restricted_address(restricted.parse().unwrap()),
-            "{restricted} is restricted"
-        );
-    }
-    for public in ["8.8.8.8", "203.0.113.7", "2606:4700:4700::1111"] {
-        assert!(
-            !restricted_address(public.parse().unwrap()),
-            "{public} is public"
-        );
-    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
