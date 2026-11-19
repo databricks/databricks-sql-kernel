@@ -29,7 +29,7 @@ use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Lower-cased fragment of rustls's `UnknownRevocationStatus` error text.
 const UNDETERMINED: &str = "unknownrevocationstatus";
@@ -466,15 +466,26 @@ fn fixture(leaf: Option<Served>, intermediate: Served, san: &str) -> Fixture {
 /// A TLS server presenting the leaf chain. With `mtls`, it requires a client
 /// certificate that chains to the test root.
 fn spawn_tls_server(pki: &Pki, mtls: bool) -> SocketAddr {
+    let chain = vec![pki.leaf_der.clone(), pki.intermediate_der.clone()];
+    let mtls_root = mtls.then(|| pki.root_der.clone());
+    spawn_tls_chain(chain, pki.leaf_key_der.clone(), mtls_root)
+}
+
+/// A TLS server presenting `chain`, with the leaf key `key_der`. With `mtls_root`, it
+/// requires a client certificate that chains to that root.
+fn spawn_tls_chain(
+    chain: Vec<CertificateDer<'static>>,
+    key_der: Vec<u8>,
+    mtls_root: Option<CertificateDer<'static>>,
+) -> SocketAddr {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let builder = rustls::ServerConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .unwrap();
-    let chain = vec![pki.leaf_der.clone(), pki.intermediate_der.clone()];
-    let key = PrivatePkcs8KeyDer::from(pki.leaf_key_der.clone()).into();
-    let config = if mtls {
+    let key = PrivatePkcs8KeyDer::from(key_der).into();
+    let config = if let Some(root) = mtls_root {
         let mut roots = rustls::RootCertStore::empty();
-        roots.add(pki.root_der.clone()).unwrap();
+        roots.add(root).unwrap();
         let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
             .build()
             .unwrap();
@@ -921,5 +932,96 @@ async fn policy_off_and_accept_self_signed_skip_revocation() {
         fx.crl.hits("/leaf.crl"),
         0,
         "no CRL is fetched when revocation is off"
+    );
+}
+
+#[tokio::test]
+async fn unrelated_appended_certificate_is_never_fetched() {
+    // The server appends a certificate that no path needs, with its own distribution point.
+    let fx = fixture(Some(Served::Good), Served::Good, "127.0.0.1");
+    let other_issuer = Issuer::new(
+        ca_params("Unrelated Test CA", 9),
+        KeyPair::generate().unwrap(),
+    );
+    let other_key = KeyPair::generate().unwrap();
+    let mut params = CertificateParams::new(vec!["unrelated.invalid".to_owned()]).unwrap();
+    params.crl_distribution_points = vec![CrlDistributionPoint {
+        uris: vec![fx.crl.url("/unrelated.crl")],
+    }];
+    let unrelated = params
+        .signed_by(&other_key, &other_issuer)
+        .unwrap()
+        .der()
+        .clone();
+    fx.crl.set(
+        "/unrelated.crl",
+        route(
+            Served::Good,
+            &other_issuer,
+            "Unrelated Test CA",
+            9,
+            &other_issuer,
+        ),
+    );
+    let chain = vec![
+        fx.pki.leaf_der.clone(),
+        fx.pki.intermediate_der.clone(),
+        unrelated,
+    ];
+    let addr = spawn_tls_chain(chain, fx.pki.leaf_key_der.clone(), None);
+    get(revocation_config(&fx.pki.root_pem, false), addr)
+        .await
+        .expect("the good path verifies; the appended certificate is not on it");
+    assert_eq!(
+        fx.crl.hits("/unrelated.crl"),
+        0,
+        "an unneeded certificate's distribution point is never fetched"
+    );
+}
+
+#[test]
+fn same_name_certificate_with_another_key_is_not_a_trust_anchor() {
+    // Anchors match by subject and SPKI, as webpki matches them. The root's name with
+    // another key is not an anchor, so its distribution points are still checked.
+    let root_key = KeyPair::generate().unwrap();
+    let root_der = ca_params(ROOT_CN, 1)
+        .self_signed(&root_key)
+        .unwrap()
+        .der()
+        .clone();
+    let mut roots = RootCertStore::empty();
+    roots.add(root_der.clone()).unwrap();
+    let other_key = KeyPair::generate().unwrap();
+    let same_name_der = ca_params(ROOT_CN, 2)
+        .self_signed(&other_key)
+        .unwrap()
+        .der()
+        .clone();
+    let anchor = parse_cert(root_der.as_ref()).unwrap();
+    let same_name = parse_cert(same_name_der.as_ref()).unwrap();
+    assert!(
+        is_trust_anchor(&roots, &anchor),
+        "the anchor matches itself"
+    );
+    assert!(
+        !is_trust_anchor(&roots, &same_name),
+        "a same-name certificate with another key is not an anchor"
+    );
+}
+
+#[tokio::test]
+async fn one_timeout_budget_bounds_all_fetches_for_a_chain() {
+    // Both distribution points hang past the per-fetch timeout. The chain shares one
+    // budget, so the second fetch gets none and the check ends in about one timeout.
+    let fx = fixture(Some(Served::Timeout), Served::Timeout, "127.0.0.1");
+    let started = Instant::now();
+    let err = get(revocation_config(&fx.pki.root_pem, false), fx.addr)
+        .await
+        .expect_err("undetermined under strict");
+    let elapsed = started.elapsed();
+    assert!(err.contains(UNDETERMINED), "{err}");
+    assert!(
+        elapsed < Duration::from_millis(900),
+        "the fetches share one budget, but the check took {elapsed:?}"
     );
 }

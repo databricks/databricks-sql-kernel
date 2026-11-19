@@ -22,6 +22,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use der::asn1::{AnyRef, GeneralizedTime, UtcTime};
 use der::{Decode, Reader, SliceReader, Tagged};
@@ -40,6 +41,7 @@ use rustls::{
 
 use super::http::{CrlFetchLimits, ProxyConfig, TlsConfig};
 use crate::kernel_error::{Error, Result};
+use crate::klog::debug;
 
 const TAG_INTEGER: u8 = 0x02;
 const TAG_UTC_TIME: u8 = 0x17;
@@ -79,7 +81,8 @@ fn sequence(der: &[u8]) -> Option<Vec<(u8, &[u8])>> {
 /// The fields of a certificate that the revocation check needs.
 struct Cert<'a> {
     issuer: &'a [u8],
-    self_issued: bool,
+    subject: &'a [u8],
+    spki: &'a [u8],
     crl_uris: Vec<String>,
 }
 
@@ -90,6 +93,7 @@ fn parse_cert(der: &[u8]) -> Option<Cert<'_>> {
     let base = usize::from(fields.first()?.0 == TAG_CONTEXT_0);
     let issuer = fields.get(base + 2)?.1;
     let subject = fields.get(base + 4)?.1;
+    let spki = fields.get(base + 5)?.1;
     let mut crl_uris = Vec::new();
     if let Some(&(_, extensions)) = fields.iter().find(|f| f.0 == TAG_CONTEXT_3) {
         for (_, extension) in sequence(extensions)? {
@@ -101,8 +105,19 @@ fn parse_cert(der: &[u8]) -> Option<Cert<'_>> {
     }
     Some(Cert {
         issuer,
-        self_issued: issuer == subject,
+        subject,
+        spki,
         crl_uris,
+    })
+}
+
+/// Whether `cert` is one of the configured trust anchors. Matching is by subject
+/// and SPKI, as webpki matches anchors, so a same-name certificate with a different
+/// key is not an anchor.
+fn is_trust_anchor(roots: &RootCertStore, cert: &Cert<'_>) -> bool {
+    roots.roots.iter().any(|anchor| {
+        anchor.subject.as_ref() == cert.subject
+            && anchor.subject_public_key_info.as_ref() == cert.spki
     })
 }
 
@@ -206,6 +221,8 @@ type CachedCrl = (Arc<Vec<u8>>, u64);
 struct CrlFetcher {
     proxy: ProxyConfig,
     limits: CrlFetchLimits,
+    /// The connection's custom CA roots, so an HTTPS CRL endpoint behind that CA verifies.
+    custom_roots: Vec<reqwest::Certificate>,
     /// URL to (CRL bytes, nextUpdate in Unix seconds).
     cache: Mutex<HashMap<String, CachedCrl>>,
 }
@@ -213,7 +230,7 @@ struct CrlFetcher {
 impl CrlFetcher {
     /// The CRL at `url`, from cache while current, otherwise freshly fetched.
     /// `None` means the fetch failed. Only a CRL with a future `nextUpdate` is cached.
-    fn get(&self, url: &str, now: u64) -> Option<Arc<Vec<u8>>> {
+    fn get(&self, url: &str, now: u64, budget: Duration) -> Option<Arc<Vec<u8>>> {
         let cached = self
             .cache
             .lock()
@@ -225,11 +242,25 @@ impl CrlFetcher {
             return cached;
         }
         self.evict(url);
-        let der = Arc::new(fetch_blocking(
+        if budget.is_zero() {
+            return None;
+        }
+        let limits = CrlFetchLimits {
+            timeout: budget,
+            ..self.limits
+        };
+        let der = match fetch_blocking(
             self.proxy.clone(),
-            self.limits,
+            limits,
+            self.custom_roots.clone(),
             url.to_owned(),
-        )?);
+        ) {
+            Ok(der) => Arc::new(der),
+            Err(reason) => {
+                debug!("CRL fetch failed for {}: {reason}", redacted(url));
+                return None;
+            }
+        };
         if let Some(next) = parse_crl(&der)
             .and_then(|crl| crl.next_update)
             .filter(|next| now <= *next)
@@ -252,28 +283,41 @@ impl CrlFetcher {
 
 /// Runs one fetch on its own thread and runtime. The caller's runtime is never
 /// re-entered, so a current-thread caller cannot deadlock.
-fn fetch_blocking(proxy: ProxyConfig, limits: CrlFetchLimits, url: String) -> Option<Vec<u8>> {
+fn fetch_blocking(
+    proxy: ProxyConfig,
+    limits: CrlFetchLimits,
+    roots: Vec<reqwest::Certificate>,
+    url: String,
+) -> std::result::Result<Vec<u8>, String> {
     std::thread::spawn(move || {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .ok()?
-            .block_on(fetch(&proxy, &url, limits))
+            .map_err(|e| e.to_string())?
+            .block_on(fetch(&proxy, &url, limits, &roots))
     })
     .join()
-    .ok()
-    .flatten()
+    .unwrap_or_else(|_| Err("CRL fetch thread panicked".to_owned()))
 }
 
 /// One CRL download. It carries no auth or custom headers, goes through the
-/// connection's proxy, and is bounded by time, size and redirects.
-async fn fetch(proxy: &ProxyConfig, url: &str, limits: CrlFetchLimits) -> Option<Vec<u8>> {
+/// connection's proxy, trusts the connection's custom CA roots, and is bounded by
+/// time, size and redirects.
+async fn fetch(
+    proxy: &ProxyConfig,
+    url: &str,
+    limits: CrlFetchLimits,
+    roots: &[reqwest::Certificate],
+) -> std::result::Result<Vec<u8>, String> {
     let mut builder = reqwest::Client::builder()
         .connect_timeout(limits.timeout)
         .timeout(limits.timeout)
         .redirect(reqwest::redirect::Policy::limited(CRL_MAX_REDIRECTS));
+    for root in roots {
+        builder = builder.add_root_certificate(root.clone());
+    }
     if let Some(proxy_url) = &proxy.url {
-        let mut via = reqwest::Proxy::all(proxy_url).ok()?;
+        let mut via = reqwest::Proxy::all(proxy_url).map_err(|e| e.to_string())?;
         if let Some(username) = &proxy.username {
             via = via.basic_auth(username, proxy.password.as_deref().unwrap_or(""));
         }
@@ -287,22 +331,45 @@ async fn fetch(proxy: &ProxyConfig, url: &str, limits: CrlFetchLimits) -> Option
         }
         builder = builder.proxy(via);
     }
-    let mut response = builder.build().ok()?.get(url).send().await.ok()?;
-    if response.status() != StatusCode::OK
-        || response
-            .content_length()
-            .is_some_and(|len| len > limits.max_bytes as u64)
+    let client = builder.build().map_err(|e| e.to_string())?;
+    let mut response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| e.without_url().to_string())?;
+    if response.status() != StatusCode::OK {
+        return Err(format!("HTTP {}", response.status()));
+    }
+    if response
+        .content_length()
+        .is_some_and(|len| len > limits.max_bytes as u64)
     {
-        return None;
+        return Err("CRL larger than the size limit".to_owned());
     }
     let mut body = Vec::new();
-    while let Some(chunk) = response.chunk().await.ok()? {
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| e.without_url().to_string())?
+    {
         if body.len() + chunk.len() > limits.max_bytes {
-            return None;
+            return Err("CRL larger than the size limit".to_owned());
         }
         body.extend_from_slice(&chunk);
     }
-    Some(body)
+    Ok(body)
+}
+
+/// The URL with any userinfo removed, for logging.
+fn redacted(url: &str) -> String {
+    match reqwest::Url::parse(url) {
+        Ok(mut parsed) => {
+            let _ = parsed.set_username("");
+            let _ = parsed.set_password(None);
+            parsed.to_string()
+        }
+        Err(_) => "<unparsable URL>".to_owned(),
+    }
 }
 
 /// The server verifier: webpki for the chain, signatures and name, with CRLs.
@@ -333,6 +400,54 @@ impl RevocationVerifier {
     }
 }
 
+impl RevocationVerifier {
+    /// The indices of the presented intermediates on a path that webpki verifies. Subsets
+    /// are tried smallest first, and the first one that verifies is the path. An intermediate
+    /// the server adds that the path does not need is never returned, so its distribution
+    /// points are never fetched. More than six presented intermediates is rejected.
+    fn path_intermediates(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: UnixTime,
+    ) -> std::result::Result<Vec<usize>, rustls::Error> {
+        const MAX_PRESENTED: usize = 6;
+        let n = intermediates.len();
+        if n > MAX_PRESENTED {
+            return Err(rustls::Error::InvalidCertificate(
+                CertificateError::UnknownIssuer,
+            ));
+        }
+        for size in 0..=n {
+            for mask in 0_usize..(1 << n) {
+                if mask.count_ones() as usize != size {
+                    continue;
+                }
+                let picked: Vec<usize> = (0..n).filter(|i| mask & (1 << i) != 0).collect();
+                let subset: Vec<CertificateDer<'_>> =
+                    picked.iter().map(|&i| intermediates[i].clone()).collect();
+                if self
+                    .tolerate_name(self.signatures.verify_server_cert(
+                        end_entity,
+                        &subset,
+                        server_name,
+                        ocsp_response,
+                        now,
+                    ))
+                    .is_ok()
+                {
+                    return Ok(picked);
+                }
+            }
+        }
+        Err(rustls::Error::InvalidCertificate(
+            CertificateError::UnknownIssuer,
+        ))
+    }
+}
+
 impl ServerCertVerifier for RevocationVerifier {
     fn verify_server_cert(
         &self,
@@ -351,21 +466,27 @@ impl ServerCertVerifier for RevocationVerifier {
         ))?;
 
         let now_secs = now.as_secs();
+        let path =
+            self.path_intermediates(end_entity, intermediates, server_name, ocsp_response, now)?;
+        // One deadline bounds every fetch for this chain, so the total wait is at
+        // most one per-fetch timeout however many distribution points there are.
+        let deadline = Instant::now() + self.fetcher.limits.timeout;
         let mut crls = Vec::new();
         let mut used_urls = Vec::new();
         let mut undetermined = false;
-        for cert in std::iter::once(end_entity).chain(intermediates) {
+        for cert in std::iter::once(end_entity).chain(path.iter().map(|&i| &intermediates[i])) {
             let Some(parsed) = parse_cert(cert.as_ref()) else {
                 undetermined = true;
                 continue;
             };
             // Trust anchors are not revocation-checked (webpki does not check them either).
-            if parsed.self_issued {
+            if is_trust_anchor(&self.roots, &parsed) {
                 continue;
             }
             let mut covered = false;
             for url in &parsed.crl_uris {
-                let Some(der) = self.fetcher.get(url, now_secs) else {
+                let budget = deadline.saturating_duration_since(Instant::now());
+                let Some(der) = self.fetcher.get(url, now_secs, budget) else {
                     continue;
                 };
                 match classify(&der, parsed.issuer, now_secs) {
@@ -492,10 +613,13 @@ pub(crate) fn client_config(
     if let Some(pem) = &tls.trusted_certificate_pem {
         pems.push(pem.clone());
     }
+    // The same custom CAs, as reqwest certificates, for the CRL client.
+    let mut custom_roots = Vec::new();
     for pem in pems {
         for cert in CertificateDer::pem_slice_iter(&pem) {
             roots.add(cert.map_err(tls_error)?).map_err(tls_error)?;
         }
+        custom_roots.extend(reqwest::Certificate::from_pem_bundle(&pem).map_err(tls_error)?);
     }
 
     let roots = Arc::new(roots);
@@ -510,6 +634,7 @@ pub(crate) fn client_config(
         fetcher: CrlFetcher {
             proxy: proxy.clone(),
             limits: tls.crl_fetch_limits,
+            custom_roots,
             cache: Mutex::new(HashMap::new()),
         },
         accept_undetermined,

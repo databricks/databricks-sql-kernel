@@ -146,6 +146,7 @@ impl std::fmt::Debug for ProxyConfig {
 /// Relaxing any of these options should only be done in development/testing
 /// environments.
 #[derive(Clone, Default)]
+#[non_exhaustive]
 pub struct TlsConfig {
     /// Enable TLS for connections. When `false`, allows plain HTTP.
     /// Default: true (TLS enabled).
@@ -227,8 +228,12 @@ impl Default for CrlFetchLimits {
 
 /// Rejects a revocation request the backend cannot honour. Shared by session
 /// open (which must report `InvalidArgument` unwrapped) and the HTTP client.
+/// `allow_self_signed` turns revocation off, so it is not an error.
 pub(crate) fn check_revocation_support(tls: &TlsConfig) -> Result<()> {
-    if cfg!(feature = "tls-rustls") || tls.check_certificate_revocation != Some(true) {
+    if cfg!(feature = "tls-rustls")
+        || tls.check_certificate_revocation != Some(true)
+        || tls.allow_self_signed == Some(true)
+    {
         return Ok(());
     }
     Err(Error::invalid_argument()
@@ -278,6 +283,14 @@ impl std::fmt::Debug for TlsConfig {
             .field(
                 "client_key_pem",
                 &self.client_key_pem.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "check_certificate_revocation",
+                &self.check_certificate_revocation,
+            )
+            .field(
+                "accept_undetermined_certificate_revocation",
+                &self.accept_undetermined_certificate_revocation,
             )
             .finish()
     }
