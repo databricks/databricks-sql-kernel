@@ -38,16 +38,8 @@ ignore = [
     # type, so exercising the RSA load+sign path in tests has value.
     # Re-evaluate when `rsa` ships a constant-time stable release.
     "RUSTSEC-2023-0071",
-    # RUSTSEC-2026-0258 — "h2 unbounded empty DATA frames". A DoS advisory
-    # in `h2 0.4.15`, pulled in transitively via `hyper` <- `reqwest`
-    # (`cargo tree -i h2`); not a direct dependency and unrelated to this
-    # crate's code. 0.4.15 is already the latest 0.4.x (a `cargo update -p
-    # h2` is a no-op), so it cannot be cleared by a bump; clearing it needs
-    # an upstream `hyper`/`reqwest` release that requires the fixed `h2`.
-    # The advisory concerns a server-side frame-flood; the kernel is an
-    # HTTP *client* to Databricks SEA, so the attack surface is not exercised
-    # here. Pre-existing on `main` (fires against the shared reqwest stack,
-    # not this PR). Re-evaluate when the reqwest/hyper stack picks up the fix.
+    # The empty-DATA-frame flood affects HTTP/2 servers; the kernel only
+    # uses HTTP/2 as a client and runs no h2 server.
     "RUSTSEC-2026-0258",
 ]
 
