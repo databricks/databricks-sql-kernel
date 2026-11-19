@@ -92,6 +92,25 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
+// Tests allow CRL hosts on loopback, the address of their CRL server. Production never does.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static TEST_ALLOW_PRIVATE_CRL: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Whether CRL hosts in restricted address ranges are allowed for clients built here.
+fn crl_private_allowed() -> bool {
+    #[cfg(test)]
+    {
+        TEST_ALLOW_PRIVATE_CRL.with(std::cell::Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
 /// The CRL fetch bounds: production defaults, or a test override on this thread.
 fn crl_fetch_limits() -> CrlFetchLimits {
     #[cfg(test)]
@@ -291,6 +310,8 @@ struct CrlFetcher {
     failed: Mutex<HashMap<String, Instant>>,
     /// Started on the first fetch, then reused for every chain this fetcher verifies.
     worker: Mutex<Option<CrlWorker>>,
+    /// Whether CRL hosts in restricted address ranges are allowed. Only tests set it.
+    allow_private: bool,
 }
 
 impl CrlFetcher {
@@ -307,10 +328,17 @@ impl CrlFetcher {
         if budget.is_zero() || self.failed_recently(url) {
             return None;
         }
-        let fetched = {
+        // The lock covers only starting the worker and queuing the request. The wait for the
+        // answer happens after it is released, so concurrent verifications do not serialize.
+        let answer = {
             let mut worker = self.worker.lock().unwrap_or_else(PoisonError::into_inner);
             if worker.is_none() {
-                match CrlWorker::start(self.proxy.clone(), self.limits, self.custom_roots.clone()) {
+                match CrlWorker::start(
+                    self.proxy.clone(),
+                    self.limits,
+                    self.custom_roots.clone(),
+                    self.allow_private,
+                ) {
                     Ok(started) => *worker = Some(started),
                     Err(reason) => {
                         debug!("CRL worker failed to start: {reason}");
@@ -318,7 +346,15 @@ impl CrlFetcher {
                     }
                 }
             }
-            worker.as_ref()?.fetch(url, budget)
+            match worker.as_ref() {
+                Some(started) => started.submit(url, budget),
+                None => Err("CRL worker is not running".to_owned()),
+            }
+        };
+        let fetched = match answer {
+            Ok(received) => in_runtime_blocking(|| received.recv())
+                .unwrap_or_else(|_| Err("CRL worker stopped".to_owned())),
+            Err(reason) => Err(reason),
         };
         let der = match fetched {
             Ok(der) => Arc::new(der),
@@ -371,12 +407,19 @@ type CrlRequest = (
     std::sync::mpsc::Sender<std::result::Result<Vec<u8>, String>>,
 );
 
-/// The thread that runs a fetcher's CRL fetches: one current-thread runtime and one reqwest
-/// client, shared by all of them. Dropping the worker closes its request channel. The
-/// thread then exits once its queue is empty, and the drop does not wait for it, so it
-/// cannot run past a chain's deadline.
+/// The thread that runs a fetcher's CRL fetches. It has one current-thread runtime and one
+/// reqwest client. Each request runs as its own task, so concurrent fetches overlap.
+///
+/// Dropping the worker closes its request channel. The thread then finishes its in-flight
+/// fetches, each bounded by the per-fetch timeout, and the drop waits at most that long.
+/// Trade-off: if a fetch outlives the wait, the thread can still run after the drop. A
+/// host that unloads this library then could fault that thread. The wait keeps that window
+/// to a fetch that is already past its timeout.
 struct CrlWorker {
-    requests: std::sync::mpsc::Sender<CrlRequest>,
+    requests: Option<tokio::sync::mpsc::UnboundedSender<CrlRequest>>,
+    /// Disconnects when the thread has finished.
+    exited: std::sync::mpsc::Receiver<()>,
+    timeout: Duration,
 }
 
 impl std::fmt::Debug for CrlWorker {
@@ -390,46 +433,130 @@ impl CrlWorker {
         proxy: ProxyConfig,
         limits: CrlFetchLimits,
         roots: Vec<reqwest::Certificate>,
+        allow_private: bool,
     ) -> std::io::Result<Self> {
-        let (requests, inbox) = std::sync::mpsc::channel::<CrlRequest>();
-        // The JoinHandle is dropped, which detaches the thread.
+        let (requests, mut inbox) = tokio::sync::mpsc::unbounded_channel::<CrlRequest>();
+        let (exit_signal, exited) = std::sync::mpsc::channel::<()>();
         std::thread::Builder::new()
             .name("databricks-crl".to_owned())
             .stack_size(runtime_thread_stack_size(ambient_rust_min_stack()))
             .spawn(move || {
+                // Dropped when the thread ends, which disconnects `exited`.
+                let _exit_signal = exit_signal;
                 // The caller's runtime is never re-entered, so a current-thread caller
                 // cannot deadlock.
-                let runtime = tokio::runtime::Builder::new_current_thread()
+                let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
-                    .build();
+                    .build()
+                else {
+                    return;
+                };
                 let client = build_client(&proxy, limits, &roots);
-                for (url, budget, answer) in inbox {
-                    let result = match (&runtime, &client) {
-                        (Ok(runtime), Ok(client)) => {
-                            runtime.block_on(fetch(client, &url, limits.max_bytes, budget))
-                        }
-                        (Err(e), _) => Err(e.to_string()),
-                        (_, Err(e)) => Err(e.clone()),
-                    };
-                    let _ = answer.send(result);
-                }
+                runtime.block_on(async move {
+                    while let Some((url, budget, answer)) = inbox.recv().await {
+                        let client = client.clone();
+                        tokio::spawn(async move {
+                            let result = match client {
+                                Ok(client) => match check_host(&url, allow_private).await {
+                                    Ok(()) => fetch(&client, &url, limits.max_bytes, budget).await,
+                                    Err(reason) => Err(reason),
+                                },
+                                Err(reason) => Err(reason),
+                            };
+                            let _ = answer.send(result);
+                        });
+                    }
+                });
             })?;
-        Ok(Self { requests })
+        Ok(Self {
+            requests: Some(requests),
+            exited,
+            timeout: limits.timeout,
+        })
     }
 
-    /// Runs one fetch on the worker and waits for its answer. The wait is bounded by
-    /// `budget`, because the fetch itself is.
-    fn fetch(&self, url: &str, budget: Duration) -> std::result::Result<Vec<u8>, String> {
+    /// Queues one fetch. This does not wait for it, so the caller can release any lock
+    /// before it waits on the returned receiver.
+    fn submit(
+        &self,
+        url: &str,
+        budget: Duration,
+    ) -> std::result::Result<std::sync::mpsc::Receiver<std::result::Result<Vec<u8>, String>>, String>
+    {
         let (answer, received) = std::sync::mpsc::channel();
-        if self
+        let requests = self
             .requests
+            .as_ref()
+            .ok_or_else(|| "CRL worker is closed".to_owned())?;
+        requests
             .send((url.to_owned(), budget, answer))
-            .is_err()
-        {
-            return Err("CRL worker is not running".to_owned());
+            .map_err(|_| "CRL worker is not running".to_owned())?;
+        Ok(received)
+    }
+}
+
+impl Drop for CrlWorker {
+    fn drop(&mut self) {
+        // Closing the channel ends the worker once its in-flight fetches finish. Wait for
+        // that, but no longer than the per-fetch timeout.
+        self.requests.take();
+        let _ = in_runtime_blocking(|| self.exited.recv_timeout(self.timeout));
+    }
+}
+
+/// Refuses a CRL URL whose host resolves to a loopback, private, link-local, unspecified,
+/// broadcast, multicast or shared (CGNAT) address. A certificate chained to a trusted CA
+/// otherwise could point the fetch at an internal endpoint. `allow_private` is set only by
+/// tests.
+async fn check_host(url: &str, allow_private: bool) -> std::result::Result<(), String> {
+    if allow_private {
+        return Ok(());
+    }
+    let parsed = reqwest::Url::parse(url).map_err(|e| e.to_string())?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| "CRL URL has no host".to_owned())?;
+    let port = parsed
+        .port_or_known_default()
+        .ok_or_else(|| "CRL URL has no port".to_owned())?;
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    let addresses = tokio::net::lookup_host((bare, port))
+        .await
+        .map_err(|e| e.to_string())?;
+    for address in addresses {
+        if restricted_address(address.ip()) {
+            return Err(format!(
+                "CRL host {host} resolves to a restricted address {}",
+                address.ip()
+            ));
         }
-        in_runtime_blocking(|| received.recv())
-            .unwrap_or_else(|_| Err("CRL worker stopped".to_owned()))
+    }
+    Ok(())
+}
+
+fn restricted_address(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            let [a, b, _, _] = v4.octets();
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_multicast()
+                || (a == 100 && (b & 0xC0) == 64)
+        }
+        std::net::IpAddr::V6(v6) => {
+            let first = v6.segments()[0];
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || (first & 0xfe00) == 0xfc00
+                || (first & 0xffc0) == 0xfe80
+                || v6
+                    .to_ipv4_mapped()
+                    .is_some_and(|v4| restricted_address(std::net::IpAddr::V4(v4)))
+        }
     }
 }
 
@@ -813,6 +940,7 @@ pub(crate) fn client_config(
             cache: Mutex::new(HashMap::new()),
             failed: Mutex::new(HashMap::new()),
             worker: Mutex::new(None),
+            allow_private: crl_private_allowed(),
         },
         accept_undetermined,
         allow_hostname_mismatch: tls.allow_hostname_mismatch.unwrap_or(false),

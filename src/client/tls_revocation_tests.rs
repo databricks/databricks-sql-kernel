@@ -65,6 +65,8 @@ enum Served {
     Oversize,
     /// Distribution point is a closed port.
     Refused,
+    /// A usable CRL that arrives after half a second.
+    Slow,
     /// Distribution point is not http(s), so there is nothing to fetch.
     NonHttp,
     /// Distribution point is indirect (has a cRLIssuer), so it must be skipped.
@@ -396,6 +398,11 @@ fn route(
             status,
             body: Vec::new(),
             delay: Duration::ZERO,
+        },
+        Served::Slow => Route {
+            status: 200,
+            body: sign_crl(issuer, &[], CURRENT),
+            delay: Duration::from_millis(500),
         },
         Served::Timeout => Route {
             status: 200,
@@ -777,6 +784,8 @@ fn policy(accept_undetermined: bool) -> Option<RevocationPolicy> {
 fn revocation_config(root_pem: &str) -> HttpClientConfig {
     let mut config = HttpClientConfig::default();
     config.tls.trusted_certificate_pem = Some(root_pem.as_bytes().to_vec());
+    // The CRL server listens on loopback. Only the address-restriction test turns this off.
+    TEST_ALLOW_PRIVATE_CRL.with(|allowed| allowed.set(true));
     set_fetch_limits(CrlFetchLimits {
         timeout: Duration::from_millis(500),
         max_bytes: 64 * 1024,
@@ -1191,6 +1200,7 @@ fn intermediate_cap_allows_six_and_rejects_seven() {
             cache: Mutex::new(HashMap::new()),
             failed: Mutex::new(HashMap::new()),
             worker: Mutex::new(None),
+            allow_private: true,
         },
         accept_undetermined: false,
         allow_hostname_mismatch: false,
@@ -1421,6 +1431,94 @@ fn crl_cache_drops_expired_entries_and_stays_within_its_caps() {
     trim_cache(&mut big, 10);
     assert_eq!(big.len(), 2, "the byte cap keeps the cache under 16 MiB");
     assert!(!big.contains_key("big0"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_verifications_do_not_serialize_their_fetches() {
+    // Two handshakes verify at once, and each needs the same slow CRL. Serialized fetches
+    // take two half-second waits. Overlapping fetches take about one.
+    let fx = fixture(Some(Served::Slow), Served::Good, "127.0.0.1");
+    let config = revocation_config(&fx.pki.root_pem);
+    set_fetch_limits(CrlFetchLimits {
+        timeout: Duration::from_millis(2000),
+        max_bytes: 64 * 1024,
+    });
+    let http = client(config, policy(false));
+    let url = format!("https://{}/", fx.addr);
+    let started = Instant::now();
+    let first = tokio::spawn({
+        let inner = http.inner().clone();
+        let url = url.clone();
+        async move { inner.get(url).send().await.map(|_| ()) }
+    });
+    let second = tokio::spawn({
+        let inner = http.inner().clone();
+        async move { inner.get(url).send().await.map(|_| ()) }
+    });
+    first.await.unwrap().expect("first verification passes");
+    second.await.unwrap().expect("second verification passes");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_millis(900),
+        "the two verifications' fetches serialized: {elapsed:?}"
+    );
+}
+
+#[tokio::test]
+async fn crl_hosts_on_restricted_addresses_are_refused() {
+    // The CRL server is on loopback, a restricted address. With the test allowance off, the
+    // fetch is refused, so the leaf is undetermined: strict rejects, and nothing is requested.
+    let fx = fixture(Some(Served::Good), Served::Good, "127.0.0.1");
+    let config = revocation_config(&fx.pki.root_pem);
+    TEST_ALLOW_PRIVATE_CRL.with(|allowed| allowed.set(false));
+    let err = get(config, policy(false), fx.addr)
+        .await
+        .expect_err("a loopback CRL host is refused");
+    assert!(err.contains(UNDETERMINED), "{err}");
+    assert_eq!(
+        fx.crl.hits("/leaf.crl"),
+        0,
+        "a refused host is never requested"
+    );
+}
+
+#[test]
+fn restricted_addresses_cover_internal_ranges_only() {
+    for restricted in [
+        "127.0.0.1",
+        "10.1.2.3",
+        "172.16.0.9",
+        "192.168.1.1",
+        "169.254.169.254",
+        "0.0.0.0",
+        "100.64.0.1",
+        "::1",
+        "fe80::1",
+        "fc00::1",
+        "::ffff:169.254.169.254",
+    ] {
+        assert!(
+            restricted_address(restricted.parse().unwrap()),
+            "{restricted} is restricted"
+        );
+    }
+    for public in ["8.8.8.8", "203.0.113.7", "2606:4700:4700::1111"] {
+        assert!(
+            !restricted_address(public.parse().unwrap()),
+            "{public} is public"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fetch_inside_a_multi_thread_runtime_completes() {
+    // The verifier waits for its CRL inside `block_in_place` on a multi-thread runtime. No
+    // other test runs that branch.
+    let fx = fixture(Some(Served::Good), Served::Good, "127.0.0.1");
+    get(revocation_config(&fx.pki.root_pem), policy(false), fx.addr)
+        .await
+        .expect("good chain");
+    assert_eq!(fx.crl.hits("/leaf.crl"), 1);
 }
 
 #[test]
