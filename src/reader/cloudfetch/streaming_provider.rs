@@ -497,55 +497,38 @@ impl StreamingCloudFetchProvider {
     /// pre-merged during download (in background tasks), so each chunk
     /// typically yields a single large batch.
     pub async fn next_batch(&self) -> Result<Option<RecordBatch>> {
-        // Check for cancellation
-        if self.cancel_token.is_cancelled() {
-            return Err(Error::invalid_state().message("Operation cancelled"));
-        }
-
-        // Drain batch buffer first
-        if let Some(batch) = self.take_buffered_batch() {
-            return Ok(Some(batch));
-        }
-
-        // Buffer empty - need next chunk
-        let chunk_index = self.current_chunk_index.load(Ordering::Acquire);
-
-        // Check if we've reached end of stream
-        if self.is_at_end(chunk_index) {
-            debug!("End of stream reached at chunk {}", chunk_index);
-            return Ok(None);
-        }
-
-        // Wait for the chunk to be downloaded
-        self.wait_for_chunk(chunk_index).await?;
-
-        // Get the chunk and move batches to buffer
-        if self.release_downloaded_chunk(chunk_index) {
-            // Schedule more downloads
-            self.schedule_downloads().await;
+        loop {
             if self.cancel_token.is_cancelled() {
                 return Err(Error::invalid_state().message("Operation cancelled"));
             }
 
-            // Return first batch from buffer
             if let Some(batch) = self.take_buffered_batch() {
                 return Ok(Some(batch));
             }
-        }
 
-        // Check end of stream again
-        if self.end_of_stream.load(Ordering::Acquire) {
-            return Ok(None);
-        }
+            let chunk_index = self.current_chunk_index.load(Ordering::Acquire);
+            if self.is_at_end(chunk_index) {
+                debug!("End of stream reached at chunk {}", chunk_index);
+                return Ok(None);
+            }
 
-        // A terminal link-fetch failure that landed after the wait
-        // returned takes precedence over the generic "not found"
-        // message, so callers see the real cause deterministically.
-        if let Some(err) = self.terminal_error() {
-            return Err(err);
-        }
+            self.wait_for_chunk(chunk_index).await?;
+            if self.release_downloaded_chunk(chunk_index) {
+                self.schedule_downloads().await;
+                // An empty chunk can precede more data or a terminal error.
+                continue;
+            }
 
-        Err(Error::invalid_state().message(format!("Chunk {} not found after wait", chunk_index)))
+            if self.is_at_end(self.current_chunk_index.load(Ordering::Acquire)) {
+                return Ok(None);
+            }
+            if let Some(err) = self.terminal_error() {
+                return Err(err);
+            }
+
+            return Err(Error::invalid_state()
+                .message(format!("Chunk {} not found after wait", chunk_index)));
+        }
     }
 
     /// Return the next batch if it is already downloaded, without waiting for
@@ -2761,6 +2744,7 @@ mod tests {
             Buffer,
             ChunkRead,
             ChunkWrite,
+            EmptyChunkBeforeReady,
             EmptyShard,
             TerminalError,
             TerminalErrorAfterEmptyChunk,
@@ -2770,6 +2754,7 @@ mod tests {
             HeldLock::Buffer,
             HeldLock::ChunkRead,
             HeldLock::ChunkWrite,
+            HeldLock::EmptyChunkBeforeReady,
             HeldLock::EmptyShard,
             HeldLock::TerminalError,
             HeldLock::TerminalErrorAfterEmptyChunk,
@@ -2779,8 +2764,12 @@ mod tests {
                 HeldLock::TerminalError | HeldLock::TerminalErrorAfterEmptyChunk
             );
             let skipped = i64::from(matches!(held, HeldLock::TerminalErrorAfterEmptyChunk));
+            let data_index = i64::from(matches!(
+                held,
+                HeldLock::TerminalErrorAfterEmptyChunk | HeldLock::EmptyChunkBeforeReady
+            ));
             let chunks = Arc::new(DashMap::new());
-            if skipped > 0 {
+            if data_index > 0 {
                 chunks.insert(
                     0,
                     entry_with_state(create_test_link(0), ChunkState::Downloaded),
@@ -2788,7 +2777,7 @@ mod tests {
             }
             if !matches!(held, HeldLock::EmptyShard) {
                 let mut entry = entry_with_state(
-                    create_test_link(skipped),
+                    create_test_link(data_index),
                     if terminal {
                         ChunkState::Downloading
                     } else {
@@ -2796,7 +2785,7 @@ mod tests {
                     },
                 );
                 entry.batches = Some(vec![make_batch(&[1]), make_batch(&[2])]);
-                chunks.insert(skipped, entry);
+                chunks.insert(data_index, entry);
             }
             let provider = StreamingCloudFetchProvider::for_test_with_chunks(
                 Arc::new(MockLinkFetcher::new(2)),
@@ -2823,7 +2812,9 @@ mod tests {
                 HeldLock::Buffer => {
                     assert_pending(&provider, provider.current_batch_buffer.lock().unwrap())
                 }
-                HeldLock::ChunkRead => assert_pending(&provider, chunks.get(&0).unwrap()),
+                HeldLock::ChunkRead | HeldLock::EmptyChunkBeforeReady => {
+                    assert_pending(&provider, chunks.get(&0).unwrap())
+                }
                 HeldLock::ChunkWrite => assert_pending(&provider, chunks.get_mut(&0).unwrap()),
                 HeldLock::EmptyShard => assert_pending(&provider, chunks.entry(0)),
                 HeldLock::TerminalError | HeldLock::TerminalErrorAfterEmptyChunk => {
@@ -2858,10 +2849,10 @@ mod tests {
                     _ => vec![1, 2],
                 };
                 for value in expected {
-                    match provider.try_next_batch().unwrap() {
-                        TryNextBatch::Ready(batch) => assert_eq!(batch, make_batch(&[value])),
-                        _ => panic!("buffered batches must survive contention in order"),
-                    }
+                    assert_eq!(
+                        provider.next_batch().await.unwrap(),
+                        Some(make_batch(&[value]))
+                    );
                 }
                 assert!(matches!(
                     provider.try_next_batch().unwrap(),

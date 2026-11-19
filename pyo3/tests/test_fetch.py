@@ -79,7 +79,9 @@ def sql_api():
                                 }
                             ],
                         },
-                        "total_chunk_count": 2 if pending else 1,
+                        "total_chunk_count": (
+                            3 if state.mode == "cloud" else 2 if pending else 1
+                        ),
                         "total_row_count": count + (2 if pending else 0),
                     },
                     "result": {
@@ -101,7 +103,9 @@ def sql_api():
             elif self.command == "DELETE" and path == statement_path:
                 state.statement_closed.set()
             elif path == f"{statement_path}/result/chunks/1" and state.mode == "cloud":
-                response = {"external_links": [self.link(1)]}
+                response = {"external_links": [self.link(1), self.link(2)]}
+            elif path == "/storage/2":
+                response = arrow_bytes([[3, 4]])
             elif path in (f"{statement_path}/result/chunks/1", "/storage/1"):
                 state.chunk_requested.set()
                 if not state.release_chunk.wait(5):
@@ -112,7 +116,7 @@ def sql_api():
                         {"error_code": "NOT_FOUND", "message": "missing chunk"},
                     )
                 elif state.mode == "cloud":
-                    response = arrow_bytes([[3, 4]])
+                    response = arrow_bytes([])
                 else:
                     response = {
                         "chunk_index": 1,
@@ -133,13 +137,14 @@ def sql_api():
             self.wfile.write(encoded)
 
         def link(self, index):
+            batches = state.batches if index == 0 else [] if index == 1 else [[3, 4]]
             return {
                 "external_link": f"{state.host}/storage/{index}",
                 "chunk_index": index,
-                "row_offset": index * 2,
-                "row_count": 2,
-                "byte_count": len(arrow_bytes(state.batches if index == 0 else [[3, 4]])),
-                "next_chunk_index": 1 if index == 0 else None,
+                "row_offset": 0 if index == 0 else 2,
+                "row_count": 0 if index == 1 else 2,
+                "byte_count": len(arrow_bytes(batches)),
+                "next_chunk_index": index + 1 if index < 2 else None,
                 "expiration": "2099-01-01T00:00:00Z",
             }
 
@@ -240,9 +245,11 @@ def test_partial_or_failed_fetch_retains_explicit_cleanup(sql_api, mode):
         for _ in range(2):
             with pytest.raises(k.KernelError, match="404|missing chunk"):
                 result.fetch_next_batch()
+    assert not sql_api.statement_closed.is_set()
     result.close()
-    statement.close()
     assert sql_api.statement_closed.wait(5)
+    assert Counter(sql_api.requests)["DELETE", sql_api.statement_path] == 1
+    statement.close()
     assert Counter(sql_api.requests)["DELETE", sql_api.statement_path] == 1
 
 

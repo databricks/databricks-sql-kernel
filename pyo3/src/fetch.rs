@@ -160,6 +160,16 @@ mod tests {
         let entries = AtomicUsize::new(0);
         let pending = || {
             entries.fetch_add(1, Ordering::Relaxed);
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                Python::attach(|_| {
+                    let _ = sender.send(());
+                });
+            });
+            receiver
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("pending fallback held the GIL");
+            worker.join().unwrap();
             runtime.block_on(async { Ok(None) })
         };
         Python::initialize();
