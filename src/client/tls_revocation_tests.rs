@@ -1116,3 +1116,64 @@ fn signed_intermediate(
     params.crl_distribution_points = vec![CrlDistributionPoint { uris: vec![cdp] }];
     params.signed_by(key, issuer).unwrap().der().clone()
 }
+
+#[test]
+fn redacted_removes_userinfo_query_and_fragment() {
+    assert_eq!(
+        redacted("https://user:secret@crl.example.com/a.crl?token=abc#frag"),
+        "https://crl.example.com/a.crl"
+    );
+    assert_eq!(
+        redacted("http://crl.example.com/ca.crl"),
+        "http://crl.example.com/ca.crl"
+    );
+    assert_eq!(redacted("not a url"), "<unparsable URL>");
+}
+
+#[test]
+fn intermediate_cap_allows_six_and_rejects_seven() {
+    // Six presented intermediates pass the cap and reach path selection, whatever it then
+    // decides. Seven fail at the cap with a message that names the limit.
+    let fx = fixture(Some(Served::Good), Served::Good, "127.0.0.1");
+    let mut roots = RootCertStore::empty();
+    roots.add(fx.pki.root_der.clone()).unwrap();
+    let verifier = RevocationVerifier {
+        roots: Arc::new(roots.clone()),
+        provider: Arc::new(rustls::crypto::ring::default_provider()),
+        signatures: WebPkiServerVerifier::builder_with_provider(
+            Arc::new(roots),
+            Arc::new(rustls::crypto::ring::default_provider()),
+        )
+        .build()
+        .unwrap(),
+        fetcher: CrlFetcher {
+            proxy: ProxyConfig::default(),
+            limits: CrlFetchLimits::default(),
+            custom_roots: Vec::new(),
+            cache: Mutex::new(HashMap::new()),
+        },
+        accept_undetermined: false,
+        allow_hostname_mismatch: false,
+    };
+    let end = &fx.pki.leaf_der;
+    let server_name = ServerName::try_from("127.0.0.1").unwrap();
+    let now = UnixTime::now();
+
+    // Any outcome other than the cap error is fine here: the path search decides it.
+    let six = vec![fx.pki.intermediate_der.clone(); 6];
+    if let Err(six_error) = verifier.path_intermediates(end, &six, &server_name, &[], now) {
+        assert!(
+            !six_error.to_string().contains("supports at most"),
+            "six intermediates must pass the cap: {six_error}"
+        );
+    }
+
+    let seven = vec![fx.pki.intermediate_der.clone(); 7];
+    match verifier.path_intermediates(end, &seven, &server_name, &[], now) {
+        Err(rustls::Error::General(message)) => assert_eq!(
+            message,
+            "the server presented 7 intermediates; revocation checking supports at most 6"
+        ),
+        other => panic!("seven intermediates must fail at the cap, got {other:?}"),
+    }
+}
