@@ -1206,6 +1206,7 @@ mod tests {
         let err = provider
             .get_auth_header()
             .expect_err("no HTTP client to fetch a token with");
+        assert_eq!(err.code, Error::invalid_state().code);
         assert!(
             err.message.contains("no longer available"),
             "{}",
