@@ -14,6 +14,8 @@ layout, or npm publishing. Pure-kernel changes go in the root
 
 ### Added
 
+- `ConnectionOptions` accepts `checkCertificateRevocation` and `acceptUndeterminedRevocation` (both default off) to check the server chain's CRLs. Needs the `tls-rustls` kernel build, which this package uses.
+
 ### Changed
 
 ### Updated

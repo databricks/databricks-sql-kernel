@@ -13,6 +13,8 @@ changes go in the root `NEXT_CHANGELOG.md`.
 
 ### Added
 
+- `Session` accepts `tls_check_certificate_revocation` and `tls_accept_undetermined_revocation` (both default off) to check the server chain's CRLs. Needs the `tls-rustls` kernel build, which the wheel uses.
+
 ### Changed
 
 ### Updated

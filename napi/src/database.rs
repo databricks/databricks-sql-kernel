@@ -362,6 +362,16 @@ pub struct ConnectionOptions {
     /// kernel's TLS backends supply a PKCS#8 key (`BEGIN PRIVATE KEY`).
     /// Maps onto the kernel [`TlsConfig::client_key_pem`].
     pub client_key_pem: Option<Buffer>,
+    /// Check the server certificate chain's CRLs before connecting. Omitted
+    /// / `false` ⇒ off. Needs a `tls-rustls` kernel build; the kernel rejects
+    /// it at open on `tls-native`. Maps onto
+    /// [`TlsConfig::check_certificate_revocation`].
+    pub check_certificate_revocation: Option<bool>,
+    /// With `check_certificate_revocation`, accept a chain whose revocation
+    /// status cannot be determined (no CRL distribution point, unreachable
+    /// CRL). Omitted / `false` ⇒ strict. Maps onto
+    /// [`TlsConfig::accept_undetermined_certificate_revocation`].
+    pub accept_undetermined_revocation: Option<bool>,
     /// Extra HTTP headers to send on every request — the route for
     /// caller-supplied headers (the NodeJS driver's `customHeaders` and
     /// the composed `User-Agent`). Maps onto the kernel
@@ -608,6 +618,9 @@ fn build_tls_config(options: &ConnectionOptions) -> TlsConfig {
     if let Some(key) = &options.client_key_pem {
         tls.client_key_pem = Some(key.to_vec());
     }
+    // Revocation is opt-in: unset stays `None` (kernel default off).
+    tls.check_certificate_revocation = options.check_certificate_revocation;
+    tls.accept_undetermined_certificate_revocation = options.accept_undetermined_revocation;
     tls
 }
 
@@ -929,6 +942,8 @@ mod tests {
             azure_client_secret: None,
             azure_tenant_id: None,
             azure_workspace_resource_id: None,
+            check_certificate_revocation: None,
+            accept_undetermined_revocation: None,
             catalog: None,
             schema: None,
             session_conf: None,
@@ -1409,6 +1424,25 @@ mod tests {
             "hostname check must be skipped (hostname = false)"
         );
         assert_eq!(tls.custom_ca_cert.as_deref(), Some(PEM));
+    }
+
+    #[test]
+    fn tls_revocation_flags_map_onto_kernel_policy() {
+        // Unset means off; each flag passes straight through to the kernel.
+        let cases = [
+            (None, None, None, None),
+            (Some(true), None, Some(true), None),
+            (Some(true), Some(true), Some(true), Some(true)),
+            (Some(false), None, Some(false), None),
+        ];
+        for (check, accept, want_check, want_accept) in cases {
+            let mut o = base();
+            o.check_certificate_revocation = check;
+            o.accept_undetermined_revocation = accept;
+            let tls = build_tls_config(&o);
+            assert_eq!(tls.check_certificate_revocation, want_check);
+            assert_eq!(tls.accept_undetermined_certificate_revocation, want_accept);
+        }
     }
 
     #[test]
