@@ -550,11 +550,6 @@ impl Session {
             None
         };
 
-        // Build an HttpConfig only when the caller tuned transport options,
-        // compression, retry/backoff, or custom headers; otherwise leave the
-        // builder on its defaults (120s request timeout,
-        // 1s/60s/5-retries, no extra headers).
-        //
         // `retry_max_attempts` is the **total** number of attempts
         // (matching the connector's `_retry_stop_after_attempts_count`
         // and JDBC's count semantics). The kernel's `retry_max_retries`

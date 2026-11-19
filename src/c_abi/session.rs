@@ -613,7 +613,7 @@ pub unsafe extern "C" fn kernel_session_config_set_custom_header(
 }
 
 /// Negotiate HTTP/2 for HTTPS requests by default, with HTTP/1.1 fallback.
-/// Set `enabled` to `false` to use HTTP/1.1 only.
+/// Setting `enabled` to `false` or configuring a proxy forces HTTP/1.1.
 ///
 /// # Safety
 /// `config` must be a live config handle.

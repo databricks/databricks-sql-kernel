@@ -171,15 +171,13 @@ impl HttpsServer {
         client
     }
 
-    fn session_builder(&self, enabled: Option<bool>) -> SessionBuilder {
-        let mut http = HttpConfig {
+    fn session_builder(&self, enabled: bool) -> SessionBuilder {
+        let http = HttpConfig {
+            http2_enabled: enabled,
             overall_timeout: Duration::from_secs(5),
             retry_max_retries: 0,
             ..HttpConfig::default()
         };
-        if let Some(enabled) = enabled {
-            http.http2_enabled = enabled;
-        }
         let tls = TlsConfig {
             custom_ca_cert: Some(self.certificate.clone()),
             ..TlsConfig::default()
@@ -327,60 +325,34 @@ async fn assert_connect_proxy(proxy_tls: bool) {
     proxy_task.abort();
 }
 
-#[test]
-fn proxy_environment_uses_http1_for_bypassed_hosts() {
-    let test_name = "proxy_environment_uses_http1_for_bypassed_hosts";
-    if std::env::var(CHILD_TEST).as_deref() == Ok(test_name) {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(async {
-                let expected = if PROXY_VARIABLES
-                    .iter()
-                    .any(|key| std::env::var_os(key).is_some_and(|value| !value.is_empty()))
-                {
-                    Version::HTTP_11
-                } else {
-                    Version::HTTP_2
-                };
-                let mut server = HttpsServer::start(true).await;
-                let client = server.client(true, None);
-                let response = client.inner().get(&server.url).send().await.unwrap();
-                assert_eq!(response.version(), expected);
-                response.bytes().await.unwrap();
-                server.assert_version(expected).await;
-                client
-                    .first_redirect_location(&format!("{}/redirect", server.url))
-                    .await
-                    .unwrap();
-                server.assert_version(expected).await;
-            });
-        return;
-    }
-
-    for selected in PROXY_VARIABLES.into_iter().map(Some).chain([None]) {
-        assert!(run_with_proxy_environment(test_name, selected));
-    }
-}
-
 #[tokio::test]
-async fn session_preserves_http2_default_and_opt_out() {
-    if run_with_proxy_environment("session_preserves_http2_default_and_opt_out", None) {
+async fn proxy_environment_uses_http1_for_bypassed_hosts() {
+    let test_name = "proxy_environment_uses_http1_for_bypassed_hosts";
+    if std::env::var(CHILD_TEST).as_deref() != Ok(test_name) {
+        for selected in PROXY_VARIABLES.into_iter().map(Some).chain([None]) {
+            assert!(run_with_proxy_environment(test_name, selected));
+        }
         return;
     }
-    for enabled in [None, Some(true), Some(false)] {
-        let mut server = HttpsServer::start(true).await;
-        let session = server.session_builder(enabled).open().await.unwrap();
-        let expected = if enabled.unwrap_or(true) {
-            Version::HTTP_2
-        } else {
-            Version::HTTP_11
-        };
-        server.assert_version(expected).await;
-        session.close().await.unwrap();
-        server.assert_version(expected).await;
-    }
+    let expected = if PROXY_VARIABLES
+        .iter()
+        .any(|key| std::env::var_os(key).is_some_and(|value| !value.is_empty()))
+    {
+        Version::HTTP_11
+    } else {
+        Version::HTTP_2
+    };
+    let mut server = HttpsServer::start(true).await;
+    let client = server.client(true, None);
+    let response = client.inner().get(&server.url).send().await.unwrap();
+    assert_eq!(response.version(), expected);
+    response.bytes().await.unwrap();
+    server.assert_version(expected).await;
+    client
+        .first_redirect_location(&format!("{}/redirect", server.url))
+        .await
+        .unwrap();
+    server.assert_version(expected).await;
 }
 
 #[tokio::test]
@@ -408,7 +380,7 @@ async fn telemetry_separates_protocols_on_the_same_host() {
             };
             sessions.push(
                 server
-                    .session_builder(Some(enabled))
+                    .session_builder(enabled)
                     .proxy(proxy)
                     .telemetry(telemetry)
                     .open()

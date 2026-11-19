@@ -538,12 +538,8 @@ impl DatabricksHttpClient {
         })
     }
 
-    /// Build a `reqwest::Client` from `config` with the given redirect policy.
-    ///
-    /// Factored out of `new()` so tenant discovery can obtain a client that
-    /// does NOT follow redirects (to read the first `/aad/auth` hop's
-    /// `Location`) while still honouring the workspace's TLS, proxy, timeout,
-    /// and user-agent configuration.
+    /// Discovery needs the first redirect's `Location` while retaining the same
+    /// protocol, TLS, proxy, timeout and user-agent settings as normal requests.
     fn build_reqwest_client(
         config: &HttpClientConfig,
         http2_enabled: bool,

@@ -229,17 +229,9 @@ enum CircuitBreakerState {
     HalfOpen,
 }
 
-/// Process-global registry of circuit breakers.
-///
-/// Entries are never evicted, so the map grows for the process lifetime. This is
-/// bounded in practice: a kernel process connects to a small, stable set of
-/// Databricks workspaces, and each entry is tiny (a client key plus an
-/// `Arc<CircuitBreaker>` holding a `Mutex<CircuitState>`). If a future
-/// deployment ever exhibits high host cardinality, add an LRU bound or
-/// idle-based eviction here.
-///
-/// Match the cached client's identity so failures on one protocol policy
-/// cannot suppress another policy's telemetry.
+/// Protocol policies use separate breakers so one policy's failures cannot
+/// suppress the other's telemetry. Entries remain for the process lifetime;
+/// processes typically connect to a small, stable set of workspaces.
 #[derive(Default)]
 struct CircuitBreakerManager {
     breakers: Mutex<HashMap<(TelemetryClientKey, CircuitBreakerConfig), Arc<CircuitBreaker>>>,
