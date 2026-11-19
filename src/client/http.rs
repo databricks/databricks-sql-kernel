@@ -146,7 +146,6 @@ impl std::fmt::Debug for ProxyConfig {
 /// Relaxing any of these options should only be done in development/testing
 /// environments.
 #[derive(Clone, Default)]
-#[non_exhaustive]
 pub struct TlsConfig {
     /// Enable TLS for connections. When `false`, allows plain HTTP.
     /// Default: true (TLS enabled).
@@ -203,9 +202,6 @@ pub struct TlsConfig {
     pub check_certificate_revocation: Option<bool>,
     /// With revocation checking on, accept an undetermined status.
     pub accept_undetermined_certificate_revocation: Option<bool>,
-    /// Bounds on each CRL fetch. Production defaults.
-    #[cfg(feature = "tls-rustls")]
-    pub(crate) crl_fetch_limits: CrlFetchLimits,
 }
 
 /// Bounds applied to each CRL HTTP fetch.
@@ -323,8 +319,6 @@ impl TlsConfig {
             check_certificate_revocation: cfg.check_certificate_revocation,
             accept_undetermined_certificate_revocation: cfg
                 .accept_undetermined_certificate_revocation,
-            #[cfg(feature = "tls-rustls")]
-            crl_fetch_limits: CrlFetchLimits::default(),
         }
     }
 }

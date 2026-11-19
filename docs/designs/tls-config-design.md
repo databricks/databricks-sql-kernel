@@ -245,7 +245,7 @@ E2E tests use mitmproxy as a TLS-intercepting proxy. The CI workflow (`.github/w
 | Self-signed certs / skip cert validation | `databricks.http.tls.allow_self_signed` | `adbc.http_options.tls.allow_self_signed` + `adbc.http_options.tls.disable_server_certificate_validation` |
 | Hostname mismatch | `databricks.http.tls.allow_hostname_mismatch` | `adbc.http_options.tls.allow_hostname_mismatch` |
 | Custom CA cert | `databricks.http.tls.trusted_certificate_path` | `adbc.http_options.tls.trusted_certificate_path` |
-| Cert revocation mode | Not supported | `adbc.http_options.tls.revocation_mode` |
+| Cert revocation mode | Opt-in on tls-rustls: `check_certificate_revocation`, `accept_undetermined_certificate_revocation` (default off; InvalidArgument on tls-native) | `adbc.http_options.tls.revocation_mode` (ADBC mapping out of scope) |
 
 ### Naming Convention Difference
 
@@ -253,7 +253,7 @@ The Rust driver uses `databricks.http.tls.*` while the C# driver uses `adbc.http
 
 ### Scope Exclusions
 
-- **Certificate revocation mode**: reqwest does not expose CRL/OCSP configuration. The C# driver supports this via `adbc.http_options.tls.revocation_mode` because .NET's `HttpClientHandler` natively supports it. Can be revisited if reqwest adds support.
+- **Certificate revocation mode**: implemented in the kernel's tls-rustls verifier (CRL checks, opt-in, default off), not through reqwest. The ADBC `adbc.http_options.tls.revocation_mode` mapping is out of scope by the user's decision, so the ADBC driver gets no mapping.
 - **Client certificates (mTLS)**: Not needed per current requirements. Could be added later via `reqwest::ClientBuilder::identity()`.
 - **TLS version pinning**: Not needed. reqwest/native-tls negotiate the highest supported version automatically.
 

@@ -736,16 +736,21 @@ fn tunnel(client: TcpStream, upstream: TcpStream) {
     let _ = back.join();
 }
 
+/// Sets the CRL fetch bounds for clients built on this test's thread.
+fn set_fetch_limits(limits: CrlFetchLimits) {
+    TEST_CRL_LIMITS.with(|cell| cell.set(Some(limits)));
+}
+
 /// Config that trusts the test root, asks for revocation, and fetches with short bounds.
 fn revocation_config(root_pem: &str, accept_undetermined: bool) -> HttpClientConfig {
     let mut config = HttpClientConfig::default();
     config.tls.trusted_certificate_pem = Some(root_pem.as_bytes().to_vec());
     config.tls.check_certificate_revocation = Some(true);
     config.tls.accept_undetermined_certificate_revocation = Some(accept_undetermined);
-    config.tls.crl_fetch_limits = CrlFetchLimits {
+    set_fetch_limits(CrlFetchLimits {
         timeout: Duration::from_millis(500),
         max_bytes: 64 * 1024,
-    };
+    });
     // No pooling: each request runs a fresh handshake and revocation check.
     config.max_connections_per_host = 0;
     config
@@ -1011,17 +1016,103 @@ fn same_name_certificate_with_another_key_is_not_a_trust_anchor() {
 
 #[tokio::test]
 async fn one_timeout_budget_bounds_all_fetches_for_a_chain() {
-    // Both distribution points hang past the per-fetch timeout. The chain shares one
-    // budget, so the second fetch gets none and the check ends in about one timeout.
+    // Both distribution points hang past the per-fetch timeout. Without a shared budget
+    // the two fetches take about two timeouts (about 2 s). With it, the chain takes about
+    // one (about 1 s). The bound sits between the two, with slack on each side.
     let fx = fixture(Some(Served::Timeout), Served::Timeout, "127.0.0.1");
+    let config = revocation_config(&fx.pki.root_pem, false);
+    set_fetch_limits(CrlFetchLimits {
+        timeout: Duration::from_millis(1000),
+        max_bytes: 64 * 1024,
+    });
     let started = Instant::now();
-    let err = get(revocation_config(&fx.pki.root_pem, false), fx.addr)
+    let err = get(config, fx.addr)
         .await
         .expect_err("undetermined under strict");
     let elapsed = started.elapsed();
     assert!(err.contains(UNDETERMINED), "{err}");
     assert!(
-        elapsed < Duration::from_millis(900),
+        elapsed < Duration::from_millis(1500),
         "the fetches share one budget, but the check took {elapsed:?}"
     );
+}
+
+#[tokio::test]
+async fn final_verify_uses_only_the_checked_path() {
+    // Two intermediates share a name and key. Only the first is needed. The second is
+    // revoked, and its distribution point must neither be fetched nor used by webpki.
+    let crl = CrlServer::start();
+    let root_key = KeyPair::generate().unwrap();
+    let root_params = ca_params(ROOT_CN, 1);
+    let root_pem = root_params.self_signed(&root_key).unwrap().pem();
+    let root_issuer = Issuer::new(root_params, root_key);
+
+    let inter_key = KeyPair::generate().unwrap();
+    let inter_pem = inter_key.serialize_pem();
+    let good_der = signed_intermediate(&inter_key, 2001, crl.url("/good.crl"), &root_issuer);
+    let revoked_der = signed_intermediate(
+        &KeyPair::from_pem(&inter_pem).unwrap(),
+        2002,
+        crl.url("/revoked.crl"),
+        &root_issuer,
+    );
+    crl.set(
+        "/good.crl",
+        route(Served::Good, &root_issuer, ROOT_CN, 2001, &root_issuer),
+    );
+    crl.set(
+        "/revoked.crl",
+        route(Served::Revoked, &root_issuer, ROOT_CN, 2002, &root_issuer),
+    );
+
+    let inter_issuer = Issuer::new(
+        ca_params(INTERMEDIATE_CN, 2001),
+        KeyPair::from_pem(&inter_pem).unwrap(),
+    );
+    let mut leaf_params = CertificateParams::new(vec!["127.0.0.1".to_owned()]).unwrap();
+    leaf_params.crl_distribution_points = vec![CrlDistributionPoint {
+        uris: vec![crl.url("/leaf.crl")],
+    }];
+    let leaf_key = KeyPair::generate().unwrap();
+    let leaf_der = leaf_params
+        .signed_by(&leaf_key, &inter_issuer)
+        .unwrap()
+        .der()
+        .clone();
+    crl.set(
+        "/leaf.crl",
+        route(
+            Served::Good,
+            &inter_issuer,
+            INTERMEDIATE_CN,
+            LEAF_SERIAL,
+            &inter_issuer,
+        ),
+    );
+
+    let addr = spawn_tls_chain(
+        vec![leaf_der, good_der, revoked_der],
+        leaf_key.serialize_der(),
+        None,
+    );
+    get(revocation_config(&root_pem, false), addr)
+        .await
+        .expect("the checked path verifies; the unused revoked intermediate is ignored");
+    assert_eq!(
+        crl.hits("/revoked.crl"),
+        0,
+        "an intermediate off the checked path is never fetched"
+    );
+}
+
+/// A CA certificate with `serial`, a distribution point at `cdp`, signed by `issuer`.
+fn signed_intermediate(
+    key: &KeyPair,
+    serial: u64,
+    cdp: String,
+    issuer: &Issuer<'_, KeyPair>,
+) -> CertificateDer<'static> {
+    let mut params = ca_params(INTERMEDIATE_CN, serial);
+    params.crl_distribution_points = vec![CrlDistributionPoint { uris: vec![cdp] }];
+    params.signed_by(key, issuer).unwrap().der().clone()
 }
