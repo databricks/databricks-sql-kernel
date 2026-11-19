@@ -376,7 +376,7 @@ impl Session {
         // 2. Auth provider — async because OAuth flows hit the OIDC
         //    discovery endpoint.
         let auth_provider: Arc<dyn AuthProvider> =
-            build_auth_provider(&config.auth, &host, http_client.clone()).await?;
+            build_auth_provider(&config.auth, &host, &http_client).await?;
         http_client.set_auth_provider(auth_provider);
         // Authenticate before the feature-flag prefetch, which swallows its
         // errors: otherwise a failed token request is sent again by
@@ -1384,18 +1384,18 @@ fn resolve_u2m_bundle(
 async fn build_auth_provider(
     auth: &AuthConfig,
     host: &str,
-    http_client: Arc<DatabricksHttpClient>,
+    http_client: &Arc<DatabricksHttpClient>,
 ) -> Result<Arc<dyn AuthProvider>> {
     // Build the base provider for the configured auth flow, then wrap it with
     // mandatory OIDC token exchange (BYOT federation). The wrapper is a no-op
     // for non-JWT and same-host-issuer tokens, so it is safe to apply
     // unconditionally across PAT / M2M / U2M. See `auth::oauth::federation`.
-    let base = build_base_auth_provider(auth, host, http_client.clone()).await?;
+    let base = build_base_auth_provider(auth, host, http_client).await?;
     let provider = FederationProvider::new(
         base,
         host,
         auth.identity_federation_client_id().map(str::to_owned),
-        &http_client,
+        http_client,
     )
     .await?;
     Ok(Arc::new(provider))
@@ -1406,7 +1406,7 @@ async fn build_auth_provider(
 async fn build_base_auth_provider(
     auth: &AuthConfig,
     host: &str,
-    http_client: Arc<DatabricksHttpClient>,
+    http_client: &Arc<DatabricksHttpClient>,
 ) -> Result<Arc<dyn AuthProvider>> {
     match auth {
         AuthConfig::Pat { token, .. } => {
@@ -1509,7 +1509,7 @@ async fn build_base_auth_provider(
             }
             let tenant = match azure_tenant_id {
                 Some(t) if !t.is_empty() => t.clone(),
-                _ => azure::discover_tenant(host, &http_client).await?,
+                _ => azure::discover_tenant(host, http_client).await?,
             };
             let provider = AzureServicePrincipalProvider::new(
                 host,

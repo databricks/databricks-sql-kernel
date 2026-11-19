@@ -20,6 +20,12 @@ changes go in their respective binding's NEXT_CHANGELOG.
   with an optional partner entry from `adbc.databricks.user_agent_entry`
   (`adbc.spark.user_agent_entry` is a compatibility alias). `User-Agent` in
   `adbc.databricks.http.headers` is now rejected; use the dedicated entry option.
+- **Breaking (Rust API):** `ClientCredentialsProvider`,
+  `JwtClientCredentialsProvider` and `AuthorizationCodeProvider` constructors
+  take `&Arc<DatabricksHttpClient>` instead of `Arc<DatabricksHttpClient>` and
+  hold it weakly, matching `FederationProvider`. Callers must keep the client
+  alive for as long as they use the provider; a token fetch after the client is
+  dropped fails with `invalid_state`.
 
 ### Updated
 
@@ -27,6 +33,7 @@ changes go in their respective binding's NEXT_CHANGELOG.
 
 - `Session::open` authenticates once before resolving feature flags. A failed OAuth token request now fails the open immediately instead of being sent a second time by CreateSession.
 - A timed-out or reset CloudFetch download no longer writes the presigned URL's signature (`sig=`, `X-Amz-Signature`) to the log or the returned error. The request URL in those messages now ends at the path, and debug request lines stop at `?`.
+- Closing an OAuth session (M2M, M2M private key, U2M or Azure service principal) now frees its HTTP client and auth provider. The provider held the HTTP client strongly while the client owned the provider, so the pair and the provider's tokio runtime handle leaked for every closed session.
 
 ---
 *Note: When making changes, please add your change under the appropriate

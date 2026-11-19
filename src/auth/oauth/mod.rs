@@ -46,3 +46,18 @@ pub use m2m::ClientCredentialsProvider;
 pub use oidc::OidcEndpoints;
 pub use token::OAuthToken;
 pub use u2m::AuthorizationCodeProvider;
+
+use crate::client::http::DatabricksHttpClient;
+use crate::kernel_error::{Error, Result};
+use std::sync::{Arc, Weak};
+
+/// OAuth providers hold the HTTP client weakly because the client owns its
+/// auth provider: a strong reference would form a cycle that keeps the client,
+/// the provider and its tokio runtime handle alive after the session closes.
+pub(crate) fn upgrade_http_client(
+    http_client: &Weak<DatabricksHttpClient>,
+) -> Result<Arc<DatabricksHttpClient>> {
+    http_client
+        .upgrade()
+        .ok_or_else(|| Error::invalid_state().message("OAuth HTTP client is no longer available"))
+}
