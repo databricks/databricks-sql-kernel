@@ -22,9 +22,6 @@
 //! Both synchronous `execute()` and async `submit()` paths supported.
 //! Built as the `databricks_sql_kernel` extension module via
 //! `maturin develop` / `maturin build`.
-//!
-//! The kernel's API is async — every method call from Python detaches
-//! the GIL and `block_on`s on the session-owned tokio runtime.
 
 // `macros` is `#[macro_use]` so the `run_kernel!` / `alive!` /
 // `alive_mut!` macros are visible across the rest of the crate

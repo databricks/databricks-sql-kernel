@@ -37,16 +37,20 @@
 //! logging.getLogger("databricks.sql.kernel").setLevel(logging.DEBUG)  # kernel only
 //! ```
 //!
-//! ## Filtering happens before the GIL
+//! ## GIL and filtering
 //!
-//! Kernel events fire on tokio worker threads with the GIL released
-//! (see `run_kernel!`). `pyo3_log` re-acquires the GIL per surviving
-//! record, so we must drop below-threshold events *before* that
-//! boundary. Two cheap gates do this: the global `log::max_level`
-//! (set by `pyo3_log` from the Python loggers' effective levels) and
-//! `pyo3_log`'s per-logger level cache. The customer's single knob
-//! (`setLevel`) drives both — there is no separate Rust-side level
-//! argument.
+//! This bridge sets `log::max_level` to `Trace`; Python logger levels
+//! control filtering through `pyo3_log`'s per-logger cache. Cached
+//! below-threshold records can be rejected without acquiring the GIL.
+//! A cache miss can acquire the GIL to resolve the logger and its level,
+//! even if a Python logger set to WARNING discards the record.
+//! Forwarding an enabled record also acquires the GIL.
+//!
+//! Events can originate on runtime workers or a Python caller holding
+//! the GIL during a buffered fetch. Callers holding the GIL must avoid
+//! waiting for locks held by a logging worker, regardless of Python log
+//! levels. CloudFetch probes yield on contended provider-state locks
+//! so the fallback can wait with the GIL released.
 //!
 //! ## Reconfiguration
 //!
@@ -166,9 +170,8 @@ impl<L: log::Log> log::Log for ExitGuard<L> {
 /// stays quiet, while a customer who turns on DEBUG to diagnose a
 /// connectivity / TLS issue gets the full wire-level picture in one
 /// shot, with no flag to flip and no support round-trip to ask for it.
-/// The per-record GIL re-acquire cost of forwarding deps only
-/// materializes when DEBUG is actually enabled on those loggers; a
-/// customer can silence them with the standard
+/// Uncached targets can acquire the GIL even if Python filters out
+/// their records. A customer can silence dependency output with
 /// `logging.getLogger("hyper_util").setLevel(WARNING)`.
 ///
 /// Returns `true` if this call performed the install, `false` otherwise
