@@ -612,6 +612,19 @@ mod tests {
 
     #[tokio::test]
     async fn dictionary_schemas_never_probe_or_pack_batches() {
+        check_dictionary_payloads(None).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "Exports fixtures for the manual apache-arrow consumer check"]
+    async fn export_dictionary_consumer_fixtures() {
+        let directory = std::path::PathBuf::from(
+            std::env::var_os("DICT_FIXTURE_DIR").expect("set DICT_FIXTURE_DIR for fixture export"),
+        );
+        check_dictionary_payloads(Some(&directory)).await;
+    }
+
+    async fn check_dictionary_payloads(directory: Option<&std::path::Path>) {
         use arrow_array::{types::Int8Type, ArrayRef, DictionaryArray, StructArray};
         for nested in [false, true] {
             let batches = ["first", "second"].map(|value| {
@@ -632,9 +645,8 @@ mod tests {
             let mut stream = IpcStream::new(Source::new(batches.to_vec()));
             for index in 0..2 {
                 let bytes = stream.next(&schema, "test").await.unwrap().unwrap();
-                if let Ok(directory) = std::env::var("DICT_FIXTURE_DIR") {
-                    let directory = std::path::PathBuf::from(directory);
-                    std::fs::create_dir_all(&directory).unwrap();
+                if let Some(directory) = directory {
+                    std::fs::create_dir_all(directory).unwrap();
                     std::fs::write(directory.join(format!("{nested}-{index}.arrow")), &bytes)
                         .unwrap();
                 }
