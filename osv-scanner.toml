@@ -49,19 +49,3 @@ id = "GHSA-h395-gr6q-cpjc"
 # ring-backed 10.x if one exists) before renewing.
 ignoreUntil = 2027-02-14
 reason = "jsonwebtoken claim-validation bug (CVE-2026-25537) is in the decode path; the kernel only signs, never decodes/validates JWTs (verified: no decode/Validation calls in src/). Upgrade to 10.x deferred — it forces rust_crypto (rsa/RUSTSEC-2023-0071 in runtime) or aws_lc_rs (C dep). Re-review on expiry."
-
-[[IgnoredVulns]]
-id = "RUSTSEC-2026-0258"
-# "h2 unbounded empty DATA frames" — a DoS advisory in `h2 0.4.15`, pulled in
-# transitively via `hyper` <- `reqwest` (`cargo tree -i h2`).
-#
-# Not reachable in the way the advisory describes: it concerns a SERVER
-# accepting a flood of empty DATA frames; the kernel is an HTTP *client* to
-# Databricks SEA and never runs an h2 server, so the affected entrypoint is
-# not exposed.
-#
-# ignoreUntil forces periodic re-review: when it lapses OSV re-reports the
-# finding, and someone must reconfirm the client-only posture (and re-check
-# for a reqwest/hyper release carrying the fix) before renewing.
-ignoreUntil = 2027-02-14
-reason = "h2 (RUSTSEC-2026-0258) DoS is a server-side empty-DATA-frame flood; the kernel is an HTTP client only and runs no h2 server. Transitive via reqwest/hyper. Re-review on expiry."

@@ -38,9 +38,6 @@ ignore = [
     # type, so exercising the RSA load+sign path in tests has value.
     # Re-evaluate when `rsa` ships a constant-time stable release.
     "RUSTSEC-2023-0071",
-    # The empty-DATA-frame flood affects HTTP/2 servers; the kernel only
-    # uses HTTP/2 as a client and runs no h2 server.
-    "RUSTSEC-2026-0258",
 ]
 
 [licenses]
