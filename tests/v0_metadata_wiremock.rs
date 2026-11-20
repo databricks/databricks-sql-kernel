@@ -1350,7 +1350,8 @@ async fn list_tables_speculation_closes_result_when_catalog_lookup_fails() {
     mount_execute_expecting_sql(
         &server,
         "SHOW CATALOGS",
-        failed_response_body("42501", "catalog lookup failure"),
+        failed_response_body("42501", "catalog lookup failure")
+            .replace("stmt-test", "failed-catalog-lookup"),
     )
     .await;
     let table = string_batch(vec![
@@ -1361,15 +1362,17 @@ async fn list_tables_speculation_closes_result_when_catalog_lookup_fails() {
     mount_execute_expecting_sql(
         &server,
         "IN CATALOG `bench_name`",
-        succeeded_inline_response_body(&table),
+        succeeded_inline_response_body(&table).replace("stmt-test", "unused-speculation"),
     )
     .await;
-    Mock::given(method("DELETE"))
-        .and(path("/api/2.0/sql/statements/stmt-test"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
-        .expect(2)
-        .mount(&server)
-        .await;
+    for statement_id in ["failed-catalog-lookup", "unused-speculation"] {
+        Mock::given(method("DELETE"))
+            .and(path(format!("/api/2.0/sql/statements/{statement_id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
     let session = open_session(&server).await;
     let result = session
         .metadata()
