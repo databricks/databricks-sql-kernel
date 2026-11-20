@@ -66,9 +66,10 @@ impl TelemetryRuntime {
             connection_params: build_connection_params(connection, auth),
             auth_type: auth_type(auth),
         });
+        let cache_key = telemetry_cache_key(&connection.host, http_client.revocation());
         let (exporter, bypass_cache) = exporter_for_config(config, connection, http_client);
         let Some(lease) = TelemetryClientManager::global().get_or_create(
-            &connection.host,
+            &cache_key,
             config,
             exporter,
             bypass_cache,
@@ -351,6 +352,18 @@ fn exporter_for_config(
         ),
         false,
     )
+}
+
+/// The per-host telemetry client cache key. A cached client holds the HTTP client of the
+/// session that created it, so the revocation mode is part of the key: sessions to one host
+/// with different revocation settings must not share a client.
+pub(super) fn telemetry_cache_key(host: &str, revocation: Option<bool>) -> String {
+    let mode = match revocation {
+        None => "off",
+        Some(false) => "strict",
+        Some(true) => "accept_undetermined",
+    };
+    format!("{host}|revocation={mode}")
 }
 
 fn build_system_configuration(

@@ -794,6 +794,12 @@ impl DatabricksHttpClient {
     }
 
     /// Returns the underlying reqwest client for building requests.
+    /// The revocation mode this client was built with: `None` when checking is off, otherwise
+    /// `Some(accept_undetermined)`.
+    pub(crate) fn revocation(&self) -> Option<bool> {
+        self.revocation
+    }
+
     pub fn inner(&self) -> &Client {
         &self.client
     }
