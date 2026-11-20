@@ -21,13 +21,15 @@
 
 use arrow_array::RecordBatch;
 use arrow_ipc::writer::StreamWriter;
-use arrow_schema::SchemaRef;
+use arrow_schema::{DataType, SchemaRef};
 use databricks_sql_kernel::{
     result_stream::TryNextBatch, Error as KernelError, ResultBatch, ResultStream,
 };
 use napi::bindgen_prelude::Buffer;
 
 use crate::error::napi_err_from_kernel;
+
+const IPC_TARGET_BYTES: usize = 2 * 1024 * 1024;
 
 /// A single Arrow IPC stream payload encoding one or more record batches (plus
 /// the schema header so the JS-side reader is stateless).
@@ -73,7 +75,7 @@ fn encode_ipc_batches(schema: &SchemaRef, batches: &[RecordBatch]) -> napi::Resu
         .iter()
         .map(sliced_batch_bytes)
         .fold(4096usize, usize::saturating_add)
-        .min(4 * 1024 * 1024);
+        .min(IPC_TARGET_BYTES);
     let mut buf: Vec<u8> = Vec::with_capacity(estimated);
     {
         let mut writer =
@@ -94,6 +96,28 @@ fn sliced_batch_bytes(batch: &RecordBatch) -> usize {
             bytes.checked_add(array.to_data().get_slice_memory_size().ok()?)
         })
         .unwrap_or(usize::MAX)
+}
+
+fn contains_dictionary(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Dictionary(_, _) => true,
+        DataType::List(field)
+        | DataType::LargeList(field)
+        | DataType::ListView(field)
+        | DataType::LargeListView(field)
+        | DataType::FixedSizeList(field, _)
+        | DataType::Map(field, _) => contains_dictionary(field.data_type()),
+        DataType::Struct(fields) => fields
+            .iter()
+            .any(|field| contains_dictionary(field.data_type())),
+        DataType::Union(fields, _) => fields
+            .iter()
+            .any(|(_, field)| contains_dictionary(field.data_type())),
+        DataType::RunEndEncoded(ends, values) => {
+            contains_dictionary(ends.data_type()) || contains_dictionary(values.data_type())
+        }
+        _ => false,
+    }
 }
 
 pub(crate) trait BatchSource: Send {
@@ -117,6 +141,7 @@ impl BatchSource for ResultStream {
 pub(crate) struct IpcStream<Source> {
     pub(crate) source: Source,
     pending: Option<napi::Result<RecordBatch>>,
+    packing_allowed: Option<bool>,
 }
 
 impl<Source: BatchSource> IpcStream<Source> {
@@ -124,6 +149,7 @@ impl<Source: BatchSource> IpcStream<Source> {
         Self {
             source,
             pending: None,
+            packing_allowed: None,
         }
     }
 
@@ -132,6 +158,13 @@ impl<Source: BatchSource> IpcStream<Source> {
         schema: &SchemaRef,
         binding_name: &str,
     ) -> napi::Result<Option<Vec<u8>>> {
+        // apache-arrow 13 ignores dictionary replacements within a stream.
+        let packing_allowed = *self.packing_allowed.get_or_insert_with(|| {
+            !schema
+                .fields()
+                .iter()
+                .any(|field| contains_dictionary(field.data_type()))
+        });
         let first = match self.pending.take() {
             Some(batch) => batch?,
             None => {
@@ -149,7 +182,7 @@ impl<Source: BatchSource> IpcStream<Source> {
         let mut rows = first.num_rows();
         let mut bytes = sliced_batch_bytes(&first);
         let mut batches = vec![first];
-        while rows < 16_384 && bytes < 4 * 1024 * 1024 && batches.len() < 16 {
+        while packing_allowed && rows < 16_384 && bytes < IPC_TARGET_BYTES && batches.len() < 16 {
             let candidate = match self.source.try_next_ready_batch() {
                 Ok(TryNextBatch::Ready(batch)) => clone_arrow_batch(batch, binding_name),
                 Ok(TryNextBatch::Pending | TryNextBatch::End) => break,
@@ -164,7 +197,7 @@ impl<Source: BatchSource> IpcStream<Source> {
                 }
             };
             let candidate_bytes = sliced_batch_bytes(&candidate);
-            if candidate.num_rows() > 16_384 - rows || candidate_bytes > 4 * 1024 * 1024 - bytes {
+            if candidate.num_rows() > 16_384 - rows || candidate_bytes > IPC_TARGET_BYTES - bytes {
                 self.pending = Some(Ok(candidate));
                 break;
             }
@@ -234,6 +267,7 @@ mod tests {
         current: Option<ResultBatch>,
         awaits: usize,
         probes: usize,
+        deferred_error: Option<KernelError>,
     }
 
     impl Source {
@@ -243,16 +277,27 @@ mod tests {
                 current: None,
                 awaits: 0,
                 probes: 0,
+                deferred_error: None,
             }
         }
 
-        fn take(&mut self) -> databricks_sql_kernel::Result<TryNextBatch<'_>> {
+        fn take(&mut self, speculative: bool) -> databricks_sql_kernel::Result<TryNextBatch<'_>> {
+            if self.deferred_error.is_some() {
+                if speculative {
+                    return Ok(TryNextBatch::Pending);
+                }
+                return Err(self.deferred_error.take().unwrap());
+            }
             match self.items.pop_front() {
                 Some(Ok(Some(batch))) => {
                     self.current = Some(ResultBatch::Arrow(batch));
                     Ok(TryNextBatch::Ready(self.current.as_ref().unwrap()))
                 }
                 Some(Ok(None)) => Ok(TryNextBatch::Pending),
+                Some(Err(error)) if speculative => {
+                    self.deferred_error = Some(error);
+                    Ok(TryNextBatch::Pending)
+                }
                 Some(Err(error)) => Err(error),
                 None => Ok(TryNextBatch::End),
             }
@@ -262,7 +307,7 @@ mod tests {
     impl BatchSource for Source {
         async fn next_batch(&mut self) -> databricks_sql_kernel::Result<Option<&ResultBatch>> {
             self.awaits += 1;
-            match self.take()? {
+            match self.take(false)? {
                 TryNextBatch::Ready(batch) => Ok(Some(batch)),
                 TryNextBatch::End => Ok(None),
                 _ => panic!("packing must not await a pending batch"),
@@ -271,7 +316,7 @@ mod tests {
 
         fn try_next_ready_batch(&mut self) -> databricks_sql_kernel::Result<TryNextBatch<'_>> {
             self.probes += 1;
-            self.take()
+            self.take(true)
         }
     }
 
@@ -322,7 +367,7 @@ mod tests {
     async fn packing_byte_limit_defers_instead_of_dropping_large_batch() {
         use arrow_array::StringArray;
         let array = Arc::new(StringArray::from(vec![
-            Some("x".repeat(3 * 1024 * 1024)),
+            Some("x".repeat(IPC_TARGET_BYTES * 3 / 4)),
             None,
         ]));
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Utf8, true)]));
@@ -392,7 +437,7 @@ mod tests {
         );
         let error = stream.next(&make_schema(), "test").await.unwrap_err();
         assert!(error.reason.contains("late download error"));
-        assert_eq!(stream.source.awaits, 1);
+        assert_eq!(stream.source.awaits, 2);
     }
 
     #[tokio::test]
@@ -410,7 +455,7 @@ mod tests {
     #[tokio::test]
     async fn decoded_wide_slices_share_backing_memory_without_inflating_budget() {
         use arrow_array::{ArrayRef, Int64Array};
-        let batch = RecordBatch::try_from_iter((0..34).map(|column| {
+        let batch = RecordBatch::try_from_iter((0..8).map(|column| {
             (
                 format!("column{column}"),
                 Arc::new(Int64Array::from_iter(
@@ -426,12 +471,12 @@ mod tests {
                 .next()
                 .unwrap()
                 .unwrap();
-        assert!(decoded.get_array_memory_size() > 4 * 1024 * 1024);
-        assert!(sliced_batch_bytes(&decoded) < 800_000);
+        assert!(decoded.get_array_memory_size() > IPC_TARGET_BYTES);
+        assert!(sliced_batch_bytes(&decoded) < 200_000);
         let schema = decoded.schema();
         let mut stream = IpcStream::new(Source::new(vec![decoded.clone(); 6]));
         let bytes = stream.next(&schema, "test").await.unwrap().unwrap();
-        assert!(bytes.len() < 4 * 1024 * 1024);
+        assert!(bytes.len() < IPC_TARGET_BYTES);
         assert_eq!(decode(bytes), vec![decoded.clone(); 5]);
         assert_eq!(next(&mut stream, &schema).await, vec![decoded]);
     }
@@ -529,15 +574,91 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn changing_dictionaries_keep_each_batch_values() {
-        use arrow_array::{types::Int8Type, DictionaryArray};
-        let batches = ["first", "second"].map(|value| {
-            let array = DictionaryArray::<Int8Type>::from_iter([Some(value), None]);
-            RecordBatch::try_from_iter([("dictionary", Arc::new(array) as arrow_array::ArrayRef)])
-                .unwrap()
-        });
-        let schema = batches[0].schema();
-        let mut stream = IpcStream::new(Source::new(batches.to_vec()));
-        assert_eq!(next(&mut stream, &schema).await, batches);
+    async fn dictionary_schemas_never_probe_or_pack_batches() {
+        use arrow_array::{types::Int8Type, ArrayRef, DictionaryArray, StructArray};
+        for nested in [false, true] {
+            let batches = ["first", "second"].map(|value| {
+                let dictionary =
+                    Arc::new(DictionaryArray::<Int8Type>::from_iter([Some(value), None]))
+                        as ArrayRef;
+                let array = if nested {
+                    Arc::new(StructArray::from(vec![(
+                        Arc::new(Field::new("nested", dictionary.data_type().clone(), true)),
+                        dictionary,
+                    )])) as ArrayRef
+                } else {
+                    dictionary
+                };
+                RecordBatch::try_from_iter([("dictionary", array)]).unwrap()
+            });
+            let schema = batches[0].schema();
+            let mut stream = IpcStream::new(Source::new(batches.to_vec()));
+            for index in 0..2 {
+                let bytes = stream.next(&schema, "test").await.unwrap().unwrap();
+                if let Ok(directory) = std::env::var("DICT_FIXTURE_DIR") {
+                    let directory = std::path::PathBuf::from(directory);
+                    std::fs::create_dir_all(&directory).unwrap();
+                    std::fs::write(directory.join(format!("{nested}-{index}.arrow")), &bytes)
+                        .unwrap();
+                }
+                assert_eq!(
+                    decode(bytes).len(),
+                    1,
+                    "dictionary payloads must be independent"
+                );
+                assert_eq!(
+                    stream.source.probes, 0,
+                    "dictionary data must not be speculatively consumed"
+                );
+            }
+            assert!(stream.next(&schema, "test").await.unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn dictionary_guard_covers_every_nested_container() {
+        use arrow_schema::{UnionFields, UnionMode};
+        let field = Arc::new(Field::new(
+            "dictionary",
+            DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+            true,
+        ));
+        let containers = vec![
+            field.data_type().clone(),
+            DataType::List(field.clone()),
+            DataType::LargeList(field.clone()),
+            DataType::ListView(field.clone()),
+            DataType::LargeListView(field.clone()),
+            DataType::FixedSizeList(field.clone(), 2),
+            DataType::Map(
+                Arc::new(Field::new(
+                    "entries",
+                    DataType::Struct(
+                        vec![
+                            Arc::new(Field::new("key", DataType::Utf8, false)),
+                            field.clone(),
+                        ]
+                        .into(),
+                    ),
+                    false,
+                )),
+                false,
+            ),
+            DataType::Struct(vec![field.clone()].into()),
+            DataType::Union(
+                UnionFields::try_new([0], [field.clone()]).unwrap(),
+                UnionMode::Dense,
+            ),
+            DataType::RunEndEncoded(Arc::new(Field::new("ends", DataType::Int16, false)), field),
+        ];
+        for data_type in containers {
+            assert!(contains_dictionary(&data_type), "{data_type}");
+            let nested =
+                DataType::Struct(vec![Arc::new(Field::new("outer", data_type, true))].into());
+            assert!(contains_dictionary(&nested));
+        }
+        assert!(!contains_dictionary(&DataType::Struct(
+            vec![Arc::new(Field::new("plain", DataType::Utf8, true))].into()
+        )));
     }
 }

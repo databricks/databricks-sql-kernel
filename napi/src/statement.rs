@@ -532,6 +532,17 @@ pub(crate) fn statement_closed_err() -> napi::Error {
 }
 
 #[cfg(test)]
+impl Statement {
+    pub(crate) async fn has_current_batch_for_test(&self) -> bool {
+        let guard = self.inner.lock().await;
+        match &guard.as_ref().expect("statement open").source {
+            AnyInner::Executed(statement) => statement.executed.result_stream().current().is_some(),
+            AnyInner::Metadata(stream) => stream.current().is_some(),
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use arrow_schema::{DataType, Field, Schema};

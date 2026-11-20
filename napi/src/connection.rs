@@ -739,7 +739,7 @@ mod tests {
         use databricks_sql_kernel::TelemetryConfig;
         use std::time::Duration;
 
-        for early_close in [false, true] {
+        for (early_close, failed_download) in [(false, false), (true, false), (false, true)] {
             let server = MockServer::start().await;
             let batch = RecordBatch::try_from_iter([(
                 "n",
@@ -767,6 +767,28 @@ mod tests {
                 .expect(1)
                 .mount(&server)
                 .await;
+            if failed_download {
+                Mock::given(method("GET"))
+                    .and(path("/failed-chunk"))
+                    .respond_with(
+                        ResponseTemplate::new(500).set_body_string("fixture download failure"),
+                    )
+                    .expect(5)
+                    .mount(&server)
+                    .await;
+            }
+            let mut links = vec![json!({
+                "external_link": format!("{}/chunk", server.uri()),
+                "expiration": "2099-01-01T00:00:00Z",
+                "chunk_index": 0, "row_offset": 0, "row_count": 9, "byte_count": ipc.len()
+            })];
+            if failed_download {
+                links.push(json!({
+                    "external_link": format!("{}/failed-chunk", server.uri()),
+                    "expiration": "2099-01-01T00:00:00Z",
+                    "chunk_index": 1, "row_offset": 9, "row_count": 3, "byte_count": ipc.len()
+                }));
+            }
             Mock::given(method("POST"))
                 .and(path("/api/2.0/sql/statements"))
                 .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -777,15 +799,10 @@ mod tests {
                         "schema": { "column_count": 1, "columns": [{
                             "name": "n", "type_name": "BIGINT", "type_text": "BIGINT", "position": 0
                         }] },
-                        "total_chunk_count": 1, "total_row_count": 9,
+                        "total_chunk_count": links.len(), "total_row_count": if failed_download { 12 } else { 9 },
                         "total_byte_count": ipc.len(), "truncated": false
                     },
-                    "result": { "external_links": [{
-                        "external_link": format!("{}/chunk", server.uri()),
-                        "expiration": "2099-01-01T00:00:00Z",
-                        "chunk_index": 0, "row_offset": 0, "row_count": 9,
-                        "byte_count": ipc.len()
-                    }] }
+                    "result": { "external_links": links }
                 })))
                 .mount(&server)
                 .await;
@@ -808,6 +825,9 @@ mod tests {
             let mut telemetry = TelemetryConfig::default();
             telemetry.set_enabled(true);
             telemetry.batch_size = 1;
+            telemetry.flush_interval = Duration::from_millis(10);
+            let mut http = databricks_sql_kernel::HttpConfig::default();
+            http.retry_max_retries = 0;
             let session = Session::builder()
                 .http_path(server.uri(), "/sql/1.0/warehouses/test_wh")
                 .auth(AuthConfig::Pat {
@@ -815,6 +835,7 @@ mod tests {
                     identity_federation_client_id: None,
                 })
                 .telemetry(telemetry)
+                .http(http)
                 .open()
                 .await
                 .unwrap();
@@ -833,7 +854,23 @@ mod tests {
                 .unwrap();
             assert_eq!(batches.len(), 3);
             assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 9);
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            for actual in &batches {
+                assert_eq!(
+                    actual
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap(),
+                    batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap()
+                );
+            }
+            // The fetch mutex is the completion barrier. Inspect synchronous EOF
+            // state so a queued-but-not-yet-sent DELETE cannot hide an early close.
+            assert!(statement.has_current_batch_for_test().await);
             let (closes, events) = packed_statement_observations(&server).await;
             assert_eq!(closes, 0, "lookahead must not close before the null fetch");
             assert!(
@@ -841,27 +878,64 @@ mod tests {
                 "lookahead must not finalize statement telemetry"
             );
 
-            if early_close {
+            let mut delivered_error_code = None;
+            if failed_download {
+                let error =
+                    tokio::time::timeout(Duration::from_secs(15), statement.fetch_next_batch())
+                        .await
+                        .expect("bounded retry failure")
+                        .err()
+                        .expect("second fetch must deliver the failed download");
+                assert!(
+                    error.reason.contains("NetworkError") || error.reason.contains("Internal"),
+                    "{}",
+                    error.reason
+                );
+                let envelope: serde_json::Value = serde_json::from_str(
+                    error
+                        .reason
+                        .strip_prefix(crate::error::ERROR_SENTINEL)
+                        .unwrap(),
+                )
+                .unwrap();
+                delivered_error_code = Some(envelope["code"].as_str().unwrap().to_owned());
+                assert_eq!(
+                    packed_statement_observations(&server).await.0,
+                    0,
+                    "a delivered download error must not auto-close"
+                );
+                statement.close().await.unwrap();
+            } else if early_close {
                 statement.close().await.unwrap();
             } else {
                 assert!(statement.fetch_next_batch().await.unwrap().is_none());
             }
-            tokio::time::timeout(Duration::from_secs(2), async {
+            let completed = tokio::time::timeout(Duration::from_secs(2), async {
                 loop {
                     let (closes, events) = packed_statement_observations(&server).await;
                     if closes == 1 && events.len() == 1 {
                         let latency = &events[0]["entry"]["sql_driver_log"]["sql_operation"]
                             ["result_latency"]["result_set_consumption_latency_millis"];
                         assert_eq!(latency.is_null(), early_close);
+                        let error_name =
+                            &events[0]["entry"]["sql_driver_log"]["error_info"]["error_name"];
+                        assert_eq!(error_name.as_str(), delivered_error_code.as_deref());
                         break;
                     }
                     tokio::time::sleep(Duration::from_millis(5)).await;
                 }
             })
-            .await
-            .expect("normal completion must close and export exactly one statement event");
+            .await;
+            assert!(
+                completed.is_ok(),
+                "completion early_close={early_close} failed_download={failed_download}: {:?}",
+                packed_statement_observations(&server).await
+            );
             statement.close().await.unwrap();
             connection.close().await.unwrap();
+            let (closes, events) = packed_statement_observations(&server).await;
+            assert_eq!(closes, 1);
+            assert_eq!(events.len(), 1, "close must not duplicate error telemetry");
         }
     }
 
