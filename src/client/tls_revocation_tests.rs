@@ -600,3 +600,29 @@ async fn unrelated_presented_certificate_does_not_change_the_result() {
         .await
         .expect("an unrelated presented certificate does not change the result");
 }
+
+#[tokio::test]
+async fn unusable_presented_intermediate_does_not_hide_a_revoked_leaf() {
+    // Webpki skips the garbage entry and verifies through the real intermediate. CryptoAPI
+    // refuses the garbage entry too, and that must not stop it from reading the leaf's status.
+    let fx = fixture(Some(Served::Revoked), Served::Good, "127.0.0.1");
+    let garbage = CertificateDer::from(b"not a certificate".to_vec());
+    let addr = spawn_tls_chain(
+        vec![
+            fx.pki.leaf_der.clone(),
+            garbage,
+            fx.pki.intermediate_der.clone(),
+        ],
+        fx.pki.leaf_key_der.clone(),
+        None,
+    );
+    for accept in [false, true] {
+        let err = get(revocation_config(&fx.pki.root_pem), Some(accept), addr)
+            .await
+            .expect_err("a revoked leaf is rejected in both modes");
+        assert!(
+            err.contains("revoked"),
+            "accept_undetermined={accept}: {err}"
+        );
+    }
+}

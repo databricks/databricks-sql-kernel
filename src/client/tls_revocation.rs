@@ -78,7 +78,7 @@ impl Store {
     }
 
     /// Adds a copy of `der`. The store keeps its own reference, so the temporary context is
-    /// freed when it drops.
+    /// freed when it drops. Returns false when CryptoAPI refuses the certificate.
     fn add(&self, der: &[u8]) -> bool {
         let Some(context) = Context::new(der) else {
             return false;
@@ -158,10 +158,11 @@ fn cryptoapi_status(leaf: &[u8], intermediates: &[&[u8]], custom_cas: &[&[u8]]) 
     let Some(store) = Store::memory() else {
         return Status::Undetermined;
     };
+    // A certificate that CryptoAPI refuses is skipped, not fatal. Webpki already ignored
+    // it, and it cannot hide the leaf's status. A chain that needs it comes out partial,
+    // which is undetermined.
     for der in intermediates.iter().chain(custom_cas) {
-        if !store.add(der) {
-            return Status::Undetermined;
-        }
+        store.add(der);
     }
     let Some(leaf) = Context::new(leaf) else {
         return Status::Undetermined;
