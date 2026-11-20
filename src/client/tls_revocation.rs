@@ -47,12 +47,14 @@ use rustls::{
 use windows_sys::Win32::Security::Cryptography::{
     CertAddCertificateContextToStore, CertCloseStore, CertCreateCertificateChainEngine,
     CertCreateCertificateContext, CertFreeCertificateChain, CertFreeCertificateChainEngine,
-    CertFreeCertificateContext, CertGetCertificateChain, CertOpenStore, CERT_CHAIN_CONTEXT,
-    CERT_CHAIN_ENGINE_CONFIG, CERT_CHAIN_EXCLUSIVE_ENABLE_CA_FLAG, CERT_CHAIN_PARA,
+    CertFreeCertificateContext, CertGetCertificateChain, CertOpenStore,
+    CertSetCertificateContextProperty, CERT_CHAIN_CONTEXT, CERT_CHAIN_ENGINE_CONFIG,
+    CERT_CHAIN_EXCLUSIVE_ENABLE_CA_FLAG, CERT_CHAIN_PARA,
     CERT_CHAIN_REVOCATION_ACCUMULATIVE_TIMEOUT, CERT_CHAIN_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT,
-    CERT_CONTEXT, CERT_STORE_ADD_ALWAYS, CERT_STORE_PROV_MEMORY, CERT_TRUST_IS_OFFLINE_REVOCATION,
+    CERT_CONTEXT, CERT_OCSP_RESPONSE_PROP_ID, CERT_STORE_ADD_ALWAYS, CERT_STORE_PROV_MEMORY,
+    CERT_TRUST_IS_NOT_SIGNATURE_VALID, CERT_TRUST_IS_OFFLINE_REVOCATION,
     CERT_TRUST_IS_PARTIAL_CHAIN, CERT_TRUST_IS_REVOKED, CERT_TRUST_REVOCATION_STATUS_UNKNOWN,
-    HCERTCHAINENGINE, HCERTSTORE, PKCS_7_ASN_ENCODING, X509_ASN_ENCODING,
+    CRYPT_INTEGER_BLOB, HCERTCHAINENGINE, HCERTSTORE, PKCS_7_ASN_ENCODING, X509_ASN_ENCODING,
 };
 
 #[cfg(test)]
@@ -61,9 +63,8 @@ use windows_sys::Win32::Foundation::GetLastError;
 // REVOCATION_STATUS_UNKNOWN) are not repeated here.
 #[cfg(test)]
 use windows_sys::Win32::Security::Cryptography::{
-    CERT_TRUST_IS_CYCLIC, CERT_TRUST_IS_NOT_SIGNATURE_VALID, CERT_TRUST_IS_NOT_TIME_VALID,
-    CERT_TRUST_IS_NOT_VALID_FOR_USAGE, CERT_TRUST_IS_UNTRUSTED_ROOT,
-    CERT_TRUST_NO_ISSUANCE_CHAIN_POLICY,
+    CERT_TRUST_IS_CYCLIC, CERT_TRUST_IS_NOT_TIME_VALID, CERT_TRUST_IS_NOT_VALID_FOR_USAGE,
+    CERT_TRUST_IS_UNTRUSTED_ROOT, CERT_TRUST_NO_ISSUANCE_CHAIN_POLICY,
 };
 
 use super::http::TlsConfig;
@@ -132,6 +133,31 @@ impl Context {
         };
         (!context.is_null()).then_some(Self(context))
     }
+
+    /// Attaches a stapled OCSP response to this certificate, as SChannel does, so CryptoAPI can
+    /// use it instead of fetching one. CryptoAPI copies the response into the context, so
+    /// `response` needs to live only for the call. Returns false when CryptoAPI refuses it, and
+    /// CryptoAPI then fetches as usual.
+    fn set_ocsp_response(&self, response: &[u8]) -> bool {
+        let Ok(len) = u32::try_from(response.len()) else {
+            return false;
+        };
+        let blob = CRYPT_INTEGER_BLOB {
+            cbData: len,
+            pbData: response.as_ptr().cast_mut(),
+        };
+        // SAFETY: the context is live. `blob` and `response` are valid for the call, and the
+        // property is set with no flags. The API takes a pointer to the blob, not the blob's
+        // contents.
+        unsafe {
+            CertSetCertificateContextProperty(
+                self.0,
+                CERT_OCSP_RESPONSE_PROP_ID,
+                0,
+                (&blob as *const CRYPT_INTEGER_BLOB).cast(),
+            ) != 0
+        }
+    }
 }
 
 impl Drop for Context {
@@ -145,23 +171,43 @@ impl Drop for Context {
 struct ChainContext(*mut CERT_CHAIN_CONTEXT);
 
 impl ChainContext {
-    /// The chain-level revocation status. CryptoAPI combines the status of every element
-    /// (the root is not checked, so its bits do not appear). The trust bits are not read.
+    /// The revocation status of the chain. CryptoAPI combines the status of the elements into
+    /// the chain's bits (the root is not checked, so its bits do not appear). The elements are
+    /// read as well, so no element's bits are missed. The trust bits are not read.
     fn status(&self) -> Status {
-        // SAFETY: the chain is live until this guard drops, and the read does not write.
-        let bits = unsafe { (*self.0).TrustStatus.dwErrorStatus };
-        if bits & CERT_TRUST_IS_REVOKED != 0 {
-            Status::Revoked
-        } else if bits
-            & (CERT_TRUST_REVOCATION_STATUS_UNKNOWN
-                | CERT_TRUST_IS_OFFLINE_REVOCATION
-                | CERT_TRUST_IS_PARTIAL_CHAIN)
-            != 0
-        {
-            Status::Undetermined
-        } else {
-            Status::Good
+        // SAFETY: the chain is live until this guard drops, and every read is of a field CryptoAPI
+        // sets. Each simple chain pointer is valid for `cChain`, and each element pointer for the
+        // `cElement` of its simple chain.
+        unsafe {
+            let chain = &*self.0;
+            let mut bits = vec![chain.TrustStatus.dwErrorStatus];
+            for i in 0..chain.cChain as usize {
+                let simple = &**chain.rgpChain.add(i);
+                bits.push(simple.TrustStatus.dwErrorStatus);
+                for j in 0..simple.cElement as usize {
+                    bits.push((**simple.rgpElement.add(j)).TrustStatus.dwErrorStatus);
+                }
+            }
+            status_from_bits(&bits)
         }
+    }
+}
+
+/// Maps the trust error bits of a chain and its elements to a status. Pure, so each case is
+/// testable on its own. A revoked bit anywhere makes the chain revoked. A bad signature, unknown
+/// or offline revocation, or a partial chain anywhere makes it undetermined: a signature that does
+/// not verify is no evidence that the chain is good. Otherwise it is good.
+fn status_from_bits(bits: &[u32]) -> Status {
+    const UNDETERMINED: u32 = CERT_TRUST_IS_NOT_SIGNATURE_VALID
+        | CERT_TRUST_REVOCATION_STATUS_UNKNOWN
+        | CERT_TRUST_IS_OFFLINE_REVOCATION
+        | CERT_TRUST_IS_PARTIAL_CHAIN;
+    if bits.iter().any(|bit| bit & CERT_TRUST_IS_REVOKED != 0) {
+        Status::Revoked
+    } else if bits.iter().any(|bit| bit & UNDETERMINED != 0) {
+        Status::Undetermined
+    } else {
+        Status::Good
     }
 }
 
@@ -244,7 +290,12 @@ impl Drop for ChainContext {
 /// CryptoAPI's revocation status for the chain that `leaf` builds. The presented
 /// intermediates and the custom CAs are in the chain's additional store, so CryptoAPI can
 /// reach the issuers that Windows does not trust. Trust is not decided here.
-fn cryptoapi_status(leaf: &[u8], intermediates: &[&[u8]], custom_cas: &[&[u8]]) -> Status {
+fn cryptoapi_status(
+    leaf: &[u8],
+    intermediates: &[&[u8]],
+    custom_cas: &[&[u8]],
+    ocsp: &[u8],
+) -> Status {
     // Each handle has a guard, so every early return frees what was opened.
     let Some(store) = Store::memory() else {
         return Status::Undetermined;
@@ -258,6 +309,11 @@ fn cryptoapi_status(leaf: &[u8], intermediates: &[&[u8]], custom_cas: &[&[u8]]) 
     let Some(leaf) = Context::new(leaf) else {
         return Status::Undetermined;
     };
+    // The stapled response is for the leaf. An empty or refused one is ignored, and CryptoAPI
+    // fetches as usual.
+    if !ocsp.is_empty() {
+        let _attached = leaf.set_ocsp_response(ocsp);
+    }
     let started = Instant::now();
     let status = chain_status(
         "default engine",
@@ -435,7 +491,7 @@ impl ServerCertVerifier for RevocationVerifier {
         let presented: Vec<&[u8]> = intermediates.iter().map(AsRef::as_ref).collect();
         let custom: Vec<&[u8]> = self.custom_cas.iter().map(AsRef::as_ref).collect();
         let leaf: &[u8] = end_entity.as_ref();
-        match in_runtime_blocking(|| cryptoapi_status(leaf, &presented, &custom)) {
+        match in_runtime_blocking(|| cryptoapi_status(leaf, &presented, &custom, ocsp_response)) {
             Status::Good => Ok(ServerCertVerified::assertion()),
             Status::Revoked => Err(rustls::Error::InvalidCertificate(CertificateError::Revoked)),
             Status::Undetermined if self.accept_undetermined => Ok(ServerCertVerified::assertion()),

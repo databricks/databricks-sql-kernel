@@ -530,6 +530,74 @@ async fn custom_ca_configured_as_the_intermediate_is_an_anchor() {
     assert!(err.contains("revoked"), "{err}");
 }
 
+#[test]
+fn status_from_bits_maps_each_case() {
+    // The trust bits are not read, so an untrusted root alone is still good.
+    assert_eq!(status_from_bits(&[]), Status::Good);
+    assert_eq!(status_from_bits(&[0]), Status::Good);
+    assert_eq!(
+        status_from_bits(&[CERT_TRUST_IS_UNTRUSTED_ROOT]),
+        Status::Good
+    );
+    // A bad signature on the chain or on any element is undetermined, never good.
+    assert_eq!(
+        status_from_bits(&[CERT_TRUST_IS_NOT_SIGNATURE_VALID]),
+        Status::Undetermined
+    );
+    assert_eq!(
+        status_from_bits(&[0, CERT_TRUST_IS_NOT_SIGNATURE_VALID]),
+        Status::Undetermined
+    );
+    assert_eq!(
+        status_from_bits(&[CERT_TRUST_REVOCATION_STATUS_UNKNOWN]),
+        Status::Undetermined
+    );
+    assert_eq!(
+        status_from_bits(&[CERT_TRUST_IS_OFFLINE_REVOCATION]),
+        Status::Undetermined
+    );
+    assert_eq!(
+        status_from_bits(&[CERT_TRUST_IS_PARTIAL_CHAIN]),
+        Status::Undetermined
+    );
+    // Revoked wins over an invalid signature.
+    assert_eq!(status_from_bits(&[CERT_TRUST_IS_REVOKED]), Status::Revoked);
+    assert_eq!(
+        status_from_bits(&[CERT_TRUST_IS_NOT_SIGNATURE_VALID, CERT_TRUST_IS_REVOKED]),
+        Status::Revoked
+    );
+}
+
+#[test]
+fn stapled_ocsp_empty_or_garbage_does_not_change_the_outcome() {
+    // An empty response is skipped, and bytes that are not OCSP are attached and then ignored or
+    // refused by CryptoAPI. Neither may change a good chain or a CRL-revoked leaf.
+    let good = fixture(Some(Served::Good), Served::Good, "127.0.0.1");
+    let revoked = fixture(Some(Served::Revoked), Served::Good, "127.0.0.1");
+    for ocsp in [&b""[..], &b"not an ocsp response"[..]] {
+        assert_eq!(
+            cryptoapi_status(
+                good.pki.leaf_der.as_ref(),
+                &[good.pki.intermediate_der.as_ref()],
+                &[good.pki.root_der.as_ref()],
+                ocsp,
+            ),
+            Status::Good,
+            "good chain, ocsp={ocsp:?}"
+        );
+        assert_eq!(
+            cryptoapi_status(
+                revoked.pki.leaf_der.as_ref(),
+                &[revoked.pki.intermediate_der.as_ref()],
+                &[revoked.pki.root_der.as_ref()],
+                ocsp,
+            ),
+            Status::Revoked,
+            "revoked leaf, ocsp={ocsp:?}"
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn multi_thread_runtime_checks_revocation() {
     // The other tests run on current_thread, where `in_runtime_blocking` does not call
