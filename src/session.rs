@@ -367,11 +367,14 @@ impl Session {
         //    it for OIDC discovery / token endpoint calls.
         let http_client_config = build_http_client_config(&config, org_id);
         let retry_configs = build_retry_configs_for_session(&config);
-        let http_client = Arc::new(
-            DatabricksHttpClient::for_session(&host, http_client_config, retry_configs).map_err(
-                |e| Error::network_error().message(format!("Failed to construct HTTP client: {e}")),
-            )?,
-        );
+        let http_client = if config.http.reuse_client_across_sessions {
+            DatabricksHttpClient::for_session(&host, http_client_config, retry_configs)
+        } else {
+            DatabricksHttpClient::new(http_client_config, retry_configs)
+        };
+        let http_client = Arc::new(http_client.map_err(|e| {
+            Error::network_error().message(format!("Failed to construct HTTP client: {e}"))
+        })?);
 
         // 2. Auth provider — async because OAuth flows hit the OIDC
         //    discovery endpoint.

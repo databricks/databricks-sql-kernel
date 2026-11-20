@@ -762,13 +762,8 @@ pub struct HttpConfig {
     pub overall_timeout: Duration,
 
     /// Per-session connection pool size (max idle warm sockets per remote host).
-    /// A live session has exclusive use of its pool. After the HTTP client is
-    /// dropped, a matching session on the same runtime may reuse that pool.
-    /// Idle pools, including sockets and TLS/proxy configuration, expire after
-    /// 90 seconds. Cleanup runs every 15 seconds while the runtime is driven;
-    /// otherwise expired pools are released on cache access or runtime shutdown.
-    /// New sessions never reuse a pool older than five minutes; system trust
-    /// is a snapshot until it is rebuilt.
+    /// A live session has exclusive use of its pool. Cross-session reuse is
+    /// controlled by [`reuse_client_across_sessions`](Self::reuse_client_across_sessions).
     ///
     /// Defaults to `100`, matching the JDBC driver's `HttpConnectionPoolSize`
     /// default. Raise this for workloads that burst many concurrent
@@ -776,6 +771,23 @@ pub struct HttpConfig {
     /// single host; too low a value forces fresh TLS handshakes when the
     /// pool fills.
     pub pool_max_idle_per_host: usize,
+
+    /// Reuse an idle HTTP client across compatible sessions on the same runtime.
+    /// Defaults to `true`. Disabling this preserves keep-alive within a session.
+    ///
+    /// After the last HTTP wrapper drops, idle sockets and TLS/proxy configuration
+    /// may remain for about 105 seconds (90-second expiry plus a 15-second sweep).
+    /// Cleanup requires a driven runtime; otherwise expiry runs on the next cache
+    /// access or runtime shutdown. Reused clients are at most 300 seconds old, so
+    /// a new session's system-trust snapshot can be up to 300 seconds old.
+    ///
+    /// ```
+    /// use databricks_sql_kernel::HttpConfig;
+    /// let mut http = HttpConfig::default();
+    /// assert!(http.reuse_client_across_sessions);
+    /// http.reuse_client_across_sessions = false;
+    /// ```
+    pub reuse_client_across_sessions: bool,
 
     /// Minimum backoff wait between retry attempts. Also the floor for
     /// a server-supplied `Retry-After` and the base of the exponential
@@ -845,6 +857,7 @@ impl Default for HttpConfig {
             request_timeout: Duration::from_secs(120),
             overall_timeout: Duration::from_secs(900),
             pool_max_idle_per_host: 100,
+            reuse_client_across_sessions: true,
             // Mirror `RetryConfig::default()` so a stock `HttpConfig`
             // produces the same retry behaviour the kernel shipped
             // before these knobs were configurable.

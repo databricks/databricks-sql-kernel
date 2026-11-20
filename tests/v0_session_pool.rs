@@ -159,6 +159,34 @@ async fn sequential_sessions_reuse_returned_clients() {
     );
 }
 
+async fn reuse_opt_out_preserves_keep_alive_within_each_session() {
+    let server = Server::start().await;
+    const OPENS: usize = 8;
+    for _ in 0..OPENS {
+        let mut http = HttpConfig::default();
+        http.reuse_client_across_sessions = false;
+        let session = open(&server, "dapi_token", "catalog", http, TlsConfig::default()).await;
+        session.close().await.unwrap();
+        tokio::task::yield_now().await;
+    }
+    let requests = server.requests.lock().unwrap();
+    let creates: HashSet<_> = requests
+        .iter()
+        .filter(|request| request.method == "POST")
+        .map(|request| request.connection)
+        .collect();
+    let deletes: HashSet<_> = requests
+        .iter()
+        .filter(|request| request.method == "DELETE")
+        .map(|request| request.connection)
+        .collect();
+    assert_eq!(creates.len(), OPENS, "reuse opt-out was ignored");
+    assert!(
+        !creates.is_disjoint(&deletes),
+        "reuse opt-out disabled keep-alive within a session"
+    );
+}
+
 async fn sessions_reuse_returned_pools_not_active_pools_or_session_state() {
     let server = Server::start().await;
     let first = open(
@@ -426,6 +454,7 @@ fn session_pool_end_to_end() {
         .block_on(async {
             tokio::time::timeout(Duration::from_secs(20), async {
                 sequential_sessions_reuse_returned_clients().await;
+                reuse_opt_out_preserves_keep_alive_within_each_session().await;
                 sessions_reuse_returned_pools_not_active_pools_or_session_state().await;
                 concurrent_sessions_keep_their_authentication_and_catalogs().await;
                 transport_settings_partition_pools_but_per_request_headers_do_not().await;
