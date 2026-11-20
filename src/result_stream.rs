@@ -652,7 +652,7 @@ impl ResultStream {
         self.volume.is_some()
     }
 
-    /// Complete a server-marked file transfer while retaining its instruction rows.
+    /// Complete a server-marked Volume operation while retaining its instruction rows.
     ///
     /// Ordinary results and read-only attachments have no transfer authority.
     /// `NeedsInputStream` requests owned bytes for the server's stream sentinel;

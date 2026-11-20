@@ -388,7 +388,6 @@ pub struct DatabricksHttpClient {
     retry_configs: HashMap<RequestCategory, RetryConfig>,
 }
 
-#[derive(Default)]
 pub(crate) struct StorageClient {
     pub(crate) read_timeout: Option<Duration>,
     config: HttpClientConfig,
