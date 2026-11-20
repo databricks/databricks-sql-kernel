@@ -41,12 +41,10 @@
 //!   Aborted, Unimplemented, …) lands in a follow-on PR. External
 //!   `match` arms get a forced `_ =>` fallback — they keep compiling
 //!   when the enum grows.
-//! - `Error` **is not** `#[non_exhaustive]`: wrappers want to
-//!   pattern-match (`let Error { code, message, sql_state, .. }`) for
-//!   logging and host-language exception mapping. New fields go
-//!   through `Error::new(...).with_*(...)`, so adding a field is
-//!   non-breaking without the marker. Keeping the marker would block
-//!   useful pattern-matches for no real benefit.
+//! - `Error` **is not** `#[non_exhaustive]`, so wrappers can pattern-match
+//!   (`let Error { code, message, sql_state, .. }`). Build it with
+//!   `Error::new(...).with_*(...)`: a struct literal stops compiling when a
+//!   field is added.
 
 #![allow(dead_code)]
 
@@ -169,9 +167,6 @@ impl ErrorCode {
 /// chain `with_*` setters. **Pattern-matching is supported** —
 /// wrappers writing a comprehensive logger or host-language exception
 /// adapter can do `let Error { code, message, sql_state, .. } = err;`.
-/// New fields land through additive setters, so the type does not
-/// need `#[non_exhaustive]` (and the marker would block the
-/// pattern-matching wrappers actually want).
 #[derive(Debug, Clone)]
 pub struct Error {
     pub code: ErrorCode,

@@ -658,6 +658,9 @@ impl ResultStream {
     /// cached, so a repeat call does not transfer again. A GET downloads to a
     /// temporary file and then copies it over the destination, so a failed
     /// download leaves an existing file unchanged.
+    /// A failure during that copy can leave the destination partly written.
+    /// Cancelling does not undo work already done: a PUT or REMOVE may already
+    /// have reached storage, and a copy that has started runs to the end.
     /// Results from [`Session::attach_async_statement`](crate::Session::attach_async_statement)
     /// cannot run transfers and return `NotVolume`.
     pub async fn complete_volume_operation(

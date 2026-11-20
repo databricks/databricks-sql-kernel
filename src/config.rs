@@ -760,6 +760,7 @@ pub struct HttpConfig {
 
     /// Idle limit for Volume file transfers: a transfer fails after this long
     /// without progress. Also caps connection setup. None sets no limit.
+    /// Exception: a stream PUT that storage redirects is resent without this limit.
     pub storage_read_timeout: Option<Duration>,
 
     /// Maximum total time across retries for a single logical RPC.
