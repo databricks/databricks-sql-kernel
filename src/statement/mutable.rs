@@ -1028,7 +1028,6 @@ impl StatementCanceller {
 
 impl Drop for Statement {
     fn drop(&mut self) {
-        self.volume_state().cancel();
         // Flip the validity flag so any executed handle the caller
         // still holds short-circuits to InvalidStatementHandle on its
         // next call without a network round-trip. Server-side cleanup

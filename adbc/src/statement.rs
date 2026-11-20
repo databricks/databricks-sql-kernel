@@ -1238,7 +1238,6 @@ fn complete_volume(
             Err(unsupported("Volume PUT with input streams"))
         }
         kernel::VolumeCompletion::Completed | kernel::VolumeCompletion::NotVolume => Ok(()),
-        _ => Err(unsupported("Volume completion outcome")),
     }
 }
 

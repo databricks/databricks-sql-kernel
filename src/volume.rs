@@ -61,7 +61,6 @@ impl VolumeOptions {
 }
 
 /// Result of explicitly completing a server-marked Volume instruction.
-#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
 pub enum VolumeCompletion {

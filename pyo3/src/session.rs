@@ -324,8 +324,8 @@ impl Session {
     /// is bounded by the shorter limit. Unset or `0` keeps the kernel default
     /// (120 seconds).
     /// For Volume transfers, a positive value bounds connection establishment,
-    /// GET/REMOVE response-header waits and all response-body reads. PUT header
-    /// waits have no deadline, allowing progressing uploads to finish.
+    /// GET/REMOVE header and body reads, PUT upload inactivity and the PUT
+    /// response-header wait. Redirected stream PUT resends have no idle bound.
     ///
     /// `max_connections` sets the maximum idle connections retained per host.
     /// Unset keeps the kernel default (100); zero is rejected.

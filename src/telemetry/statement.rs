@@ -292,7 +292,7 @@ fn duration_millis(duration: Duration) -> i64 {
 mod tests {
     use super::*;
     use crate::kernel_error::ErrorCode;
-    use crate::reader::test_utils::{BatchThenErrorReader, MockReader};
+    use crate::reader::test_utils::{BatchThenErrorReader, ErrorReader, MockReader};
     use crate::reader::{ResultReader, ResultReaderMetrics};
     use crate::result_stream::ResultStream;
     use crate::telemetry::models::OperationType;
@@ -368,7 +368,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn result_errors_finalize_statement_with_error_before_drop() {
+    async fn peek_first_batch_error_finalizes_statement_with_error_before_drop() {
+        let connection = Arc::new(CapturingConnectionTelemetry::default());
+        let telemetry = StatementTelemetry::new(
+            connection.clone(),
+            StatementType::Sql,
+            OperationType::ExecuteStatement,
+        );
+        let reader = ErrorReader {
+            schema: Arc::new(Schema::empty()),
+        };
+        let mut stream = ResultStream::from_reader(Box::new(reader))
+            .await
+            .expect("schema succeeds");
+        stream.attach_telemetry(telemetry);
+
+        let error = match stream.peek_first_batch().await {
+            Ok(_) => panic!("peek should surface reader error"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, ErrorCode::Internal);
+
+        drop(stream);
+
+        let events = connection.statement_events.lock().expect("events mutex");
+        assert_eq!(
+            events.len(),
+            1,
+            "peek error should finalize once; Drop must not overwrite it with success"
+        );
+        let event = &events[0];
+        assert_eq!(event.context.statement_type, StatementType::Sql);
+        assert_eq!(event.error_code, Some(ErrorCode::Internal));
+        assert_eq!(event.error_message.as_deref(), Some("simulated read error"));
+        assert!(
+            event.context.consumption_latency.is_some(),
+            "failed consumption should still record result-consumption latency"
+        );
+    }
+
+    #[tokio::test]
+    async fn volume_errors_finalize_statement_with_error_before_drop() {
         enum Case {
             VolumeReader,
             Instruction,

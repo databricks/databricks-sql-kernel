@@ -18,7 +18,9 @@ changes go in their respective binding's NEXT_CHANGELOG.
 
 ### Changed
 
-- This minor release adds public fields to `Error` and `ResultManifest`; no Rust consumer outside this repository's PyO3, NAPI and ADBC bindings builds these structs with literals.
+- Adds public fields to `Error` and `ResultManifest`. Code that builds these
+  structs with struct literals must be updated. Supported consumers are the PyO3,
+  NAPI, C ABI and ADBC bindings.
 
 ### Updated
 

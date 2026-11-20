@@ -290,6 +290,41 @@ async fn sync_and_direct_closed_results_complete_explicitly_and_keep_raw_rows() 
 }
 
 #[tokio::test]
+async fn completion_outlives_parent_statement() {
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let destination = dir.path().join("download");
+    let session = session(
+        &server,
+        response(&server, true, destination.to_str().unwrap()),
+    )
+    .await;
+    Mock::given(method("GET"))
+        .and(path("/object"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"downloaded"))
+        .mount(&server)
+        .await;
+    let mut statement = session.statement();
+    statement.spec().sql("operation");
+    let mut executed = statement.execute().await.unwrap();
+    drop(statement);
+    assert_eq!(
+        executed
+            .result_stream_mut()
+            .complete_volume_operation(
+                &VolumeOptions::new(vec![dir.path().to_owned()], false),
+                None,
+            )
+            .await
+            .unwrap(),
+        VolumeCompletion::Completed
+    );
+    assert_eq!(std::fs::read(&destination).unwrap(), b"downloaded");
+    executed.close().await.unwrap();
+    session.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn marker_false_and_id_attachment_cannot_initiate_transfer() {
     for marked in [false, true] {
         let server = MockServer::start().await;

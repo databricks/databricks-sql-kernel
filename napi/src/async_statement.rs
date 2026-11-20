@@ -511,7 +511,7 @@ impl AsyncResultHandle {
                 .ok_or_else(|| closed_err("AsyncResultHandle"))?
                 .complete_volume_operation(&options, None)
                 .await
-                .and_then(crate::result::VolumeCompletion::try_from)
+                .map(crate::result::VolumeCompletion::from)
                 .map_err(napi_err_from_kernel)
         })
         .await

@@ -347,8 +347,6 @@ async fn storage_redirect_rejects_https_to_http_on_the_same_port() {
         .await
         .unwrap()
         .get(format!("https://{address}/object"))
-        .header("authorization", "storage-secret")
-        .header("cookie", "storage-cookie")
         .send()
         .await
         .unwrap_err();
