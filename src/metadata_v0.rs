@@ -490,6 +490,24 @@ pub struct Metadata {
     session: Arc<SessionInner>,
 }
 
+struct TablesCloseGuard {
+    session: Arc<SessionInner>,
+    statement_id: String,
+}
+
+impl Drop for TablesCloseGuard {
+    fn drop(&mut self) {
+        let statement_id = std::mem::take(&mut self.statement_id);
+        if statement_id.is_empty() {
+            return;
+        }
+        let transport = Arc::clone(self.session.transport());
+        self.session.runtime_handle().spawn(async move {
+            transport.close_statement(&statement_id).await.ok();
+        });
+    }
+}
+
 impl Metadata {
     pub(crate) fn new(session: Arc<SessionInner>) -> Self {
         Self { session }
@@ -1048,8 +1066,9 @@ impl Metadata {
         // Read + reshape into `out`. Capture the result rather than `?`-ing
         // out early: the fan-out opens one statement per catalog and
         // `ExecuteResult` has no Drop-based close, so a mid-stream read
-        // error must still close this statement or it leaks server-side
-        // (unlike the streaming paths, which close via a StatementCloseGuard).
+        // error must still close this statement or it leaks server-side.
+        // TablesCloseGuard also reaps it if this future is dropped mid-read
+        // or during the explicit close below.
         //
         // `close_id` returns an empty id when the server already reported
         // `status.state == Closed` (statement reaped server-side); skip the
@@ -1057,6 +1076,10 @@ impl Metadata {
         // streaming metadata paths and the regular-query path in
         // `statement/mutable.rs`.
         let stmt_id = close_id(&raw);
+        let mut close_guard = (!stmt_id.is_empty()).then(|| TablesCloseGuard {
+            session: Arc::clone(&self.session),
+            statement_id: stmt_id,
+        });
         let native = is_native_metadata_result(&raw);
         let mut reader = raw.reader;
         let read: Result<Vec<arrow_array::RecordBatch>> = async {
@@ -1083,12 +1106,13 @@ impl Metadata {
         .await;
         // Best-effort close on every exit (success or error), unless the
         // statement was already closed server-side.
-        if !stmt_id.is_empty() {
+        if let Some(guard) = &mut close_guard {
             self.session
                 .transport()
-                .close_statement(&stmt_id)
+                .close_statement(&guard.statement_id)
                 .await
                 .ok();
+            guard.statement_id.clear();
         }
         read
     }

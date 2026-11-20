@@ -1390,6 +1390,83 @@ async fn list_tables_speculation_closes_result_when_catalog_lookup_fails() {
 }
 
 #[tokio::test]
+async fn list_tables_canceled_speculation_retries_incomplete_close() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+    let catalogs = string_batch(vec![("catalog", vec![Some("bench_name")])]);
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .and(body_string_contains("SHOW CATALOGS"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(closed_inline_response_body(&catalogs))
+                .set_delay(Duration::from_secs(5)),
+        )
+        .mount(&server)
+        .await;
+    let table = string_batch(vec![
+        ("namespace", vec![Some("default")]),
+        ("tableName", vec![Some("t")]),
+        ("tableType", vec![Some("TABLE")]),
+    ]);
+    mount_execute_expecting_sql(
+        &server,
+        "IN CATALOG `bench_name`",
+        succeeded_inline_response_body(&table).replace("stmt-test", "canceled-speculation"),
+    )
+    .await;
+    let closes = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&closes);
+    Mock::given(method("DELETE"))
+        .and(path("/api/2.0/sql/statements/canceled-speculation"))
+        .respond_with(move |_: &wiremock::Request| {
+            let response = ResponseTemplate::new(200).set_body_json(json!({}));
+            if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                response.set_delay(Duration::from_secs(5))
+            } else {
+                response
+            }
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
+    let session = open_session(&server).await;
+    let metadata = session.metadata();
+    let mut future = Box::pin(metadata.list_tables(
+        Some(LikePattern::new("bench_name").unwrap()),
+        None,
+        None,
+        None,
+    ));
+    let closing = async {
+        while closes.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::select! {
+        _ = &mut future => panic!("delayed catalog lookup must still be pending"),
+        result = tokio::time::timeout(Duration::from_secs(2), closing) => {
+            result.expect("speculation must start closing its statement");
+        }
+    }
+    drop(future);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while closes.load(Ordering::SeqCst) < 2 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("dropping metadata must retry its interrupted close");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    server.verify().await;
+    session.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn list_tables_percent_catalog_uses_single_all_catalogs_query() {
     // `%` matches every catalog and is semantically identical to `None`,
     // so it must take the single `SHOW TABLES IN ALL CATALOGS` path, NOT
