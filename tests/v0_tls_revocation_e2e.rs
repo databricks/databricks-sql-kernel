@@ -16,10 +16,12 @@
 //!
 //! ```sh
 //! DATABRICKS_TEST_REVOCATION=strict cargo test --no-default-features \
-//!   --features tls-rustls --test tls_revocation_e2e -- --ignored --nocapture
+//!   --features tls-rustls --test v0_tls_revocation_e2e -- --ignored --nocapture
 //! ```
 //!
-//! `DATABRICKS_TEST_REVOCATION` is `off`, `strict` or `accept_undetermined`.
+//! `DATABRICKS_TEST_REVOCATION` is `off`, `strict` or `accept_undetermined`. `strict` and
+//! `accept_undetermined` work only on Windows with `tls-rustls`. Elsewhere, opening the
+//! session fails with `InvalidArgument`.
 
 mod common;
 
