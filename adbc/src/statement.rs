@@ -495,16 +495,15 @@ impl Statement {
         match key {
             STAGING_ALLOWED_PATHS_OPTION => {
                 let text = expect_string(value, key)?;
-                let roots: Vec<String> = serde_json::from_str(&text).map_err(|_| {
+                let roots: Option<Vec<String>> = serde_json::from_str(&text).map_err(|_| {
                     adbc_error(
-                        format!("{key} expects a JSON array of strings"),
+                        format!("{key} expects a JSON array of strings or null"),
                         Status::InvalidArguments,
                     )
                 })?;
-                self.volume_options = Some(kernel::VolumeOptions::new(
-                    roots.into_iter().map(Into::into).collect(),
-                    true,
-                ));
+                self.volume_options = roots.map(|roots| {
+                    kernel::VolumeOptions::new(roots.into_iter().map(Into::into).collect(), true)
+                });
                 Ok(())
             }
             ENABLE_DIRECT_RESULTS_OPTION => {
@@ -1239,6 +1238,7 @@ fn complete_volume(
             Err(unsupported("Volume PUT with input streams"))
         }
         kernel::VolumeCompletion::Completed | kernel::VolumeCompletion::NotVolume => Ok(()),
+        _ => Err(unsupported("Volume completion outcome")),
     }
 }
 
@@ -1538,6 +1538,61 @@ mod tests {
     use serde_json::json;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn volume_option_null_clears_paths_across_statement_reuse() {
+        let runtime = RuntimeHandle::create().unwrap();
+        let server = runtime.block_on_safe(MockServer::start());
+        runtime.block_on_safe(async {
+            Mock::given(method("POST"))
+                .and(path("/api/2.0/sql/warehouses/wh/sessions"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(json!({"session_id":"session"})),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("DELETE"))
+                .respond_with(ResponseTemplate::new(200))
+                .mount(&server)
+                .await;
+        });
+        let session = runtime
+            .block_on_safe(
+                kernel::Session::builder()
+                    .http_path(server.uri(), "/sql/1.0/warehouses/wh")
+                    .auth(kernel::AuthConfig::Pat {
+                        token: "test-token".into(),
+                        identity_federation_client_id: None,
+                    })
+                    .open(),
+            )
+            .unwrap();
+        let mut statement = Statement::new(
+            session.statement(),
+            session.metadata(),
+            Arc::clone(&runtime),
+            Arc::new(CancellationRegistry::default()),
+            false,
+        );
+        let key = OptionStatement::Other(STAGING_ALLOWED_PATHS_OPTION.into());
+        statement
+            .set_option(key.clone(), r#"["/allowed"]"#.into())
+            .unwrap();
+        statement.set_sql_query("SELECT 1").unwrap();
+        assert_eq!(
+            statement.get_option_string(key.clone()).unwrap(),
+            r#"["/allowed"]"#
+        );
+        statement.set_option(key.clone(), "null".into()).unwrap();
+        statement.set_sql_query("SELECT 2").unwrap();
+        assert!(statement.volume_options.is_none());
+        assert_eq!(
+            statement.get_option_string(key).unwrap_err().status,
+            Status::NotFound
+        );
+        runtime.block_on_safe(session.close()).unwrap();
+    }
 
     #[test]
     fn volume_option_controls_completion_on_all_execution_paths_and_preserves_rows() {

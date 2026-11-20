@@ -62,12 +62,18 @@ pub enum VolumeCompletion {
     Completed,
 }
 
-impl From<databricks_sql_kernel::VolumeCompletion> for VolumeCompletion {
-    fn from(value: databricks_sql_kernel::VolumeCompletion) -> Self {
+impl TryFrom<databricks_sql_kernel::VolumeCompletion> for VolumeCompletion {
+    type Error = databricks_sql_kernel::Error;
+
+    fn try_from(
+        value: databricks_sql_kernel::VolumeCompletion,
+    ) -> databricks_sql_kernel::Result<Self> {
         match value {
-            databricks_sql_kernel::VolumeCompletion::NotVolume => Self::NotVolume,
-            databricks_sql_kernel::VolumeCompletion::NeedsInputStream => Self::NeedsInputStream,
-            databricks_sql_kernel::VolumeCompletion::Completed => Self::Completed,
+            databricks_sql_kernel::VolumeCompletion::NotVolume => Ok(Self::NotVolume),
+            databricks_sql_kernel::VolumeCompletion::NeedsInputStream => Ok(Self::NeedsInputStream),
+            databricks_sql_kernel::VolumeCompletion::Completed => Ok(Self::Completed),
+            _ => Err(databricks_sql_kernel::Error::not_implemented()
+                .message("Unsupported Volume completion outcome")),
         }
     }
 }
@@ -84,12 +90,12 @@ pub(crate) fn complete_volume(
         allowed_paths.into_iter().map(Into::into).collect(),
         remove_not_found_is_success,
     );
-    Ok(run_kernel_interruptible!(
-        py,
-        runtime,
-        stream.complete_volume_operation(&options, input_bytes)
-    )?
-    .into())
+    run_kernel_interruptible!(py, runtime, async {
+        stream
+            .complete_volume_operation(&options, input_bytes)
+            .await
+            .and_then(VolumeCompletion::try_from)
+    })
 }
 
 #[pymethods]

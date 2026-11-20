@@ -247,11 +247,26 @@ pub struct Error {
 }
 
 /// Local filesystem error details retained across language boundaries.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct LocalFileError {
     pub raw_os_error: Option<i32>,
     pub kind: std::io::ErrorKind,
     pub path: String,
+}
+
+impl LocalFileError {
+    pub fn new(
+        raw_os_error: Option<i32>,
+        kind: std::io::ErrorKind,
+        path: impl Into<String>,
+    ) -> Self {
+        Self {
+            raw_os_error,
+            kind,
+            path: path.into(),
+        }
+    }
 }
 
 impl Error {

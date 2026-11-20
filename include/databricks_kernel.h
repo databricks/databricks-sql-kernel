@@ -984,15 +984,17 @@ typedef enum KernelVolumeCompletion {
   KernelVolumeCompletion_Completed = 2
 } KernelVolumeCompletion;
 
-/* Complete a server-marked file transfer while retaining its instruction rows.
- * Roots are a JSON array of strings.
- * The detached result-stream canceller can interrupt completion. */
+/* out is written only on success. */
 KernelStatusCode kernel_executed_statement_is_volume_operation(
     const kernel_executed_statement_t* exec, bool* out);
-/* The cached marker does not establish whether the executed owner is valid. */
+/* The cached marker does not establish whether the executed owner is valid.
+ * out is written only on success. */
 KernelStatusCode kernel_result_stream_is_volume_operation(
     const kernel_result_stream_t* stream, bool* out);
-/* out_status is written only on success. */
+/* Complete a server-marked Volume operation while retaining its instruction rows.
+ * Roots are a JSON array of strings.
+ * The detached result-stream canceller can interrupt completion.
+ * out_status is written only on success. */
 KernelStatusCode kernel_result_stream_complete_volume_operation(
     kernel_result_stream_t* stream, const char* allowed_paths_json,
     bool remove_not_found_is_success, KernelVolumeCompletion* out_status);

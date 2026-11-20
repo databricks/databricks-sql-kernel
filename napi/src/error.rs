@@ -209,11 +209,11 @@ mod tests {
     #[test]
     fn local_error_metadata_is_optional_and_preserved() {
         let mut error = KernelError::not_found().message("missing local file");
-        error.local_error = Some(Box::new(databricks_sql_kernel::LocalFileError {
-            raw_os_error: Some(2),
-            kind: std::io::ErrorKind::NotFound,
-            path: "local-file".into(),
-        }));
+        error.local_error = Some(Box::new(databricks_sql_kernel::LocalFileError::new(
+            Some(2),
+            std::io::ErrorKind::NotFound,
+            "local-file",
+        )));
         let encoded = napi_err_from_kernel(error);
         let value: Value = serde_json::from_str(&encoded.reason[ERROR_SENTINEL.len()..]).unwrap();
         assert_eq!(value["localOsError"], 2);

@@ -285,11 +285,11 @@ mod tests {
         let mut error = Error::sql_error()
             .message("statement gone")
             .with_error_code("STATEMENT_NOT_FOUND");
-        error.local_error = Some(Box::new(crate::kernel_error::LocalFileError {
-            raw_os_error: Some(2),
-            kind: std::io::ErrorKind::NotFound,
-            path: "local-file".into(),
-        }));
+        error.local_error = Some(Box::new(crate::kernel_error::LocalFileError::new(
+            Some(2),
+            std::io::ErrorKind::NotFound,
+            "local-file",
+        )));
         store_error(error);
         with_last_error(|e| {
             let e = e.expect("error present");

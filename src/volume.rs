@@ -61,6 +61,7 @@ impl VolumeOptions {
 }
 
 /// Result of explicitly completing a server-marked Volume instruction.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
 pub enum VolumeCompletion {
@@ -192,7 +193,7 @@ impl VolumeState {
         } else {
             None
         };
-        let started = std::time::Instant::now();
+        let mut retry_started = None;
         let mut attempt = 0;
         loop {
             let mut retry_after = None;
@@ -209,6 +210,7 @@ impl VolumeState {
                 Ok(completion) => return Ok(completion),
                 Err(error) => error,
             };
+            let started = retry_started.get_or_insert_with(std::time::Instant::now);
             if !error.retryable || attempt >= self.retry.max_retries {
                 return Err(error.message(format!("after {} attempts", attempt + 1)));
             }
@@ -516,11 +518,11 @@ fn local_error(error: std::io::Error, path: &str) -> Error {
     .with_error_code("VOLUME_LOCAL_FILE_ERROR")
     .with_sql_state("HY000")
     .message(format!("{error}: {path}"))
-    .with_local_error(LocalFileError {
-        raw_os_error: error.raw_os_error(),
-        kind: error.kind(),
-        path: path.to_owned(),
-    })
+    .with_local_error(LocalFileError::new(
+        error.raw_os_error(),
+        error.kind(),
+        path,
+    ))
 }
 
 fn normalize(path: &Path) -> Result<PathBuf> {
@@ -774,6 +776,14 @@ mod tests {
         }
     }
 
+    fn storage(read_timeout: Option<Duration>) -> Arc<crate::client::http::StorageClient> {
+        Arc::new(
+            crate::client::DatabricksHttpClient::with_default_retry(Default::default())
+                .unwrap()
+                .storage_client(read_timeout),
+        )
+    }
+
     fn transfer_state(max_retries: u32) -> Arc<VolumeState> {
         VolumeState::new(
             RetryConfig {
@@ -782,11 +792,7 @@ mod tests {
                 max_wait: Duration::ZERO,
                 ..Default::default()
             },
-            Arc::new(
-                crate::client::DatabricksHttpClient::with_default_retry(Default::default())
-                    .unwrap()
-                    .storage_client(None),
-            ),
+            storage(None),
             Default::default(),
         )
     }
@@ -851,7 +857,9 @@ mod tests {
                         assert_eq!(request.body, b"payload");
                     }
                     if count.fetch_add(1, Ordering::SeqCst) == 0 {
-                        ResponseTemplate::new(503).insert_header("retry-after", "0")
+                        ResponseTemplate::new(503)
+                            .insert_header("retry-after", "0")
+                            .set_delay(Duration::from_millis(200))
                     } else {
                         ResponseTemplate::new(200).set_body_bytes(b"payload")
                     }
@@ -876,7 +884,8 @@ mod tests {
                 &file
             };
             let batch = instruction(operation, &format!("{}/object", server.uri()), local);
-            let state = transfer_state(6);
+            let mut state = transfer_state(6);
+            Arc::get_mut(&mut state).unwrap().retry.overall_timeout = Duration::from_millis(100);
             let options = options(dir.path());
             assert_eq!(
                 state
@@ -940,11 +949,7 @@ mod tests {
                     max_wait: Duration::ZERO,
                     ..Default::default()
                 },
-                Arc::new(
-                    crate::client::DatabricksHttpClient::with_default_retry(Default::default())
-                        .unwrap()
-                        .storage_client(None),
-                ),
+                storage(None),
                 Default::default(),
             );
             let batch = instruction(
@@ -990,11 +995,7 @@ mod tests {
                 max_wait: Duration::from_secs(30),
                 ..Default::default()
             },
-            Arc::new(
-                crate::client::DatabricksHttpClient::with_default_retry(Default::default())
-                    .unwrap()
-                    .storage_client(None),
-            ),
+            storage(None),
             Default::default(),
         );
         let batch = instruction("REMOVE", &server.uri(), Path::new(""));
@@ -1284,11 +1285,7 @@ mod tests {
                 transfer_state(if operation == "PUT" { 1 } else { 0 })
                     .retry
                     .clone(),
-                Arc::new(
-                    crate::client::DatabricksHttpClient::with_default_retry(Default::default())
-                        .unwrap()
-                        .storage_client(Some(Duration::from_millis(150))),
-                ),
+                storage(Some(Duration::from_millis(150))),
                 Default::default(),
             );
             let batch = instruction(operation, &url, &dest);
@@ -1339,11 +1336,7 @@ mod tests {
         let dest = dir.path().join("download");
         let state = VolumeState::new(
             transfer_state(0).retry.clone(),
-            Arc::new(
-                crate::client::DatabricksHttpClient::with_default_retry(Default::default())
-                    .unwrap()
-                    .storage_client(Some(Duration::from_millis(150))),
-            ),
+            storage(Some(Duration::from_millis(150))),
             Default::default(),
         );
         state
@@ -1413,11 +1406,7 @@ mod tests {
             });
             let state = VolumeState::new(
                 transfer_state(0).retry.clone(),
-                Arc::new(
-                    crate::client::DatabricksHttpClient::with_default_retry(Default::default())
-                        .unwrap()
-                        .storage_client(Some(Duration::from_millis(150))),
-                ),
+                storage(Some(Duration::from_millis(150))),
                 Default::default(),
             );
             let error = tokio::time::timeout(
