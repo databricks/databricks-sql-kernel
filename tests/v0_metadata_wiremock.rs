@@ -1201,19 +1201,38 @@ async fn list_tables_speculation_preserves_catalog_matches_types_and_values() {
                     rows, expected,
                     "pattern={pattern}, native={native}, types={filter:?}"
                 );
-                let statements = server
-                    .received_requests()
-                    .await
-                    .unwrap()
-                    .iter()
-                    .filter(|request| {
-                        request.method == "POST" && request.url.path() == "/api/2.0/sql/statements"
-                    })
-                    .count();
+                // Unmatched speculation may finish after the typed empty result.
+                let statements = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                    loop {
+                        let statements = server
+                            .received_requests()
+                            .await
+                            .unwrap()
+                            .iter()
+                            .filter(|request| {
+                                request.method == "POST"
+                                    && request.url.path() == "/api/2.0/sql/statements"
+                            })
+                            .count();
+                        if statements >= *count {
+                            break statements;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .expect("all expected catalog executes must eventually be submitted");
                 assert_eq!(
                     statements, *count,
-                    "pattern={pattern}, native={native}, types={filter:?}"
+                    "pattern={pattern}, matched={matched:?}, native={native}, types={filter:?}"
                 );
+                if *count == matched.len() + 2 {
+                    assert_eq!(
+                        wait_for_close_delete(&server, 1, std::time::Duration::from_secs(2)).await,
+                        1,
+                        "unused failed speculation must close before fixture teardown"
+                    );
+                }
                 session.close().await.unwrap();
             }
         }
