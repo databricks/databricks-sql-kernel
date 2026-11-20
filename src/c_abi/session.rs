@@ -3565,7 +3565,11 @@ mod revocation_open_windows_tests {
             assert!(crate::c_abi::error::kernel_get_last_error(out.as_mut_ptr()));
             let error = out.assume_init();
             let message = CStr::from_ptr(error.message).to_str().unwrap();
-            assert!(message.contains("revoked"), "{message}");
+            // rustls renders the error as "invalid peer certificate: Revoked".
+            assert!(
+                message.to_ascii_lowercase().contains("revoked"),
+                "{message}"
+            );
         }
     }
 }
