@@ -29,7 +29,7 @@ use napi::bindgen_prelude::Buffer;
 
 use crate::error::napi_err_from_kernel;
 
-const IPC_TARGET_BYTES: usize = 2 * 1024 * 1024;
+const IPC_TARGET_BYTES: usize = 1024 * 1024;
 
 /// A single Arrow IPC stream payload encoding one or more record batches (plus
 /// the schema header so the JS-side reader is stateless).

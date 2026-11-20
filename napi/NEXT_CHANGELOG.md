@@ -16,7 +16,7 @@ layout, or npm publishing. Pure-kernel changes go in the root
 
 ### Changed
 
-- Result fetches pack already-buffered Arrow batches into bounded IPC payloads to reduce Node.js crossings, without waiting for another download.
+- Result fetches pack already-buffered Arrow batches into IPC payloads capped at 16,384 rows, 1MiB of sliced Arrow data (excluding IPC framing), and 16 messages, without waiting for another download. Single oversized batches and schemas containing dictionaries retain one batch per payload.
 
 ### Updated
 
