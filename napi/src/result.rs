@@ -339,8 +339,12 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Utf8, true)]));
         let batch = RecordBatch::try_new(schema.clone(), vec![array]).unwrap();
         let mut stream = IpcStream::new(Source::new(vec![batch.clone(), batch.clone()]));
-        assert_eq!(next(&mut stream, &schema).await, vec![batch.clone()]);
-        assert_eq!(next(&mut stream, &schema).await, vec![batch]);
+        let first = next(&mut stream, &schema).await;
+        assert_eq!(first.len(), 1);
+        assert!(first[0] == batch);
+        let second = next(&mut stream, &schema).await;
+        assert_eq!(second.len(), 1);
+        assert!(second[0] == batch);
         assert!(stream.next(&schema, "test").await.unwrap().is_none());
     }
 
@@ -356,7 +360,7 @@ mod tests {
         )
         .unwrap();
         let mut stream = IpcStream::new(Source::new(vec![batch.clone(), batch.clone()]));
-        assert_eq!(next(&mut stream, &schema).await, vec![batch]);
+        assert!(next(&mut stream, &schema).await == vec![batch]);
         assert_eq!(stream.source.probes, 0);
     }
 
@@ -416,7 +420,17 @@ mod tests {
 
     #[tokio::test]
     async fn nullable_arrow_types_and_metadata_round_trip_across_messages() {
+        use arrow_array::builder::{Int32Builder, MapBuilder, StringBuilder};
         use arrow_array::*;
+        let mut map = MapBuilder::new(None, StringBuilder::new(), Int32Builder::new());
+        map.keys().append_value("key");
+        map.values().append_null();
+        map.append(true).unwrap();
+        map.append(false).unwrap();
+        let structure = StructArray::from(vec![(
+            Arc::new(Field::new("nested", DataType::Utf8, true)),
+            Arc::new(StringArray::from(vec![Some("value"), None])) as ArrayRef,
+        )]);
         let arrays: Vec<ArrayRef> = vec![
             Arc::new(BooleanArray::from(vec![Some(true), None])),
             Arc::new(Int8Array::from(vec![Some(-1), None])),
@@ -463,6 +477,20 @@ mod tests {
                 None,
             ])),
             Arc::new(NullArray::new(2)),
+            Arc::new(map.finish()),
+            Arc::new(structure),
+            Arc::new(
+                Decimal256Array::from(vec![
+                    Some(
+                        "123456789012345678901234567890123456789012"
+                            .parse()
+                            .unwrap(),
+                    ),
+                    None,
+                ])
+                .with_precision_and_scale(50, 12)
+                .unwrap(),
+            ),
         ];
         let fields = arrays
             .iter()

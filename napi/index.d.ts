@@ -721,13 +721,13 @@ export interface RawParameterInput {
   value?: string
 }
 /**
- * A single Arrow IPC stream payload encoding one record batch (plus
+ * A single Arrow IPC stream payload encoding one or more record batches (plus
  * the schema header so the JS-side reader is stateless).
  */
 export interface ArrowBatch {
   /**
-   * Arrow IPC stream payload (schema header + 1 record-batch
-   * message). Decode with `apache-arrow`'s `RecordBatchReader`.
+   * Arrow IPC stream payload (schema header + record-batch messages).
+   * Decode with `apache-arrow`'s `RecordBatchReader`.
    */
   ipcBytes: Buffer
 }
@@ -887,10 +887,10 @@ export declare class AsyncResultHandle {
   /**
    * Pull the next batch of results. Returns `null` when the
    * stream is exhausted. The returned `ArrowBatch.ipcBytes` is a
-   * complete Arrow IPC stream (schema header + 1 record-batch
-   * message), suitable for handing to `apache-arrow`'s
-   * `RecordBatchReader`. Byte-identical to the sync
-   * `Statement.fetchNextBatch()` payload for the same query.
+   * complete Arrow IPC stream (schema header + one or more record-batch
+   * messages), suitable for handing to `apache-arrow`'s
+   * `RecordBatchReader`. Uses the same bounded packing as
+   * `Statement.fetchNextBatch()`.
    * Rejects with `KernelError(InvalidStatementHandle)` after the
    * parent `AsyncStatement` is closed (see `AsyncStatement.close()`).
    */
@@ -1225,7 +1225,7 @@ export declare class Statement {
   /**
    * Pull the next batch of results. Returns `null` when the stream
    * is exhausted. The returned `ArrowBatch.ipcBytes` is a complete
-   * Arrow IPC stream (schema header + 1 record-batch message)
+   * Arrow IPC stream (schema header + one or more record-batch messages)
    * suitable for handing to `apache-arrow`'s `RecordBatchReader`.
    *
    * On `Err`, the stream is in an unspecified state — call
