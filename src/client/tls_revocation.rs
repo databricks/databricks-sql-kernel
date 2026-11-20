@@ -12,575 +12,184 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! CRL revocation checking for the `tls-rustls` backend.
+//! Certificate revocation for the `tls-rustls` backend on Windows, through CryptoAPI.
 //!
-//! The server verifier builds the chain with webpki first, so a bad chain never
-//! reaches the network. It then fetches the CRLs named by the distribution points
-//! of each non-self-issued certificate and hands the current ones to webpki, which
-//! checks their signatures and the revocation status. The DER reader here only
-//! selects CRLs and reads issuer names and `nextUpdate`. Authenticity is webpki's.
+//! Trust stays with webpki. The connection's `WebPkiServerVerifier`, over the kernel's
+//! roots, verifies the chain, the name and the signatures, as it does with revocation off.
+//! Only after that succeeds is revocation asked of CryptoAPI (`CertGetCertificateChain`).
+//! CryptoAPI builds the chain from the leaf, the presented intermediates and the custom CAs,
+//! and checks the revocation of every certificate except the root. Its CRL and OCSP fetches
+//! use the Windows networking stack and proxy settings, and Windows caches their results.
+//!
+//! The decision reads the chain-level revocation bits only. The trust bits, including the
+//! root's, are ignored.
+//!
+//! This module is compiled only on Windows with `tls-rustls`. Elsewhere, revocation is
+//! rejected at session open.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, Instant};
+use std::ptr::{null, null_mut};
+use std::sync::Arc;
+use std::time::Duration;
 
-use der::asn1::{AnyRef, GeneralizedTime, UtcTime};
-use der::{Decode, Reader, SliceReader, Tagged};
-use reqwest::StatusCode;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::client::WebPkiServerVerifier;
-use rustls::crypto::CryptoProvider;
-use rustls::pki_types::{
-    pem::PemObject, CertificateDer, CertificateRevocationListDer, PrivateKeyDer, ServerName,
-    UnixTime,
-};
+use rustls::pki_types::{pem::PemObject, CertificateDer, ServerName, UnixTime};
 use rustls::{
-    CertRevocationListError, CertificateError, ClientConfig, DigitallySignedStruct, RootCertStore,
-    SignatureScheme,
+    CertificateError, ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme,
+};
+use windows_sys::Win32::Security::Cryptography::{
+    CertAddCertificateContextToStore, CertCloseStore, CertCreateCertificateContext,
+    CertFreeCertificateChain, CertFreeCertificateContext, CertGetCertificateChain, CertOpenStore,
+    CERT_CHAIN_CONTEXT, CERT_CHAIN_PARA, CERT_CHAIN_REVOCATION_ACCUMULATIVE_TIMEOUT,
+    CERT_CHAIN_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT, CERT_CONTEXT, CERT_STORE_ADD_ALWAYS,
+    CERT_STORE_PROV_MEMORY, CERT_TRUST_IS_OFFLINE_REVOCATION, CERT_TRUST_IS_PARTIAL_CHAIN,
+    CERT_TRUST_IS_REVOKED, CERT_TRUST_REVOCATION_STATUS_UNKNOWN, HCERTSTORE, PKCS_7_ASN_ENCODING,
+    X509_ASN_ENCODING,
 };
 
-use super::http::{CrlFetchLimits, ProxyConfig, TlsConfig};
+use super::http::TlsConfig;
 use crate::kernel_error::{Error, Result};
-use crate::klog::debug;
-use crate::util::runtime::{ambient_rust_min_stack, runtime_thread_stack_size};
 
-const TAG_INTEGER: u8 = 0x02;
-const TAG_UTC_TIME: u8 = 0x17;
-const TAG_GENERALIZED_TIME: u8 = 0x18;
-const TAG_SEQUENCE: u8 = 0x30;
-/// Context [0]: explicit version, `distributionPoint`, `fullName`.
-const TAG_CONTEXT_0: u8 = 0xA0;
-/// Context [2]: `cRLIssuer` (an indirect CRL, which is not supported).
-const TAG_CONTEXT_2: u8 = 0xA2;
-/// Context [3]: certificate extensions.
-const TAG_CONTEXT_3: u8 = 0xA3;
-/// Context [6] primitive: a `uniformResourceIdentifier`.
-const TAG_URI: u8 = 0x86;
-/// OID 2.5.29.31, the CRL distribution points extension (content octets).
-const OID_CRL_DISTRIBUTION_POINTS: &[u8] = &[0x55, 0x1D, 0x1F];
-/// How long a failed fetch is remembered, so an unreachable endpoint is not waited on again
-/// by every handshake.
-const FAILED_FETCH_TTL: Duration = Duration::from_secs(60);
-/// Caps on the cached CRLs, by count and by total bytes.
-const MAX_CACHED_CRLS: usize = 64;
-const MAX_CACHED_BYTES: usize = 16 * 1024 * 1024;
+/// The budget for CRL and OCSP retrieval for one chain. CryptoAPI applies it to all of the
+/// chain's fetches together (`CERT_CHAIN_REVOCATION_ACCUMULATIVE_TIMEOUT`).
+const REVOCATION_TIMEOUT: Duration = Duration::from_secs(10);
+/// The chain flags: check every certificate except the root.
+const CHAIN_FLAGS: u32 =
+    CERT_CHAIN_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT | CERT_CHAIN_REVOCATION_ACCUMULATIVE_TIMEOUT;
 
-/// A verification failure the verifier raises itself. It carries a message for the caller
-/// and is classified as a certificate-verification failure.
-#[derive(Debug)]
-struct VerifierError(String);
-
-impl std::fmt::Display for VerifierError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for VerifierError {}
-
-fn verifier_error(message: String) -> rustls::Error {
-    rustls::Error::InvalidCertificate(CertificateError::Other(rustls::OtherError(Arc::new(
-        VerifierError(message),
-    ))))
-}
-
-// Tests set a per-thread fetch bound here. The client is built on the calling thread, so
-// the bound in effect at construction is the one the fetcher keeps.
-#[cfg(test)]
-thread_local! {
-    pub(crate) static TEST_CRL_LIMITS: std::cell::Cell<Option<CrlFetchLimits>> =
-        const { std::cell::Cell::new(None) };
-}
-
-/// The CRL fetch bounds: production defaults, or a test override on this thread.
-fn crl_fetch_limits() -> CrlFetchLimits {
-    #[cfg(test)]
-    if let Some(limits) = TEST_CRL_LIMITS.with(std::cell::Cell::get) {
-        return limits;
-    }
-    CrlFetchLimits::default()
-}
-
-/// The (tag, content) pairs of the consecutive TLVs in `der`.
-fn tlvs(der: &[u8]) -> Option<Vec<(u8, &[u8])>> {
-    let mut reader = SliceReader::new(der).ok()?;
-    let mut out = Vec::new();
-    while !reader.is_finished() {
-        let any = AnyRef::decode(&mut reader).ok()?;
-        out.push((any.tag().into(), any.value()));
-    }
-    Some(out)
-}
-
-/// The children of the single SEQUENCE that `der` consists of.
-fn sequence(der: &[u8]) -> Option<Vec<(u8, &[u8])>> {
-    match tlvs(der)?.as_slice() {
-        [(TAG_SEQUENCE, body)] => tlvs(body),
-        _ => None,
-    }
-}
-
-/// The fields of a certificate that the revocation check needs.
-struct Cert<'a> {
-    issuer: &'a [u8],
-    subject: &'a [u8],
-    spki: &'a [u8],
-    crl_uris: Vec<String>,
-}
-
-fn parse_cert(der: &[u8]) -> Option<Cert<'_>> {
-    let top = sequence(der)?;
-    let fields = tlvs(top.first()?.1)?;
-    // Optional explicit version, then serialNumber, signature, issuer, validity, subject.
-    let base = usize::from(fields.first()?.0 == TAG_CONTEXT_0);
-    let issuer = fields.get(base + 2)?.1;
-    let subject = fields.get(base + 4)?.1;
-    let spki = fields.get(base + 5)?.1;
-    let mut crl_uris = Vec::new();
-    if let Some(&(_, extensions)) = fields.iter().find(|f| f.0 == TAG_CONTEXT_3) {
-        for (_, extension) in sequence(extensions)? {
-            let parts = tlvs(extension)?;
-            if parts.first()?.1 == OID_CRL_DISTRIBUTION_POINTS {
-                crl_uris = distribution_points(parts.last()?.1)?;
-            }
-        }
-    }
-    Some(Cert {
-        issuer,
-        subject,
-        spki,
-        crl_uris,
-    })
-}
-
-/// Whether `cert` is one of the configured trust anchors. Matching is by subject
-/// and SPKI, as webpki matches anchors, so a same-name certificate with a different
-/// key is not an anchor.
-fn is_trust_anchor(roots: &RootCertStore, cert: &Cert<'_>) -> bool {
-    roots.roots.iter().any(|anchor| {
-        anchor.subject.as_ref() == cert.subject
-            && anchor.subject_public_key_info.as_ref() == cert.spki
-    })
-}
-
-/// The http(s) URIs of a CRLDistributionPoints value. Indirect points are skipped.
-fn distribution_points(value: &[u8]) -> Option<Vec<String>> {
-    let mut uris = Vec::new();
-    for (_, point) in sequence(value)? {
-        let parts = tlvs(point)?;
-        if parts.iter().any(|part| part.0 == TAG_CONTEXT_2) {
-            continue;
-        }
-        for (_, name) in parts.iter().filter(|part| part.0 == TAG_CONTEXT_0) {
-            general_names(name, &mut uris)?;
-        }
-    }
-    Some(uris)
-}
-
-/// Collects http(s) URIs from a DistributionPointName. Nested wrappers are followed.
-/// Directory and relative names are ignored.
-fn general_names(der: &[u8], out: &mut Vec<String>) -> Option<()> {
-    for (tag, value) in tlvs(der)? {
-        match tag {
-            TAG_URI => {
-                if let Ok(uri) = std::str::from_utf8(value) {
-                    let lower = uri.to_ascii_lowercase();
-                    if lower.starts_with("http://") || lower.starts_with("https://") {
-                        out.push(uri.to_owned());
-                    }
-                }
-            }
-            TAG_CONTEXT_0 | TAG_SEQUENCE => general_names(value, out)?,
-            _ => {}
-        }
-    }
-    Some(())
-}
-
-/// The fields of a CRL that the classification needs.
-struct Crl<'a> {
-    issuer: &'a [u8],
-    next_update: Option<u64>,
-}
-
-fn parse_crl(der: &[u8]) -> Option<Crl<'_>> {
-    let top = sequence(der)?;
-    let fields = tlvs(top.first()?.1)?;
-    // Optional version, then signature, issuer, thisUpdate, nextUpdate.
-    let base = usize::from(fields.first()?.0 == TAG_INTEGER);
-    let issuer = fields.get(base + 1)?.1;
-    let next_update = match fields.get(base + 3) {
-        Some(&(tag, value)) if tag == TAG_UTC_TIME || tag == TAG_GENERALIZED_TIME => {
-            Some(to_unix_secs(tag, value)?)
-        }
-        _ => None,
-    };
-    Some(Crl {
-        issuer,
-        next_update,
-    })
-}
-
-/// Unix seconds of a UTCTime or GeneralizedTime, given its tag and contents.
-fn to_unix_secs(tag: u8, value: &[u8]) -> Option<u64> {
-    let mut tlv = vec![tag, u8::try_from(value.len()).ok()?];
-    tlv.extend_from_slice(value);
-    let at = if tag == TAG_UTC_TIME {
-        UtcTime::from_der(&tlv).ok()?.to_unix_duration()
-    } else {
-        GeneralizedTime::from_der(&tlv).ok()?.to_unix_duration()
-    };
-    Some(at.as_secs())
-}
-
-/// The outcome of checking one fetched CRL against the certificate it covers.
-enum Verdict {
-    Current,
+/// The revocation status of a chain, as CryptoAPI reports it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Status {
+    Good,
+    /// CryptoAPI could not determine the status: a fetch failed or the server is offline, the
+    /// chain is partial, or no chain could be built at all.
     Undetermined,
-    WrongIssuer,
+    Revoked,
 }
 
-fn classify(der: &[u8], cert_issuer: &[u8], now: u64) -> Verdict {
-    if webpki::BorrowedCertRevocationList::from_der(der).is_err() {
-        return Verdict::Undetermined;
-    }
-    match parse_crl(der) {
-        Some(crl) if crl.issuer != cert_issuer => Verdict::WrongIssuer,
-        Some(Crl {
-            next_update: Some(next),
-            ..
-        }) if now <= next => Verdict::Current,
-        _ => Verdict::Undetermined,
-    }
-}
+/// An in-memory certificate store. Closed on drop.
+struct Store(HCERTSTORE);
 
-/// A cached CRL and its nextUpdate in Unix seconds.
-type CachedCrl = (Arc<Vec<u8>>, u64);
+impl Store {
+    fn memory() -> Option<Self> {
+        // SAFETY: the memory provider takes no parameters.
+        let handle = unsafe { CertOpenStore(CERT_STORE_PROV_MEMORY, 0, 0, 0, null()) };
+        (!handle.is_null()).then_some(Self(handle))
+    }
 
-/// Drops expired CRLs, then the ones that expire soonest until the count and byte caps hold.
-fn trim_cache(cache: &mut HashMap<String, CachedCrl>, now: u64) {
-    cache.retain(|_, (_, next)| now <= *next);
-    while cache.len() > MAX_CACHED_CRLS || cached_bytes(cache) > MAX_CACHED_BYTES {
-        let Some(soonest) = cache
-            .iter()
-            .min_by_key(|(_, (_, next))| *next)
-            .map(|(url, _)| url.clone())
-        else {
-            break;
+    /// Adds a copy of `der`. The store keeps its own reference, so the temporary context is
+    /// freed when it drops.
+    fn add(&self, der: &[u8]) -> bool {
+        let Some(context) = Context::new(der) else {
+            return false;
         };
-        cache.remove(&soonest);
-    }
-}
-
-fn cached_bytes(cache: &HashMap<String, CachedCrl>) -> usize {
-    cache.values().map(|(der, _)| der.len()).sum()
-}
-
-/// Fetches CRLs through one worker. Each CRL is cached until its `nextUpdate`, within the
-/// caps, and a failed fetch is remembered for `FAILED_FETCH_TTL`.
-#[derive(Debug)]
-struct CrlFetcher {
-    proxy: ProxyConfig,
-    limits: CrlFetchLimits,
-    /// The connection's custom CA roots, so an HTTPS CRL endpoint behind that CA verifies.
-    custom_roots: Vec<reqwest::Certificate>,
-    /// URL to (CRL bytes, nextUpdate in Unix seconds).
-    cache: Mutex<HashMap<String, CachedCrl>>,
-    /// URL to the time its last fetch failed.
-    failed: Mutex<HashMap<String, Instant>>,
-    /// Started on the first fetch, then reused for every chain this fetcher verifies.
-    worker: Mutex<Option<CrlWorker>>,
-}
-
-impl CrlFetcher {
-    /// The CRL at `url`, from cache while current, otherwise fetched within `budget`.
-    /// `None` means the fetch failed, no budget was left, or the URL failed recently.
-    fn get(&self, url: &str, now: u64, budget: Duration) -> Option<Arc<Vec<u8>>> {
-        {
-            let mut cache = self.cache.lock().unwrap_or_else(PoisonError::into_inner);
-            trim_cache(&mut cache, now);
-            if let Some((der, _)) = cache.get(url) {
-                return Some(Arc::clone(der));
-            }
+        // SAFETY: both handles are live, and no output context is requested.
+        unsafe {
+            CertAddCertificateContextToStore(self.0, context.0, CERT_STORE_ADD_ALWAYS, null_mut())
+                != 0
         }
-        if budget.is_zero() || self.failed_recently(url) {
-            return None;
-        }
-        // The lock covers only starting the worker and queuing the request. The wait for the
-        // answer happens after it is released, so concurrent verifications do not serialize.
-        let answer = {
-            let mut worker = self.worker.lock().unwrap_or_else(PoisonError::into_inner);
-            if worker.is_none() {
-                match CrlWorker::start(self.proxy.clone(), self.limits, self.custom_roots.clone()) {
-                    Ok(started) => *worker = Some(started),
-                    Err(reason) => {
-                        debug!("CRL worker failed to start: {reason}");
-                        return None;
-                    }
-                }
-            }
-            match worker.as_ref() {
-                Some(started) => started.submit(url, budget),
-                None => Err("CRL worker is not running".to_owned()),
-            }
-        };
-        let fetched = match answer {
-            Ok(received) => in_runtime_blocking(|| received.recv())
-                .unwrap_or_else(|_| Err("CRL worker stopped".to_owned())),
-            Err(reason) => Err(reason),
-        };
-        let der = match fetched {
-            Ok(der) => Arc::new(der),
-            Err(reason) => {
-                debug!("CRL fetch failed for {}: {reason}", redacted(url));
-                // A fetch given only a sliver of the chain's budget says little about the
-                // endpoint, so only a fetch with most of its time is remembered.
-                if budget >= self.limits.timeout / 2 {
-                    self.failed
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .insert(url.to_owned(), Instant::now());
-                }
-                return None;
-            }
-        };
-        self.failed
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(url);
-        if let Some(next) = parse_crl(&der)
-            .and_then(|crl| crl.next_update)
-            .filter(|next| now <= *next)
-        {
-            let mut cache = self.cache.lock().unwrap_or_else(PoisonError::into_inner);
-            cache.insert(url.to_owned(), (Arc::clone(&der), next));
-            trim_cache(&mut cache, now);
-        }
-        Some(der)
-    }
-
-    fn failed_recently(&self, url: &str) -> bool {
-        let mut failed = self.failed.lock().unwrap_or_else(PoisonError::into_inner);
-        failed.retain(|_, at| at.elapsed() < FAILED_FETCH_TTL);
-        failed.contains_key(url)
-    }
-
-    fn evict(&self, url: &str) {
-        self.cache
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(url);
     }
 }
 
-/// A fetch to run: the URL, the time it may take, and where the answer goes.
-type CrlRequest = (
-    String,
-    Duration,
-    std::sync::mpsc::Sender<std::result::Result<Vec<u8>, String>>,
-);
-
-/// The thread that runs a fetcher's CRL fetches. It has one current-thread runtime and one
-/// reqwest client. Each request runs as its own task, so concurrent fetches overlap.
-///
-/// Dropping the worker closes its request channel. The thread then finishes its in-flight
-/// fetches, each bounded by the per-fetch timeout, and the drop waits at most that long.
-/// The module is pinned before the thread starts (see [`pin_crate_module_once`]), so a host
-/// that unloads this library cannot unmap the thread's code, even when a fetch outlives
-/// that wait.
-struct CrlWorker {
-    requests: Option<tokio::sync::mpsc::UnboundedSender<CrlRequest>>,
-    /// Disconnects when the thread has finished.
-    exited: std::sync::mpsc::Receiver<()>,
-    timeout: Duration,
-}
-
-impl std::fmt::Debug for CrlWorker {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("CrlWorker")
-    }
-}
-
-impl CrlWorker {
-    fn start(
-        proxy: ProxyConfig,
-        limits: CrlFetchLimits,
-        roots: Vec<reqwest::Certificate>,
-    ) -> std::io::Result<Self> {
-        // Pin before the thread exists, so the host cannot unmap this code once it runs.
-        pin_crate_module_once();
-        let (requests, mut inbox) = tokio::sync::mpsc::unbounded_channel::<CrlRequest>();
-        let (exit_signal, exited) = std::sync::mpsc::channel::<()>();
-        std::thread::Builder::new()
-            .name("databricks-crl".to_owned())
-            .stack_size(runtime_thread_stack_size(ambient_rust_min_stack()))
-            .spawn(move || {
-                // Dropped when the thread ends, which disconnects `exited`.
-                let _exit_signal = exit_signal;
-                // The caller's runtime is never re-entered, so a current-thread caller
-                // cannot deadlock.
-                let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                else {
-                    return;
-                };
-                let client = build_client(&proxy, limits, &roots);
-                runtime.block_on(async move {
-                    while let Some((url, budget, answer)) = inbox.recv().await {
-                        let client = client.clone();
-                        tokio::spawn(async move {
-                            let result = match client {
-                                Ok(client) => fetch(&client, &url, limits.max_bytes, budget).await,
-                                Err(reason) => Err(reason),
-                            };
-                            let _ = answer.send(result);
-                        });
-                    }
-                });
-            })?;
-        Ok(Self {
-            requests: Some(requests),
-            exited,
-            timeout: limits.timeout,
-        })
-    }
-
-    /// Queues one fetch. This does not wait for it, so the caller can release any lock
-    /// before it waits on the returned receiver.
-    fn submit(
-        &self,
-        url: &str,
-        budget: Duration,
-    ) -> std::result::Result<std::sync::mpsc::Receiver<std::result::Result<Vec<u8>, String>>, String>
-    {
-        let (answer, received) = std::sync::mpsc::channel();
-        let requests = self
-            .requests
-            .as_ref()
-            .ok_or_else(|| "CRL worker is closed".to_owned())?;
-        requests
-            .send((url.to_owned(), budget, answer))
-            .map_err(|_| "CRL worker is not running".to_owned())?;
-        Ok(received)
-    }
-}
-
-impl Drop for CrlWorker {
+impl Drop for Store {
     fn drop(&mut self) {
-        // Closing the channel ends the worker once its in-flight fetches finish. Wait for
-        // that, but no longer than the per-fetch timeout.
-        //
-        // A fetch already past its per-fetch timeout can outlive this bounded wait, and the
-        // thread then keeps running after the drop. The library was pinned when the worker
-        // started, so the host cannot unmap that code while the thread runs. Once revocation
-        // is first used, the library therefore stays loaded for the rest of the process.
-        self.requests.take();
-        let _ = in_runtime_blocking(|| self.exited.recv_timeout(self.timeout));
+        // SAFETY: the handle came from `CertOpenStore` and is closed once.
+        unsafe { CertCloseStore(self.0, 0) };
     }
 }
 
-/// Pins the module that holds this crate, at most once per process, when the first CRL
-/// worker starts. A pinned module is never unmapped, so a host that unloads the library
-/// (an ODBC driver manager, or a napi addon's worker) cannot fault a CRL thread that is
-/// still running. A failed pin is logged at debug and changes nothing else: the connection
-/// proceeds as it did before pinning existed.
-fn pin_crate_module_once() {
-    static PINNED: std::sync::Once = std::sync::Once::new();
-    PINNED.call_once(|| {
-        if let Err(reason) = pin_crate_module() {
-            debug!("could not pin the kernel module for the CRL worker: {reason}");
-        }
-    });
-}
+/// A certificate context, freed on drop.
+struct Context(*mut CERT_CONTEXT);
 
-/// Windows: `GetModuleHandleExW` with `FROM_ADDRESS | PIN` on the address of a function in
-/// this crate. The pinned handle is deliberately never released.
-#[cfg(windows)]
-fn pin_crate_module() -> std::result::Result<(), String> {
-    use windows_sys::Win32::Foundation::HMODULE;
-    use windows_sys::Win32::System::LibraryLoader::{
-        GetModuleHandleExW, GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_PIN,
-    };
-    let mut module: HMODULE = std::ptr::null_mut();
-    // SAFETY: with FROM_ADDRESS, the name argument is a code address rather than a string.
-    // It is the address of `pin_crate_module`, which lives in this crate, and `module` is a
-    // valid out-pointer.
-    let found = unsafe {
-        GetModuleHandleExW(
-            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
-            pin_crate_module as *const () as usize as *const u16,
-            &mut module,
-        )
-    };
-    if found == 0 {
-        return Err(format!(
-            "GetModuleHandleExW failed: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    Ok(())
-}
-
-/// Unix: `dladdr` finds the object that holds a function in this crate, then `dlopen` with
-/// `RTLD_NOLOAD` reopens that object without loading it again. `RTLD_NODELETE` makes a later
-/// `dlclose` a no-op, so the object is never unmapped. The handle is deliberately not closed.
-#[cfg(unix)]
-fn pin_crate_module() -> std::result::Result<(), String> {
-    use std::os::unix::ffi::OsStrExt;
-
-    // SAFETY: `Dl_info` is plain data, and dladdr writes it only on success.
-    let mut info: libc::Dl_info = unsafe { std::mem::zeroed() };
-    let address = pin_crate_module as *const () as *const libc::c_void;
-    // SAFETY: `address` is a code address in this process, and `info` is valid for writes.
-    if unsafe { libc::dladdr(address, &mut info) } == 0 || info.dli_fname.is_null() {
-        return Err("dladdr found no object for the kernel's code".to_owned());
-    }
-    // SAFETY: `dli_fname` is a NUL-terminated path from dladdr, valid for this call.
-    let path = unsafe { std::ffi::CStr::from_ptr(info.dli_fname) };
-    let path = std::path::Path::new(std::ffi::OsStr::from_bytes(path.to_bytes()));
-    // A program that holds the kernel is the main executable, which the host cannot unload.
-    // dladdr names it by argv[0], and RTLD_NOLOAD cannot reopen it by that name.
-    if let (Ok(object), Ok(exe)) = (
-        std::fs::canonicalize(path),
-        std::env::current_exe().and_then(std::fs::canonicalize),
-    ) {
-        if object == exe {
-            return Ok(());
-        }
-    }
-    // The flags request the already-loaded object only, and RTLD_NODELETE pins it.
-    let handle = unsafe {
-        libc::dlopen(
-            info.dli_fname,
-            libc::RTLD_NOW | libc::RTLD_NOLOAD | libc::RTLD_NODELETE,
-        )
-    };
-    if handle.is_null() {
-        // SAFETY: dlerror returns a NUL-terminated message, or null when there is none.
-        let detail = unsafe { libc::dlerror() };
-        let detail = if detail.is_null() {
-            "no detail".to_owned()
-        } else {
-            // SAFETY: checked non-null above; the message is read before any other dl call.
-            unsafe { std::ffi::CStr::from_ptr(detail) }
-                .to_string_lossy()
-                .into_owned()
+impl Context {
+    fn new(der: &[u8]) -> Option<Self> {
+        let len = u32::try_from(der.len()).ok()?;
+        // SAFETY: `der` is valid for `len` bytes for the duration of the call.
+        let context = unsafe {
+            CertCreateCertificateContext(X509_ASN_ENCODING | PKCS_7_ASN_ENCODING, der.as_ptr(), len)
         };
-        return Err(format!("dlopen failed: {detail}"));
+        (!context.is_null()).then_some(Self(context))
     }
-    Ok(())
 }
 
-#[cfg(all(test, target_os = "linux"))]
-mod pin_tests {
-    use super::*;
-
-    #[test]
-    fn crate_module_pin_succeeds_on_linux() {
-        assert_eq!(pin_crate_module(), Ok(()));
+impl Drop for Context {
+    fn drop(&mut self) {
+        // SAFETY: the handle came from `CertCreateCertificateContext` and is freed once.
+        unsafe { CertFreeCertificateContext(self.0) };
     }
+}
+
+/// A chain built by CryptoAPI. Freed on drop.
+struct ChainContext(*mut CERT_CHAIN_CONTEXT);
+
+impl ChainContext {
+    /// The chain-level revocation status. CryptoAPI combines the status of every element
+    /// (the root is not checked, so its bits do not appear). The trust bits are not read.
+    fn status(&self) -> Status {
+        // SAFETY: the chain is live until this guard drops, and the read does not write.
+        let bits = unsafe { (*self.0).TrustStatus.dwErrorStatus };
+        if bits & CERT_TRUST_IS_REVOKED != 0 {
+            Status::Revoked
+        } else if bits
+            & (CERT_TRUST_REVOCATION_STATUS_UNKNOWN
+                | CERT_TRUST_IS_OFFLINE_REVOCATION
+                | CERT_TRUST_IS_PARTIAL_CHAIN)
+            != 0
+        {
+            Status::Undetermined
+        } else {
+            Status::Good
+        }
+    }
+}
+
+impl Drop for ChainContext {
+    fn drop(&mut self) {
+        // SAFETY: the chain came from `CertGetCertificateChain` and is freed once.
+        unsafe { CertFreeCertificateChain(self.0) };
+    }
+}
+
+/// CryptoAPI's revocation status for the chain that `leaf` builds. The presented
+/// intermediates and the custom CAs are in the chain's additional store, so CryptoAPI can
+/// reach the issuers that Windows does not trust. Trust is not decided here.
+fn cryptoapi_status(leaf: &[u8], intermediates: &[&[u8]], custom_cas: &[&[u8]]) -> Status {
+    // Each handle has a guard, so every early return frees what was opened.
+    let Some(store) = Store::memory() else {
+        return Status::Undetermined;
+    };
+    for der in intermediates.iter().chain(custom_cas) {
+        if !store.add(der) {
+            return Status::Undetermined;
+        }
+    }
+    let Some(leaf) = Context::new(leaf) else {
+        return Status::Undetermined;
+    };
+    let para = CERT_CHAIN_PARA {
+        cbSize: std::mem::size_of::<CERT_CHAIN_PARA>() as u32,
+        dwUrlRetrievalTimeout: REVOCATION_TIMEOUT.as_millis() as u32,
+        ..Default::default()
+    };
+    let mut chain: *mut CERT_CHAIN_CONTEXT = null_mut();
+    // SAFETY: the leaf and store are live, and `para` outlives the call. The null chain
+    // engine is the default, and null time is now.
+    let built = unsafe {
+        CertGetCertificateChain(
+            null_mut(),
+            leaf.0,
+            null(),
+            store.0,
+            &para,
+            CHAIN_FLAGS,
+            null(),
+            &mut chain,
+        )
+    };
+    if built == 0 || chain.is_null() {
+        return Status::Undetermined;
+    }
+    ChainContext(chain).status()
 }
 
 /// Runs a blocking wait. On a multi-thread runtime, block_in_place moves the worker's
@@ -595,115 +204,25 @@ fn in_runtime_blocking<T>(wait: impl FnOnce() -> T) -> T {
     }
 }
 
-/// The client for a chain's CRL fetches. It carries no auth or custom headers, goes
-/// through the connection's proxy, trusts the connection's custom CA roots, and is bounded
-/// by time and redirects.
-fn build_client(
-    proxy: &ProxyConfig,
-    limits: CrlFetchLimits,
-    roots: &[reqwest::Certificate],
-) -> std::result::Result<reqwest::Client, String> {
-    let mut builder = reqwest::Client::builder()
-        .connect_timeout(limits.timeout)
-        .timeout(limits.timeout)
-        // Redirects are not followed. A plaintext CRL response could otherwise send the
-        // fetch to an internal endpoint. A 3xx is not a 200, so the status is undetermined.
-        .redirect(reqwest::redirect::Policy::none());
-    for root in roots {
-        builder = builder.add_root_certificate(root.clone());
-    }
-    if let Some(proxy_url) = &proxy.url {
-        let mut via = reqwest::Proxy::all(proxy_url).map_err(|e| e.to_string())?;
-        if let Some(username) = &proxy.username {
-            via = via.basic_auth(username, proxy.password.as_deref().unwrap_or(""));
-        }
-        if let Some(bypass) = &proxy.bypass_hosts {
-            let normalized = bypass
-                .split(',')
-                .map(str::trim)
-                .collect::<Vec<_>>()
-                .join(",");
-            via = via.no_proxy(reqwest::NoProxy::from_string(&normalized));
-        }
-        builder = builder.proxy(via);
-    }
-    builder.build().map_err(|e| e.to_string())
+fn tls_error(e: impl std::fmt::Display) -> Error {
+    Error::invalid_argument().message(format!("invalid TLS configuration: {e}"))
 }
 
-/// One CRL download with `client`, bounded by `budget` and by the size limit.
-async fn fetch(
-    client: &reqwest::Client,
-    url: &str,
-    max_bytes: usize,
-    budget: Duration,
-) -> std::result::Result<Vec<u8>, String> {
-    tokio::time::timeout(budget, download(client, url, max_bytes))
-        .await
-        .unwrap_or_else(|_| Err("CRL fetch timed out".to_owned()))
-}
-
-async fn download(
-    client: &reqwest::Client,
-    url: &str,
-    max_bytes: usize,
-) -> std::result::Result<Vec<u8>, String> {
-    let mut response = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| e.without_url().to_string())?;
-    if response.status() != StatusCode::OK {
-        return Err(format!("HTTP {}", response.status()));
-    }
-    if response
-        .content_length()
-        .is_some_and(|len| len > max_bytes as u64)
-    {
-        return Err("CRL larger than the size limit".to_owned());
-    }
-    let mut body = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|e| e.without_url().to_string())?
-    {
-        if body.len() + chunk.len() > max_bytes {
-            return Err("CRL larger than the size limit".to_owned());
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok(body)
-}
-
-/// The URL without userinfo, query or fragment, for logging.
-fn redacted(url: &str) -> String {
-    match reqwest::Url::parse(url) {
-        Ok(mut parsed) => {
-            let _ = parsed.set_username("");
-            let _ = parsed.set_password(None);
-            parsed.set_query(None);
-            parsed.set_fragment(None);
-            parsed.to_string()
-        }
-        Err(_) => "<unparsable URL>".to_owned(),
-    }
-}
-
-/// The server verifier: webpki for the chain, signatures and name, with CRLs.
+/// The server verifier. Webpki decides the chain, the name and the signatures. CryptoAPI
+/// decides the revocation of the chain it builds for the same leaf.
 #[derive(Debug)]
 struct RevocationVerifier {
-    roots: Arc<RootCertStore>,
-    provider: Arc<CryptoProvider>,
-    /// Webpki verifier without CRLs. Supplies the handshake signature checks.
+    /// Webpki over the kernel's roots, without CRLs.
     signatures: Arc<WebPkiServerVerifier>,
-    fetcher: CrlFetcher,
+    /// The custom CAs. CryptoAPI needs them as issuers when Windows does not trust them.
+    custom_cas: Vec<CertificateDer<'static>>,
     accept_undetermined: bool,
     allow_hostname_mismatch: bool,
 }
 
 impl RevocationVerifier {
-    /// Forgives a name-only failure under `allow_hostname_mismatch`. webpki checks
-    /// the name last, so the chain has already verified when this happens.
+    /// Forgives a name-only failure under `allow_hostname_mismatch`. webpki checks the name
+    /// last, so the chain has already verified when this happens.
     fn tolerate_name(
         &self,
         result: std::result::Result<ServerCertVerified, rustls::Error>,
@@ -717,54 +236,6 @@ impl RevocationVerifier {
     }
 }
 
-impl RevocationVerifier {
-    /// The indices of the presented intermediates on a path that webpki verifies. Subsets
-    /// are tried smallest first, and the first one that verifies is the path. An intermediate
-    /// the server adds that the path does not need is never returned, so its distribution
-    /// points are never fetched. More than six presented intermediates is rejected.
-    fn path_intermediates(
-        &self,
-        end_entity: &CertificateDer<'_>,
-        intermediates: &[CertificateDer<'_>],
-        server_name: &ServerName<'_>,
-        ocsp_response: &[u8],
-        now: UnixTime,
-    ) -> std::result::Result<Vec<usize>, rustls::Error> {
-        const MAX_PRESENTED: usize = 6;
-        let n = intermediates.len();
-        if n > MAX_PRESENTED {
-            return Err(verifier_error(format!(
-                "the server presented {n} intermediates; revocation checking supports at most {MAX_PRESENTED}"
-            )));
-        }
-        for size in 0..=n {
-            for mask in 0_usize..(1 << n) {
-                if mask.count_ones() as usize != size {
-                    continue;
-                }
-                let picked: Vec<usize> = (0..n).filter(|i| mask & (1 << i) != 0).collect();
-                let subset: Vec<CertificateDer<'_>> =
-                    picked.iter().map(|&i| intermediates[i].clone()).collect();
-                if self
-                    .tolerate_name(self.signatures.verify_server_cert(
-                        end_entity,
-                        &subset,
-                        server_name,
-                        ocsp_response,
-                        now,
-                    ))
-                    .is_ok()
-                {
-                    return Ok(picked);
-                }
-            }
-        }
-        Err(rustls::Error::InvalidCertificate(
-            CertificateError::UnknownIssuer,
-        ))
-    }
-}
-
 impl ServerCertVerifier for RevocationVerifier {
     fn verify_server_cert(
         &self,
@@ -774,6 +245,8 @@ impl ServerCertVerifier for RevocationVerifier {
         ocsp_response: &[u8],
         now: UnixTime,
     ) -> std::result::Result<ServerCertVerified, rustls::Error> {
+        // Chain, name and validity come first, so a chain webpki rejects never reaches
+        // CryptoAPI and its errors are the same as with revocation off.
         self.tolerate_name(self.signatures.verify_server_cert(
             end_entity,
             intermediates,
@@ -781,87 +254,17 @@ impl ServerCertVerifier for RevocationVerifier {
             ocsp_response,
             now,
         ))?;
-
-        let now_secs = now.as_secs();
-        let path =
-            self.path_intermediates(end_entity, intermediates, server_name, ocsp_response, now)?;
-        // One deadline bounds every fetch for this chain, so the total wait is at
-        // most one per-fetch timeout however many distribution points there are.
-        let deadline = Instant::now() + self.fetcher.limits.timeout;
-        let mut crls = Vec::new();
-        let mut used_urls = Vec::new();
-        let mut undetermined = false;
-        for cert in std::iter::once(end_entity).chain(path.iter().map(|&i| &intermediates[i])) {
-            let Some(parsed) = parse_cert(cert.as_ref()) else {
-                undetermined = true;
-                continue;
-            };
-            // Trust anchors are not revocation-checked (webpki does not check them either).
-            if is_trust_anchor(&self.roots, &parsed) {
-                continue;
-            }
-            let mut covered = false;
-            for url in &parsed.crl_uris {
-                // One usable CRL covers the certificate, so the other URLs are not fetched.
-                if covered {
-                    break;
-                }
-                let budget = deadline.saturating_duration_since(Instant::now());
-                let Some(der) = self.fetcher.get(url, now_secs, budget) else {
-                    continue;
-                };
-                match classify(&der, parsed.issuer, now_secs) {
-                    Verdict::Current => {
-                        crls.push(CertificateRevocationListDer::from(der.to_vec()));
-                        used_urls.push(url.clone());
-                        covered = true;
-                    }
-                    Verdict::Undetermined => self.fetcher.evict(url),
-                    Verdict::WrongIssuer => {
-                        self.fetcher.evict(url);
-                        return Err(rustls::Error::InvalidCertRevocationList(
-                            CertRevocationListError::IssuerInvalidForCrl,
-                        ));
-                    }
-                }
-            }
-            undetermined |= !covered;
-        }
-        if undetermined && !self.accept_undetermined {
-            return Err(rustls::Error::InvalidCertificate(
+        let presented: Vec<&[u8]> = intermediates.iter().map(AsRef::as_ref).collect();
+        let custom: Vec<&[u8]> = self.custom_cas.iter().map(AsRef::as_ref).collect();
+        let leaf: &[u8] = end_entity.as_ref();
+        match in_runtime_blocking(|| cryptoapi_status(leaf, &presented, &custom)) {
+            Status::Good => Ok(ServerCertVerified::assertion()),
+            Status::Revoked => Err(rustls::Error::InvalidCertificate(CertificateError::Revoked)),
+            Status::Undetermined if self.accept_undetermined => Ok(ServerCertVerified::assertion()),
+            Status::Undetermined => Err(rustls::Error::InvalidCertificate(
                 CertificateError::UnknownRevocationStatus,
-            ));
+            )),
         }
-
-        let mut builder = WebPkiServerVerifier::builder_with_provider(
-            Arc::clone(&self.roots),
-            Arc::clone(&self.provider),
-        )
-        .with_crls(crls);
-        if self.accept_undetermined {
-            builder = builder.allow_unknown_revocation_status();
-        }
-        let verifier = builder
-            .build()
-            .map_err(|e| verifier_error(format!("revocation verifier setup: {e}")))?;
-        // The final verification sees only the checked path. Webpki then cannot build a
-        // path through a presented intermediate whose CRLs were not checked.
-        let checked: Vec<CertificateDer<'_>> =
-            path.iter().map(|&i| intermediates[i].clone()).collect();
-        let result = self.tolerate_name(verifier.verify_server_cert(
-            end_entity,
-            &checked,
-            server_name,
-            ocsp_response,
-            now,
-        ));
-        // A CRL that webpki rejects must not stay cached.
-        if let Err(rustls::Error::InvalidCertRevocationList(_)) = &result {
-            for url in &used_urls {
-                self.fetcher.evict(url);
-            }
-        }
-        result
     }
 
     fn verify_tls12_signature(
@@ -887,21 +290,13 @@ impl ServerCertVerifier for RevocationVerifier {
     }
 }
 
-fn tls_error(e: impl std::fmt::Display) -> Error {
-    Error::invalid_argument().message(format!("invalid TLS configuration: {e}"))
-}
-
-/// The rustls config for a connection with revocation checking. Trust roots are
-/// webpki roots, then the OS store, then custom CAs, as reqwest's rustls assembly
-/// uses. ALPN is HTTP/1.1, since the kernel enables no HTTP/2.
+/// The rustls config for a connection with revocation checking. Trust roots are webpki
+/// roots, then the OS store, then custom CAs, as reqwest's rustls assembly uses. ALPN is
+/// HTTP/1.1, since the kernel enables no HTTP/2.
 ///
-/// The caller has already validated the PEM bytes and the mTLS identity pair, so
-/// they are parsed here without re-checking.
-pub(crate) fn client_config(
-    tls: &TlsConfig,
-    proxy: &ProxyConfig,
-    accept_undetermined: bool,
-) -> Result<ClientConfig> {
+/// The caller has already validated the PEM bytes and the mTLS identity pair, so they are
+/// parsed here without re-checking.
+pub(crate) fn client_config(tls: &TlsConfig, accept_undetermined: bool) -> Result<ClientConfig> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut roots = RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
@@ -938,32 +333,22 @@ pub(crate) fn client_config(
     if let Some(pem) = &tls.trusted_certificate_pem {
         pems.push(pem.clone());
     }
-    // The same custom CAs, as reqwest certificates, for the CRL client.
-    let mut custom_roots = Vec::new();
+    let mut custom_cas = Vec::new();
     for pem in pems {
         for cert in CertificateDer::pem_slice_iter(&pem) {
-            roots.add(cert.map_err(tls_error)?).map_err(tls_error)?;
+            let cert = cert.map_err(tls_error)?;
+            roots.add(cert.clone()).map_err(tls_error)?;
+            custom_cas.push(cert);
         }
-        custom_roots.extend(reqwest::Certificate::from_pem_bundle(&pem).map_err(tls_error)?);
     }
 
-    let roots = Arc::new(roots);
     let signatures =
-        WebPkiServerVerifier::builder_with_provider(Arc::clone(&roots), Arc::clone(&provider))
+        WebPkiServerVerifier::builder_with_provider(Arc::new(roots), Arc::clone(&provider))
             .build()
             .map_err(tls_error)?;
     let verifier = RevocationVerifier {
-        roots,
-        provider: Arc::clone(&provider),
         signatures,
-        fetcher: CrlFetcher {
-            proxy: proxy.clone(),
-            limits: crl_fetch_limits(),
-            custom_roots,
-            cache: Mutex::new(HashMap::new()),
-            failed: Mutex::new(HashMap::new()),
-            worker: Mutex::new(None),
-        },
+        custom_cas,
         accept_undetermined,
         allow_hostname_mismatch: tls.allow_hostname_mismatch.unwrap_or(false),
     };
@@ -978,7 +363,7 @@ pub(crate) fn client_config(
             let chain = CertificateDer::pem_slice_iter(cert)
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .map_err(tls_error)?;
-            let key = PrivateKeyDer::from_pem_slice(key).map_err(tls_error)?;
+            let key = rustls::pki_types::PrivateKeyDer::from_pem_slice(key).map_err(tls_error)?;
             builder
                 .with_client_auth_cert(chain, key)
                 .map_err(tls_error)?

@@ -65,12 +65,9 @@ rustls = { version = "0.23.41", optional = true, default-features = false, featu
 # Enforce TLS dependency minimums for consumers with their own lockfiles.
 rustls-webpki = { version = "0.103.16", optional = true, default-features = false }
 webpki-roots = { version = "1.0.11", optional = true, default-features = false }
-# `tls-rustls` only: opt-in certificate revocation checking (see
-# `src/client/tls_revocation.rs`). Both crates are already in the runtime graph
-# through reqwest / pkcs8; they are declared here so the kernel can build its own
-# rustls client config (root store from the OS trust store, and a CRL DER reader).
+# `tls-rustls` only. Loads the OS trust store for the revocation verifier on Windows (see
+# `src/client/tls_revocation.rs`), the same store reqwest's `rustls-tls-native-roots` loads.
 rustls-native-certs = { version = "0.8", optional = true }
-der = { version = "0.7", optional = true }
 tokio = { version = "1", features = ["full", "sync"] }
 
 # Serialization
@@ -151,14 +148,10 @@ zeroize = "1.9"                                                                 
 jsonwebtoken = { version = "9", default-features = false, features = ["use_pem"] } # JWT signing (RS256/384/512, PS256/384/512, ES256/384); use_pem = PEM key loading (adds pem + simple_asn1, no TLS)
 pkcs8 = { version = "0.10", features = ["encryption", "pem", "std"] }            # PKCS#8 PEM parsing + PBES2 passphrase decryption
 
-# Pins the module that holds the kernel while the CRL worker thread may still run its
-# code (see `pin_crate_module` in `src/client/tls_revocation.rs`). Both crates are already
-# in the graph; these target-specific entries add no new crates.
+# Windows CryptoAPI for TLS certificate revocation (`src/client/tls_revocation.rs`).
+# `windows-sys` is already in the lock file; no new packages.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_LibraryLoader"] }
-
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util"] }
@@ -228,7 +221,6 @@ tls-rustls = [
     "dep:rustls-webpki",
     "dep:webpki-roots",
     "dep:rustls-native-certs",
-    "dep:der",
 ]
 
 [lib]

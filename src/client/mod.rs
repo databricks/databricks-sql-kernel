@@ -34,7 +34,7 @@
 pub mod http;
 pub mod retry;
 pub mod sea;
-#[cfg(feature = "tls-rustls")]
+#[cfg(all(windows, feature = "tls-rustls"))]
 pub(crate) mod tls_revocation;
 pub(crate) mod transport;
 

@@ -271,11 +271,7 @@ pub(crate) fn is_certificate_verification_failure(
         #[cfg(feature = "tls-rustls")]
         if matches!(
             error.downcast_ref::<rustls::Error>(),
-            Some(
-                rustls::Error::InvalidCertificate(_)
-                    | rustls::Error::InvalidCertRevocationList(_)
-                    | rustls::Error::NoCertificatesPresented
-            )
+            Some(rustls::Error::InvalidCertificate(_) | rustls::Error::NoCertificatesPresented)
         ) {
             return true;
         }

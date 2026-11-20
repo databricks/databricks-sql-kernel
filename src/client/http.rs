@@ -199,57 +199,31 @@ pub struct TlsConfig {
     pub client_key_pem: Option<Vec<u8>>,
 }
 
-/// Bounds applied to each CRL HTTP fetch.
-#[cfg(feature = "tls-rustls")]
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct CrlFetchLimits {
-    pub(crate) timeout: Duration,
-    pub(crate) max_bytes: usize,
+/// The revocation mode for a client, from the public options: `None` when checking is
+/// off, otherwise `Some(accept_undetermined)`.
+pub(crate) fn revocation_mode(
+    check: Option<bool>,
+    accept_undetermined: Option<bool>,
+) -> Option<bool> {
+    (check == Some(true)).then(|| accept_undetermined == Some(true))
 }
 
-#[cfg(feature = "tls-rustls")]
-impl Default for CrlFetchLimits {
-    fn default() -> Self {
-        Self {
-            timeout: Duration::from_secs(10),
-            max_bytes: 32 * 1024 * 1024,
-        }
-    }
-}
-
-/// Revocation checking for one client: whether an undetermined status is accepted.
-/// It is carried next to [`TlsConfig`], not inside it, so that struct keeps its
-/// published shape.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct RevocationPolicy {
-    pub(crate) accept_undetermined: bool,
-}
-
-impl RevocationPolicy {
-    /// The policy for the public options, or `None` when checking is off (unset or
-    /// `false`).
-    pub(crate) fn from_options(
-        check: Option<bool>,
-        accept_undetermined: Option<bool>,
-    ) -> Option<Self> {
-        (check == Some(true)).then(|| Self {
-            accept_undetermined: accept_undetermined == Some(true),
-        })
-    }
-}
-
-/// Rejects a revocation request the backend cannot honour. Shared by session
-/// open (which must report `InvalidArgument` unwrapped) and the HTTP client.
+/// Rejects a revocation request that this platform or backend cannot honour, with
+/// `InvalidArgument`. Revocation is implemented only on Windows with `tls-rustls`.
 /// `allow_self_signed` turns revocation off, so it is not an error.
-pub(crate) fn check_revocation_support(
-    tls: &TlsConfig,
-    revocation: Option<RevocationPolicy>,
-) -> Result<()> {
-    if cfg!(feature = "tls-rustls") || revocation.is_none() || tls.allow_self_signed == Some(true) {
+pub(crate) fn check_revocation_support(tls: &TlsConfig, revocation: Option<bool>) -> Result<()> {
+    if revocation.is_none() || tls.allow_self_signed == Some(true) {
         return Ok(());
     }
-    Err(Error::invalid_argument()
-        .message("certificate revocation checking requires the tls-rustls backend"))
+    if cfg!(all(windows, feature = "tls-rustls")) {
+        return Ok(());
+    }
+    let message = if cfg!(windows) {
+        "TLS certificate revocation checking requires the tls-rustls backend"
+    } else {
+        "TLS certificate revocation checking is supported only on Windows"
+    };
+    Err(Error::invalid_argument().message(message))
 }
 
 impl std::fmt::Debug for TlsConfig {
@@ -439,7 +413,7 @@ pub struct DatabricksHttpClient {
     config: HttpClientConfig,
     auth_provider: OnceLock<Arc<dyn AuthProvider>>,
     retry_configs: HashMap<RequestCategory, RetryConfig>,
-    revocation: Option<RevocationPolicy>,
+    revocation: Option<bool>,
 }
 
 impl DatabricksHttpClient {
@@ -461,7 +435,7 @@ impl DatabricksHttpClient {
     pub(crate) fn with_revocation(
         mut config: HttpClientConfig,
         retry_configs: HashMap<RequestCategory, RetryConfig>,
-        revocation: Option<RevocationPolicy>,
+        revocation: Option<bool>,
     ) -> Result<Self> {
         // Fold any caller-supplied `User-Agent` custom header into the
         // effective UA, and remove it from `custom_headers` so it isn't
@@ -581,7 +555,7 @@ impl DatabricksHttpClient {
     fn build_reqwest_client(
         config: &HttpClientConfig,
         redirect: reqwest::redirect::Policy,
-        revocation: Option<RevocationPolicy>,
+        revocation: Option<bool>,
     ) -> Result<Client> {
         check_revocation_support(&config.tls, revocation)?;
         let mut builder = Client::builder()
@@ -769,15 +743,15 @@ impl DatabricksHttpClient {
             debug!("HTTP client using default proxy behavior (env vars)");
         }
 
-        // With revocation on, the verifier replaces reqwest's trust roots and
-        // identity. Those were already validated above.
-        #[cfg(feature = "tls-rustls")]
-        // `allow_self_signed` turns revocation off, as Simba does.
-        if let Some(policy) = revocation.filter(|_| config.tls.allow_self_signed != Some(true)) {
+        // With revocation on, the verifier replaces reqwest's trust roots and identity.
+        // Those were already validated above. `allow_self_signed` turns revocation off.
+        #[cfg(all(windows, feature = "tls-rustls"))]
+        if let Some(accept_undetermined) =
+            revocation.filter(|_| config.tls.allow_self_signed != Some(true))
+        {
             builder = builder.use_preconfigured_tls(super::tls_revocation::client_config(
                 &config.tls,
-                &config.proxy,
-                policy.accept_undetermined,
+                accept_undetermined,
             )?);
         }
 
@@ -1176,6 +1150,42 @@ mod tests {
 
     fn default_retry_configs() -> HashMap<RequestCategory, RetryConfig> {
         build_retry_configs(&RetryConfig::default(), &HashMap::new())
+    }
+
+    #[test]
+    fn revocation_mode_maps_the_public_options() {
+        assert_eq!(revocation_mode(None, None), None);
+        assert_eq!(revocation_mode(Some(false), Some(true)), None);
+        assert_eq!(revocation_mode(Some(true), None), Some(false));
+        assert_eq!(revocation_mode(Some(true), Some(false)), Some(false));
+        assert_eq!(revocation_mode(Some(true), Some(true)), Some(true));
+    }
+
+    #[test]
+    fn revocation_request_is_refused_where_it_is_not_implemented() {
+        let tls = HttpClientConfig::default().tls;
+        check_revocation_support(&tls, None).expect("no request");
+        let mut self_signed = tls.clone();
+        self_signed.allow_self_signed = Some(true);
+        check_revocation_support(&self_signed, Some(false))
+            .expect("allow_self_signed turns revocation off");
+        if cfg!(all(windows, feature = "tls-rustls")) {
+            check_revocation_support(&tls, Some(false)).expect("implemented on this platform");
+        } else {
+            let error = check_revocation_support(&tls, Some(false))
+                .expect_err("revocation is refused off Windows with tls-rustls");
+            assert_eq!(
+                error.code,
+                crate::kernel_error::ErrorCode::InvalidArgument,
+                "{error}"
+            );
+            assert!(
+                error
+                    .message
+                    .contains("TLS certificate revocation checking"),
+                "{error}"
+            );
+        }
     }
 
     #[test]

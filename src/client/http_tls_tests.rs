@@ -274,6 +274,62 @@ async fn self_signed_fails_once_with_certificate_cause() {
 }
 
 #[tokio::test]
+async fn trusted_chain_completes_with_revocation_off() {
+    // Revocation off: a chain the client trusts completes on the default path, on every
+    // backend, and no revocation check is involved.
+    let mut ca_params = CertificateParams::new(Vec::new()).unwrap();
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "Off test CA");
+    let ca_key = KeyPair::generate().unwrap();
+    let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+    let issuer = Issuer::new(ca_params, ca_key);
+    let server_key = KeyPair::generate().unwrap();
+    let server_cert = CertificateParams::new(vec!["127.0.0.1".to_string()])
+        .unwrap()
+        .signed_by(&server_key, &issuer)
+        .unwrap();
+    let tls = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_no_client_auth()
+    .with_single_cert(
+        vec![server_cert.der().clone()],
+        PrivatePkcs8KeyDer::from(server_key.serialize_der()).into(),
+    )
+    .unwrap();
+    let acceptor = TlsAcceptor::from(Arc::new(tls));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let socket = listener.accept().await.unwrap().0;
+        let mut stream = acceptor.accept(socket).await.unwrap();
+        let mut buffer = [0; 1024];
+        let _ = stream.read(&mut buffer).await;
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let _ = stream.shutdown().await;
+    });
+
+    let mut config = HttpClientConfig::default();
+    config.tls.trusted_certificate_pem = Some(ca_cert.pem().into_bytes());
+    let client = test_client(config, Duration::from_secs(10));
+    let response = client
+        .inner()
+        .get(format!("https://{address}/"))
+        .send()
+        .await
+        .expect("a trusted chain completes with revocation off");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    server.await.unwrap();
+}
+
+#[tokio::test]
 async fn hostname_mismatch_fails_once_with_certificate_cause() {
     assert_certificate_failure(CertificateFailure::HostnameMismatch).await;
 }

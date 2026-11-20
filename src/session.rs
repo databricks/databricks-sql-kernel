@@ -368,7 +368,7 @@ impl Session {
         let http_client_config = build_http_client_config(&config, org_id);
         // Checked before the client-construction wrapping below, so the
         // configuration error keeps its InvalidArgument category.
-        let revocation = crate::client::http::RevocationPolicy::from_options(
+        let revocation = crate::client::http::revocation_mode(
             config.tls.check_certificate_revocation,
             config.tls.accept_undetermined_certificate_revocation,
         );
@@ -3956,12 +3956,14 @@ mod is_open_tests {
     }
 }
 
-#[cfg(all(test, not(feature = "tls-rustls")))]
+/// Revocation is refused at open everywhere except Windows with `tls-rustls`. The
+/// Windows success path is covered by the Windows-only verifier tests.
+#[cfg(all(test, not(all(windows, feature = "tls-rustls"))))]
 mod revocation_open_tests {
     use super::*;
 
     #[tokio::test]
-    async fn revocation_on_tls_native_fails_open_as_invalid_argument() {
+    async fn revocation_on_unsupported_platform_fails_open_as_invalid_argument() {
         let config = SessionConfig {
             connection: ConnectionConfig::new("https://workspace.invalid", "test_wh"),
             defaults: None,
@@ -3985,12 +3987,12 @@ mod revocation_open_tests {
         };
         let error = Session::open(config)
             .await
-            .expect_err("tls-native must reject a revocation request");
+            .expect_err("revocation must be refused on this platform or backend");
         assert_eq!(error.code, crate::kernel_error::ErrorCode::InvalidArgument);
         assert!(
             error
                 .message
-                .contains("certificate revocation checking requires the tls-rustls backend"),
+                .contains("TLS certificate revocation checking"),
             "{}",
             error.message
         );

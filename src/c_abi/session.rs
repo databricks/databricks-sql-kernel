@@ -3463,15 +3463,15 @@ mod tests {
     }
 }
 
-#[cfg(all(test, not(feature = "tls-rustls")))]
+#[cfg(all(test, not(all(windows, feature = "tls-rustls"))))]
 mod revocation_open_tests {
     use super::*;
     use std::ffi::{CStr, CString};
 
-    /// Revocation on tls-native: session open returns InvalidArgument with the
-    /// backend message. It is rejected before network I/O, so the host is not dialed.
+    /// Revocation on a platform or backend without it (anything but Windows with
+    /// tls-rustls): session open returns InvalidArgument. It is rejected before network I/O, so the host is not dialed.
     #[test]
-    fn tls_revocation_on_tls_native_open_returns_invalid_argument() {
+    fn tls_revocation_on_unsupported_platform_open_returns_invalid_argument() {
         unsafe {
             let mut config: *mut KernelSessionConfig = std::ptr::null_mut();
             assert_eq!(
@@ -3504,7 +3504,7 @@ mod revocation_open_tests {
             let error = out.assume_init();
             let message = CStr::from_ptr(error.message).to_str().unwrap();
             assert!(
-                message.contains("certificate revocation checking requires the tls-rustls backend"),
+                message.contains("TLS certificate revocation checking"),
                 "{message}"
             );
         }
