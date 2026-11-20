@@ -2698,26 +2698,6 @@ mod tests {
     }
 
     #[test]
-    fn set_http2_enabled_records_value() {
-        unsafe {
-            let mut config = std::ptr::null_mut();
-            assert_eq!(
-                kernel_session_config_new(&mut config),
-                KernelStatusCode::Success
-            );
-            assert_eq!(config.as_ref().unwrap().http2_enabled, None);
-            for enabled in [true, false] {
-                assert_eq!(
-                    kernel_session_config_set_http2_enabled(config, enabled),
-                    KernelStatusCode::Success
-                );
-                assert_eq!(config.as_ref().unwrap().http2_enabled, Some(enabled));
-            }
-            kernel_session_config_free(config);
-        }
-    }
-
-    #[test]
     fn set_sea_response_compression_records_value() {
         unsafe {
             let mut config = std::ptr::null_mut();

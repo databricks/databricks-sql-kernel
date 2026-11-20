@@ -131,9 +131,6 @@ and may reuse an earlier session's HTTP settings. An explicit proxy URL or nonem
 `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` (including lowercase variants) forces
 HTTP/1.1, including destinations that bypass the proxy.
 
-Standalone `DatabricksHttpClient` constructors negotiate HTTP/2 for HTTPS unless
-a proxy is configured. They do not expose a protocol opt-out.
-
 | Field | Description | Default |
 |-------|-------------|---------|
 | `http2_enabled` | HTTP/2 with HTTP/1.1 fallback; `false` forces HTTP/1.1. | `true` |

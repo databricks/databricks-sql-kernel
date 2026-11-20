@@ -67,12 +67,6 @@ Exactly one of `adbc.databricks.http_path` and
 parameter in the HTTP path when the workspace connection details include one.
 Canonical `adbc.databricks.*` names take precedence over compatibility aliases.
 
-## HTTP transport
-
-HTTPS requests negotiate HTTP/2 with HTTP/1.1 fallback by default. Set
-`adbc.databricks.http.http2_enabled` to `false` to force HTTP/1.1 for session
-HTTPS traffic. Configured proxies force HTTP/1.1, including bypassed destinations.
-
 ## Authentication
 
 Set `adbc.databricks.auth.type` to one of `pat`, `oauth_m2m`, `oauth_u2m`,
@@ -112,6 +106,10 @@ The main database option families are:
 | Results | complex datatype support, geospatial representation, CloudFetch enablement and buffering |
 | Execution | `adbc.databricks.enable_direct_results` (default `true`); set `false` to use `wait_timeout=0s` and status polling |
 | Metadata | `adbc.databricks.metadata.escape_catalog_name` |
+
+HTTPS requests negotiate HTTP/2 with HTTP/1.1 fallback by default. Set
+`adbc.databricks.http.http2_enabled` to `false` to force HTTP/1.1 for session
+HTTPS traffic. Configured proxies force HTTP/1.1, including bypassed destinations.
 
 The optional user-agent entry is appended to the driver-owned identity as
 `RustADBCDatabricksDriver/<version> (<entry>)`. Set it through
