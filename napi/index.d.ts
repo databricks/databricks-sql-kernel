@@ -491,20 +491,6 @@ export interface ConnectionOptions {
    */
   clientKeyPem?: Buffer
   /**
-   * Check the server certificate chain's CRLs before connecting. Omitted
-   * / `false` ⇒ off. Needs a `tls-rustls` kernel build; the kernel rejects
-   * it at open on `tls-native`. Maps onto
-   * [`TlsConfig::check_certificate_revocation`].
-   */
-  checkCertificateRevocation?: boolean
-  /**
-   * With `checkCertificateRevocation`, accept a chain whose revocation
-   * status cannot be determined (no CRL distribution point, unreachable
-   * CRL). Omitted / `false` ⇒ strict. Maps onto
-   * [`TlsConfig::accept_undetermined_certificate_revocation`].
-   */
-  acceptUndeterminedRevocation?: boolean
-  /**
    * Extra HTTP headers to send on every request — the route for
    * caller-supplied headers (the NodeJS driver's `customHeaders` and
    * the composed `User-Agent`). Maps onto the kernel

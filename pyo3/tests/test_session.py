@@ -17,29 +17,9 @@ use-after-close."""
 
 from __future__ import annotations
 
-import inspect
-import sys
-
-import pytest
-
 import databricks_sql_kernel as k
 
 from conftest import live
-
-
-@pytest.mark.skipif(
-    sys.version_info < (3, 10),
-    reason="inspect.signature cannot read a pyo3 class's signature before Python 3.10",
-)
-def test_revocation_kwargs_are_keyword_only_and_default_off():
-    # Offline: checks the constructor contract. Unset (None) means off.
-    params = inspect.signature(k.Session).parameters
-    for name in (
-        "tls_check_certificate_revocation",
-        "tls_accept_undetermined_revocation",
-    ):
-        assert params[name].kind is inspect.Parameter.KEYWORD_ONLY, name
-        assert params[name].default is None, name
 
 
 @live

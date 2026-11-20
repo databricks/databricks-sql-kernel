@@ -305,10 +305,6 @@ impl Session {
     /// `tls_skip_hostname_verify` disables the hostname check;
     /// `tls_client_cert` + `tls_client_key` (both PEM bytes) configure
     /// mutual TLS. The two mTLS fields must be set together.
-    /// `tls_check_certificate_revocation=True` checks the chain's CRLs
-    /// (`tls-rustls` builds only); `tls_accept_undetermined_revocation=True`
-    /// accepts a chain whose revocation status cannot be determined.
-    /// Both default to off.
     ///
     /// Retry/backoff: all optional, default to the kernel's built-in
     /// policy (1s/60s backoff, 6 total attempts, 900s budget) when
@@ -379,8 +375,6 @@ impl Session {
         tls_skip_hostname_verify=false,
         tls_client_cert=None,
         tls_client_key=None,
-        tls_check_certificate_revocation=None,
-        tls_accept_undetermined_revocation=None,
         sea_response_compression_enabled=false,
         request_timeout_secs=None,
         max_connections=None,
@@ -448,8 +442,6 @@ impl Session {
         tls_skip_hostname_verify: bool,
         tls_client_cert: Option<Vec<u8>>,
         tls_client_key: Option<Vec<u8>>,
-        tls_check_certificate_revocation: Option<bool>,
-        tls_accept_undetermined_revocation: Option<bool>,
         sea_response_compression_enabled: bool,
         request_timeout_secs: Option<f64>,
         max_connections: Option<usize>,
@@ -539,8 +531,6 @@ impl Session {
             || tls_skip_hostname_verify
             || tls_client_cert.is_some()
             || tls_client_key.is_some()
-            || tls_check_certificate_revocation.is_some()
-            || tls_accept_undetermined_revocation.is_some()
         {
             let mut tls = databricks_sql_kernel::TlsConfig::default();
             tls.custom_ca_cert = tls_ca_cert;
@@ -548,8 +538,6 @@ impl Session {
             tls.skip_hostname_verification = tls_skip_hostname_verify;
             tls.client_cert_pem = tls_client_cert;
             tls.client_key_pem = tls_client_key;
-            tls.check_certificate_revocation = tls_check_certificate_revocation;
-            tls.accept_undetermined_certificate_revocation = tls_accept_undetermined_revocation;
             Some(tls)
         } else {
             None
