@@ -16,6 +16,7 @@ changes go in their respective binding's NEXT_CHANGELOG.
 
 ### Changed
 
+- Table metadata overlaps catalog discovery with a speculative scoped query when a catalog pattern can also name a literal catalog. Other matches retain the existing wildcard resolution, with one extra speculative statement.
 - Rust ADBC requests identify themselves as `RustADBCDatabricksDriver/<version>`
   with an optional partner entry from `adbc.databricks.user_agent_entry`
   (`adbc.spark.user_agent_entry` is a compatibility alias). `User-Agent` in

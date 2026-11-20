@@ -868,13 +868,10 @@ impl Metadata {
         Self::finish_metadata_call(telemetry, result)
     }
 
-    /// Enumerate catalogs, keep those matching `pattern`
-    /// (case-insensitive ODBC/JDBC LIKE), and fan out one scoped
-    /// `SHOW TABLES IN CATALOG <name>` per match — reproducing Thrift's
-    /// catalog wildcarding without the whole-workspace scan of
-    /// `SHOW TABLES IN ALL CATALOGS`. The per-catalog queries run with
-    /// bounded parallelism; their reshaped rows are concatenated and
-    /// re-sorted into the JDBC row order.
+    /// Resolve wildcard catalogs while speculating a literal-catalog query.
+    /// Reuse that successful result only for one byte-identical catalog match;
+    /// otherwise use the bounded per-catalog fan-out. Concatenate and re-sort
+    /// the reshaped rows into JDBC order without a whole-workspace table scan.
     async fn list_tables_matching_catalogs(
         &self,
         pattern: &str,
@@ -885,28 +882,51 @@ impl Metadata {
     ) -> Result<ResultStream> {
         use futures::stream::{FuturesUnordered, StreamExt};
 
-        // 1. Enumerate + filter catalog names client-side.
-        let matcher = LikeMatcher::new(pattern);
-        let noop = StatementTelemetry::noop();
-        let mut catalogs = self.list_catalogs_uninstrumented(&noop).await?;
-        let mut names: Vec<String> = Vec::new();
-        let mut enumerated = 0usize;
-        while let Some(batch) = catalogs.next_batch().await? {
-            let ResultBatch::Arrow(rb) = batch;
-            // GET_CATALOGS_SCHEMA is a single `TABLE_CAT: Utf8` column.
-            let col = rb
-                .column(0)
-                .as_any()
-                .downcast_ref::<arrow_array::StringArray>()
-                .ok_or_else(|| Error::data_loss().message("TABLE_CAT is not Utf8"))?;
-            for i in 0..col.len() {
-                enumerated += 1;
-                if !col.is_null(i) && matcher.matches(col.value(i)) {
-                    names.push(col.value(i).to_owned());
+        let schema_str = schema_pattern.as_ref().map(|p| p.as_str().to_owned());
+        let table_str = table_pattern.as_ref().map(|p| p.as_str().to_owned());
+        let types_owned: Option<Vec<String>> =
+            table_types.map(|s| s.iter().map(|t| (*t).to_owned()).collect());
+        let literal = SqlCommandBuilder::strip_jdbc_escapes(pattern);
+        let lookup = async {
+            let matcher = LikeMatcher::new(pattern);
+            let noop = StatementTelemetry::noop();
+            let mut catalogs = self.list_catalogs_uninstrumented(&noop).await?;
+            let mut names: Vec<String> = Vec::new();
+            let mut enumerated = 0usize;
+            while let Some(batch) = catalogs.next_batch().await? {
+                let ResultBatch::Arrow(rb) = batch;
+                // GET_CATALOGS_SCHEMA is a single `TABLE_CAT: Utf8` column.
+                let col = rb
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow_array::StringArray>()
+                    .ok_or_else(|| Error::data_loss().message("TABLE_CAT is not Utf8"))?;
+                for i in 0..col.len() {
+                    enumerated += 1;
+                    if !col.is_null(i) && matcher.matches(col.value(i)) {
+                        names.push(col.value(i).to_owned());
+                    }
                 }
             }
-        }
-        catalogs.close();
+            catalogs.close();
+            Ok::<_, Error>((names, enumerated))
+        };
+        let speculative = async {
+            if !SqlCommandBuilder::pattern_has_wildcards(pattern) {
+                return None;
+            }
+            self.try_fetch_tables_for_catalog(
+                literal.clone(),
+                schema_str.clone(),
+                table_str.clone(),
+                types_owned.clone(),
+            )
+            .await
+            .ok()
+        };
+        let (lookup, speculative) = futures::join!(lookup, speculative);
+        let (names, enumerated) = lookup?;
+        let mut speculative = speculative.filter(|_| names.len() == 1 && names[0] == literal);
         // One correlatable line tying the fan-out back to its cause: how
         // many catalogs a wildcard `list_tables` matched (and will query),
         // vs how many exist. Lets on-call spot fan-out amplification (a
@@ -933,14 +953,15 @@ impl Metadata {
         // be hit with an unbounded burst when a loose pattern matches many
         // catalogs.
         const MAX_INFLIGHT: usize = 8;
-        let schema_str = schema_pattern.as_ref().map(|p| p.as_str().to_owned());
-        let table_str = table_pattern.as_ref().map(|p| p.as_str().to_owned());
-        let types_owned: Option<Vec<String>> =
-            table_types.map(|s| s.iter().map(|t| (*t).to_owned()).collect());
 
         let mut inflight = FuturesUnordered::new();
         let mut remaining = names.into_iter();
+        let mut all_batches: Vec<arrow_array::RecordBatch> = Vec::new();
         for name in remaining.by_ref().take(MAX_INFLIGHT) {
+            if let Some(batches) = speculative.take() {
+                all_batches.extend(batches);
+                continue;
+            }
             inflight.push(self.fetch_tables_for_catalog(
                 name,
                 schema_str.clone(),
@@ -948,7 +969,6 @@ impl Metadata {
                 types_owned.clone(),
             ));
         }
-        let mut all_batches: Vec<arrow_array::RecordBatch> = Vec::new();
         while let Some(result) = inflight.next().await {
             all_batches.extend(result?);
             if let Some(name) = remaining.next() {
@@ -995,10 +1015,26 @@ impl Metadata {
         table_pattern: Option<String>,
         table_types: Option<Vec<String>>,
     ) -> Result<Vec<arrow_array::RecordBatch>> {
+        match self
+            .try_fetch_tables_for_catalog(catalog, schema_pattern, table_pattern, table_types)
+            .await
+        {
+            Err(error) if thrift_shape::is_object_not_found(&error) => Ok(Vec::new()),
+            result => result,
+        }
+    }
+
+    async fn try_fetch_tables_for_catalog(
+        &self,
+        catalog: String,
+        schema_pattern: Option<String>,
+        table_pattern: Option<String>,
+        table_types: Option<Vec<String>>,
+    ) -> Result<Vec<arrow_array::RecordBatch>> {
         let types_ref: Option<Vec<&str>> = table_types
             .as_ref()
             .map(|v| v.iter().map(String::as_str).collect());
-        let raw = match self
+        let raw = self
             .session
             .transport()
             .list_tables(
@@ -1008,13 +1044,7 @@ impl Metadata {
                 table_pattern.as_deref(),
                 types_ref.as_deref(),
             )
-            .await
-        {
-            Ok(r) => r,
-            // Catalog vanished mid-enumeration → contribute no rows.
-            Err(e) if thrift_shape::is_object_not_found(&e) => return Ok(Vec::new()),
-            Err(e) => return Err(e),
-        };
+            .await?;
         // Read + reshape into `out`. Capture the result rather than `?`-ing
         // out early: the fan-out opens one statement per catalog and
         // `ExecuteResult` has no Drop-based close, so a mid-stream read

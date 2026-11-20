@@ -985,6 +985,408 @@ async fn list_tables_wildcard_catalog_fans_out_per_matching_catalog() {
 }
 
 #[tokio::test]
+async fn list_tables_speculation_preserves_catalog_matches_types_and_values() {
+    let cases = [
+        (
+            "bench_name",
+            "bench_name",
+            vec!["bench_name"],
+            vec!["bench_name"],
+            2,
+        ),
+        (
+            "bench%name",
+            "bench%name",
+            vec!["bench%name"],
+            vec!["bench%name"],
+            2,
+        ),
+        (
+            "bench_name",
+            "bench_name",
+            vec!["bench_name", "benchXname"],
+            vec!["bench_name", "benchXname"],
+            4,
+        ),
+        (
+            "bench_name",
+            "bench_name",
+            vec!["benchXname"],
+            vec!["benchXname"],
+            3,
+        ),
+        ("bench_name", "bench_name", vec!["other"], vec![], 2),
+        (
+            "BENCH_NAME",
+            "BENCH_NAME",
+            vec!["bench_name"],
+            vec!["bench_name"],
+            3,
+        ),
+        (
+            r"bench\_name%",
+            "bench_name%",
+            vec!["bench_name"],
+            vec!["bench_name"],
+            3,
+        ),
+        (
+            r"bench\%name_",
+            "bench%name_",
+            vec!["bench%name_"],
+            vec!["bench%name_"],
+            2,
+        ),
+        ("absent_", "absent_", vec!["bench_name"], vec![], 2),
+        ("*", "*", vec!["bench_name"], vec![], 1),
+    ];
+    let filters: [Option<&[&str]>; 5] = [
+        None,
+        Some(&[]),
+        Some(&["TABLE"]),
+        Some(&["VIEW"]),
+        Some(&["view"]),
+    ];
+    let columns = [
+        "TABLE_CAT",
+        "TABLE_SCHEM",
+        "TABLE_NAME",
+        "TABLE_TYPE",
+        "REMARKS",
+        "TYPE_CAT",
+        "TYPE_SCHEM",
+        "TYPE_NAME",
+        "SELF_REFERENCING_COL_NAME",
+        "REF_GENERATION",
+    ];
+    for native in [false, true] {
+        for (pattern, literal, catalogs, matched, count) in &cases {
+            for filter in filters {
+                let server = MockServer::start().await;
+                mount_create_session(&server).await;
+                mount_delete_session(&server).await;
+                let catalog_batch = string_batch(vec![(
+                    "catalog",
+                    catalogs.iter().map(|name| Some(*name)).collect(),
+                )]);
+                mount_execute_expecting_sql(
+                    &server,
+                    "SHOW CATALOGS",
+                    closed_inline_response_body(&catalog_batch),
+                )
+                .await;
+                let mut scopes = catalogs.clone();
+                if !scopes.contains(literal) {
+                    scopes.push(literal);
+                }
+                for scope in scopes {
+                    let canonical = catalogs
+                        .iter()
+                        .find(|name| name.eq_ignore_ascii_case(scope));
+                    let body = if let Some(canonical) = canonical {
+                        let batch = if native {
+                            string_batch(vec![
+                                ("TABLE_CAT", vec![Some(*canonical); 2]),
+                                ("TABLE_SCHEM", vec![Some("default"); 2]),
+                                ("TABLE_NAME", vec![Some("v"), Some("t")]),
+                                ("TABLE_TYPE", vec![Some("VIEW"), Some("TABLE")]),
+                                ("REMARKS", vec![None, Some("table comment")]),
+                                ("TYPE_CAT", vec![None; 2]),
+                                ("TYPE_SCHEM", vec![None; 2]),
+                                ("TYPE_NAME", vec![None; 2]),
+                                ("SELF_REFERENCING_COL_NAME", vec![None; 2]),
+                                ("REF_GENERATION", vec![None; 2]),
+                            ])
+                        } else {
+                            string_batch(vec![
+                                ("namespace", vec![Some("default"); 2]),
+                                ("tableName", vec![Some("v"), Some("t")]),
+                                ("tableType", vec![Some("VIEW"), Some("TABLE")]),
+                                ("remarks", vec![None, Some("table comment")]),
+                            ])
+                        };
+                        let mut body: serde_json::Value =
+                            serde_json::from_str(&closed_inline_response_body(&batch)).unwrap();
+                        body["manifest"]["is_native_metadata_result"] = json!(native);
+                        body.to_string()
+                    } else {
+                        failed_response_body("42704", "CATALOG_NOT_FOUND")
+                    };
+                    mount_execute_expecting_sql(&server, &format!("IN CATALOG `{scope}`"), body)
+                        .await;
+                }
+                Mock::given(method("DELETE"))
+                    .and(path("/api/2.0/sql/statements/stmt-test"))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+                    .mount(&server)
+                    .await;
+                let session = open_session(&server).await;
+                let mut stream = session
+                    .metadata()
+                    .list_tables(
+                        Some(LikePattern::new(pattern).unwrap()),
+                        Some(LikePattern::new("default").unwrap()),
+                        Some(LikePattern::new("%").unwrap()),
+                        filter,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(col_names(&stream.schema()), columns);
+                let batches = drain_stream(&mut stream).await;
+                let rows: Vec<Vec<Option<String>>> = batches
+                    .iter()
+                    .flat_map(|batch| {
+                        (0..batch.num_rows()).map(|row| {
+                            batch
+                                .columns()
+                                .iter()
+                                .map(|column| {
+                                    let values = column.as_string::<i32>();
+                                    (!values.is_null(row)).then(|| values.value(row).to_owned())
+                                })
+                                .collect()
+                        })
+                    })
+                    .collect();
+                let mut matched = matched.clone();
+                matched.sort();
+                let mut expected = Vec::new();
+                for table_type in ["TABLE", "VIEW"] {
+                    if filter.is_some_and(|types| !types.contains(&table_type)) {
+                        continue;
+                    }
+                    for catalog in &matched {
+                        expected.push(vec![
+                            Some((*catalog).to_owned()),
+                            Some("default".to_owned()),
+                            Some(if table_type == "TABLE" { "t" } else { "v" }.to_owned()),
+                            Some(table_type.to_owned()),
+                            if table_type == "TABLE" {
+                                Some("table comment".to_owned())
+                            } else if native {
+                                None
+                            } else {
+                                Some(String::new())
+                            },
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                        ]);
+                    }
+                }
+                assert_eq!(
+                    rows, expected,
+                    "pattern={pattern}, native={native}, types={filter:?}"
+                );
+                let statements = server
+                    .received_requests()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .filter(|request| {
+                        request.method == "POST" && request.url.path() == "/api/2.0/sql/statements"
+                    })
+                    .count();
+                assert_eq!(
+                    statements, *count,
+                    "pattern={pattern}, native={native}, types={filter:?}"
+                );
+                session.close().await.unwrap();
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn list_tables_speculation_starts_before_catalog_lookup_finishes() {
+    use std::time::Duration;
+
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+    let catalogs = string_batch(vec![("catalog", vec![Some("bench_name")])]);
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .and(body_string_contains("SHOW CATALOGS"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(closed_inline_response_body(&catalogs))
+                .set_delay(Duration::from_secs(1)),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let table = string_batch(vec![
+        ("namespace", vec![Some("default")]),
+        ("tableName", vec![Some("t")]),
+        ("tableType", vec![Some("TABLE")]),
+    ]);
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .and(body_string_contains("IN CATALOG `bench_name`"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(closed_inline_response_body(&table)),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let session = open_session(&server).await;
+    let metadata = session.metadata();
+    let future = metadata.list_tables(
+        Some(LikePattern::new("bench_name").unwrap()),
+        None,
+        None,
+        None,
+    );
+    tokio::pin!(future);
+    let both_started = async {
+        loop {
+            let count = server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|request| {
+                    request.method == "POST" && request.url.path() == "/api/2.0/sql/statements"
+                })
+                .count();
+            if count == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::select! {
+        _ = &mut future => panic!("metadata completed before delayed catalog lookup"),
+        result = tokio::time::timeout(Duration::from_millis(500), both_started) => {
+            result.expect("table request must overlap delayed catalog lookup");
+        }
+    }
+    let mut stream = tokio::time::timeout(Duration::from_secs(3), future)
+        .await
+        .unwrap()
+        .unwrap();
+    let batches = drain_stream(&mut stream).await;
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+    session.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn list_tables_failed_speculation_retries_after_catalog_confirmation() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    for sql_state in ["42704", "42501", "HY000"] {
+        let server = MockServer::start().await;
+        mount_create_session(&server).await;
+        mount_delete_session(&server).await;
+        let catalogs = string_batch(vec![("catalog", vec![Some("bench_name")])]);
+        mount_execute_expecting_sql(
+            &server,
+            "SHOW CATALOGS",
+            closed_inline_response_body(&catalogs),
+        )
+        .await;
+        let table = string_batch(vec![
+            ("namespace", vec![Some("default")]),
+            ("tableName", vec![Some("t")]),
+            ("tableType", vec![Some("TABLE")]),
+        ]);
+        let success = closed_inline_response_body(&table);
+        let failure = failed_response_body(sql_state, "speculative failure");
+        let executions = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&executions);
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/statements"))
+            .and(body_string_contains("IN CATALOG `bench_name`"))
+            .respond_with(move |_: &wiremock::Request| {
+                let body = if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                    &failure
+                } else {
+                    &success
+                };
+                ResponseTemplate::new(200).set_body_string(body)
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/api/2.0/sql/statements/stmt-test"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let session = open_session(&server).await;
+        let mut stream = session
+            .metadata()
+            .list_tables(
+                Some(LikePattern::new("bench_name").unwrap()),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            drain_stream(&mut stream)
+                .await
+                .iter()
+                .map(RecordBatch::num_rows)
+                .sum::<usize>(),
+            1
+        );
+        assert_eq!(executions.load(Ordering::SeqCst), 2);
+        session.close().await.unwrap();
+        server.verify().await;
+    }
+}
+
+#[tokio::test]
+async fn list_tables_speculation_closes_result_when_catalog_lookup_fails() {
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+    mount_execute_expecting_sql(
+        &server,
+        "SHOW CATALOGS",
+        failed_response_body("42501", "catalog lookup failure"),
+    )
+    .await;
+    let table = string_batch(vec![
+        ("namespace", vec![Some("default")]),
+        ("tableName", vec![Some("t")]),
+        ("tableType", vec![Some("TABLE")]),
+    ]);
+    mount_execute_expecting_sql(
+        &server,
+        "IN CATALOG `bench_name`",
+        succeeded_inline_response_body(&table),
+    )
+    .await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/2.0/sql/statements/stmt-test"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .expect(2)
+        .mount(&server)
+        .await;
+    let session = open_session(&server).await;
+    let result = session
+        .metadata()
+        .list_tables(
+            Some(LikePattern::new("bench_name").unwrap()),
+            None,
+            None,
+            None,
+        )
+        .await;
+    let error = result.err().expect("catalog lookup failure must propagate");
+    assert!(error.to_string().contains("catalog lookup failure"));
+    server.verify().await;
+    session.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn list_tables_percent_catalog_uses_single_all_catalogs_query() {
     // `%` matches every catalog and is semantically identical to `None`,
     // so it must take the single `SHOW TABLES IN ALL CATALOGS` path, NOT
