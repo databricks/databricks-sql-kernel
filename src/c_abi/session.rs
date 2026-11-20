@@ -1303,10 +1303,11 @@ pub unsafe extern "C" fn kernel_session_config_set_tls_client_certificate(
 /// Enable or disable TLS certificate-revocation checking (default: off).
 ///
 /// `check_revocation` turns checking on. A revoked certificate is always
-/// rejected. An undetermined status (no distribution point, CRL fetch failure,
-/// expired CRL) is rejected unless `accept_undetermined` is true. Requires the
-/// `tls-rustls` backend: under `tls-native`, opening a session with
-/// `check_revocation` true fails with `InvalidArgument`.
+/// rejected. An undetermined status (a fetch failure, an offline status, a
+/// partial chain) is rejected unless `accept_undetermined` is true. Supported
+/// only on Windows with the `tls-rustls` backend: elsewhere, and under
+/// `tls-native`, opening a session with `check_revocation` true fails with
+/// `InvalidArgument`.
 ///
 /// # Safety
 /// `config` must be a live config handle.

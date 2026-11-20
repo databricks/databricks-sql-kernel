@@ -470,18 +470,22 @@ KernelStatusCode kernel_session_config_set_tls_client_certificate(
 
 /* Enable or disable TLS certificate-revocation checking (default: off).
  *
- * With `check_revocation` true, the server certificate chain (end-entity and
- * intermediates) is checked against the CRLs named by its CRL distribution
- * points. A revoked certificate is always rejected. `accept_undetermined`
- * governs a status that cannot be determined (no distribution point, CRL fetch
- * failure or timeout, non-200 or oversized response, expired CRL): false
- * rejects it (strict), true accepts it. An invalid CRL signature or a CRL for
- * the wrong issuer is always rejected. `check_revocation` false disables the
- * check whatever `accept_undetermined` says. Revocation is also skipped when
- * the self-signed setter is set.
+ * Supported only on Windows with the tls-rustls backend, where Windows CryptoAPI
+ * checks the revocation of the chain it builds for the server certificate, after
+ * webpki has verified the chain. A revoked certificate is always rejected.
+ * `accept_undetermined` governs a status that cannot be determined (a fetch
+ * failure or timeout, an offline status, a partial chain): false rejects it
+ * (strict), true accepts it. `check_revocation` false disables the check whatever
+ * `accept_undetermined` says. Revocation is also skipped when the self-signed
+ * setter is set.
  *
- * Requires the tls-rustls backend; under tls-native, opening a session with
- * `check_revocation` true fails and the error names the backend. */
+ * CRL and OCSP retrieval uses Windows networking and proxy settings, not the
+ * kernel's proxy configuration, and Windows caches the results. Session
+ * resumption is disabled while checking is on.
+ *
+ * Requesting it on any other platform, or on tls-native, makes opening a session
+ * fail with InvalidArgument, and the error names the unsupported platform or
+ * backend. */
 KernelStatusCode kernel_session_config_set_tls_certificate_revocation(
     KernelSessionConfig* config, bool check_revocation, bool accept_undetermined);
 

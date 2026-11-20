@@ -1042,22 +1042,25 @@ pub struct TlsConfig {
     /// backend-specific validation timing.
     pub client_key_pem: Option<Vec<u8>>,
 
-    /// Check the server chain's revocation status against its CRL distribution
-    /// points. Default off. Revoked certificates are always rejected. Requires
-    /// the `tls-rustls` backend; `tls-native` fails session open with
-    /// `InvalidArgument`. Disabled by [`Self::accept_self_signed`].
+    /// Check the revocation status of the server certificate chain with Windows
+    /// CryptoAPI. Default off. Revoked certificates are always rejected.
     ///
-    /// CRL distribution-point URLs come from certificates that chain to a trusted CA, and the
-    /// kernel fetches them without destination filtering.
+    /// Supported only on Windows with the `tls-rustls` backend. Elsewhere, and on
+    /// `tls-native`, opening a session with this on fails with `InvalidArgument`.
+    /// Disabled by [`Self::accept_self_signed`].
     ///
-    /// Each handshake waits, up to a 10 s budget per chain, for the CRLs it needs. The
-    /// kernel's own runtimes are multi-thread (C ABI, telemetry, pyo3 and napi), where that
-    /// wait moves the runtime's other tasks off the thread. Only a caller that drives the
-    /// kernel on its own `current_thread` runtime can be stalled by it.
+    /// Trust, name and signatures are still decided by webpki, as with checking off.
+    /// CryptoAPI then checks every certificate in the chain it builds except the root.
+    /// Only the revocation bits are read. The trust bits are ignored. CRL and OCSP
+    /// retrieval uses Windows networking and proxy settings, not [`ProxyConfig`], and
+    /// Windows caches the results. Each handshake waits at most 10 s in total for those
+    /// fetches. A caller on its own `current_thread` runtime can be stalled by that
+    /// wait. Session resumption is disabled while checking is on.
     pub check_certificate_revocation: Option<bool>,
 
     /// With [`Self::check_certificate_revocation`] on, accept a chain whose status
-    /// cannot be determined (no CRL, fetch failure, expired CRL). Default off.
+    /// cannot be determined (a fetch failure or timeout, an offline status, a partial
+    /// chain). Default off. Matches Simba's strict and accept-undetermined modes.
     pub accept_undetermined_certificate_revocation: Option<bool>,
 }
 
