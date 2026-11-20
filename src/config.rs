@@ -764,9 +764,11 @@ pub struct HttpConfig {
     /// Per-session connection pool size (max idle warm sockets per remote host).
     /// A live session has exclusive use of its pool. After the HTTP client is
     /// dropped, a matching session on the same runtime may reuse that pool.
-    /// Idle pools, including sockets and TLS/proxy configuration, are retained
-    /// for up to 105 seconds. New sessions never reuse a pool older than five
-    /// minutes; system trust is a snapshot until it is rebuilt.
+    /// Idle pools, including sockets and TLS/proxy configuration, expire after
+    /// 90 seconds. Cleanup runs every 15 seconds while the runtime is driven;
+    /// otherwise expired pools are released on cache access or runtime shutdown.
+    /// New sessions never reuse a pool older than five minutes; system trust
+    /// is a snapshot until it is rebuilt.
     ///
     /// Defaults to `100`, matching the JDBC driver's `HttpConnectionPoolSize`
     /// default. Raise this for workloads that burst many concurrent

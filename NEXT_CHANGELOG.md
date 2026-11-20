@@ -16,7 +16,7 @@ changes go in their respective binding's NEXT_CHANGELOG.
 
 ### Changed
 
-- Sessions can reuse a matching HTTP connection pool after its previous HTTP client is dropped; live sessions keep exclusive pools and independent idle-socket limits. Idle retention is bounded to 105 seconds (including TLS/proxy configuration), and pools older than five minutes are never reused, bounding system-trust snapshots.
+- Sessions can reuse a matching HTTP connection pool after its previous HTTP wrapper is dropped; live sessions keep exclusive pools and independent idle-socket limits. Idle sockets and TLS/proxy configuration expire after 90 seconds, with cleanup within 15 more seconds while the runtime is driven or on the next cache access/shutdown otherwise; pools older than five minutes are never reused, bounding system-trust snapshots.
 - Rust ADBC requests identify themselves as `RustADBCDatabricksDriver/<version>`
   with an optional partner entry from `adbc.databricks.user_agent_entry`
   (`adbc.spark.user_agent_entry` is a compatibility alias). `User-Agent` in

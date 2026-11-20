@@ -156,6 +156,21 @@ struct PoolState {
     closed: bool,
 }
 
+impl PoolState {
+    fn expire(&mut self, now: Instant) -> Vec<Entry> {
+        let mut expired = Vec::new();
+        let mut index = 0;
+        while index < self.entries.len() {
+            if !self.entries[index].reusable(now) {
+                expired.push(self.entries.swap_remove(index));
+            } else {
+                index += 1;
+            }
+        }
+        expired
+    }
+}
+
 #[derive(Default)]
 struct ClientPool {
     state: Mutex<PoolState>,
@@ -165,11 +180,15 @@ impl ClientPool {
     fn take(&self, key: &PoolKey) -> Option<Entry> {
         let now = Instant::now();
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        let index = state
+        let expired = state.expire(now);
+        let entry = state
             .entries
             .iter()
-            .position(|entry| entry.key == *key && entry.reusable(now))?;
-        Some(state.entries.swap_remove(index))
+            .position(|entry| entry.key == *key)
+            .map(|index| state.entries.swap_remove(index));
+        drop(state);
+        drop(expired);
+        entry
     }
 
     fn checkout(
@@ -192,11 +211,15 @@ impl ClientPool {
     }
 
     fn put(&self, entry: Entry) {
+        let now = Instant::now();
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        if state.closed || !entry.reusable(Instant::now()) {
+        let mut expired = state.expire(now);
+        if state.closed || !entry.reusable(now) {
+            drop(state);
+            drop(expired);
             return;
         }
-        let evicted = if state.entries.len() == MAX_CLIENTS {
+        if state.entries.len() == MAX_CLIENTS {
             let oldest = state
                 .entries
                 .iter()
@@ -204,26 +227,16 @@ impl ClientPool {
                 .min_by_key(|(_, entry)| entry.idle_since)
                 .map(|(index, _)| index)
                 .unwrap_or(0);
-            Some(state.entries.swap_remove(oldest))
-        } else {
-            None
-        };
+            expired.push(state.entries.swap_remove(oldest));
+        }
         state.entries.push(entry);
         drop(state);
-        drop(evicted);
+        drop(expired);
     }
 
     fn expire(&self, now: Instant) {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        let mut expired = Vec::new();
-        let mut index = 0;
-        while index < state.entries.len() {
-            if !state.entries[index].reusable(now) {
-                expired.push(state.entries.swap_remove(index));
-            } else {
-                index += 1;
-            }
-        }
+        let expired = state.expire(now);
         drop(state);
         drop(expired);
     }
@@ -511,6 +524,62 @@ mod tests {
         assert!(pool.take(&key("host")).is_none());
         pool.expire(Instant::now());
         assert!(pool.state.lock().unwrap().entries.is_empty());
+    }
+
+    #[test]
+    fn cache_access_expires_entries_without_polling_the_runtime() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _entered = runtime.enter();
+        tokio::time::pause();
+        let polls = Arc::new(AtomicUsize::new(0));
+        for access in 0..3 {
+            let pool = Arc::new(ClientPool::default());
+            let cleanup = expire_idle_clients(runtime.handle().id(), pool.clone());
+            let task_polls = polls.clone();
+            runtime.spawn(async move {
+                task_polls.fetch_add(1, Ordering::SeqCst);
+                cleanup.await;
+            });
+            let created_at = Instant::now();
+            let mut expired_key = key("expired");
+            expired_key.config.tls.client_key_pem = Some(b"expired-private-key".to_vec());
+            expired_key.config.proxy.password = Some("expired-proxy-password".into());
+            pool.put(Entry {
+                key: expired_key,
+                client: Client::new(),
+                created_at,
+                idle_since: created_at,
+            });
+            // Advance the clock without driving Tokio's tasks or IO/timer driver.
+            futures::executor::block_on(tokio::time::advance(if access == 2 {
+                MAX_AGE
+            } else {
+                IDLE_TIMEOUT + SWEEP_INTERVAL
+            }));
+            if access == 0 {
+                assert!(pool.take(&key("unrelated")).is_none());
+            } else {
+                pool.put(Entry {
+                    key: key("returned"),
+                    client: Client::new(),
+                    created_at: if access == 2 {
+                        created_at
+                    } else {
+                        Instant::now()
+                    },
+                    idle_since: Instant::now(),
+                });
+            }
+            assert_eq!(
+                pool.state.lock().unwrap().entries.len(),
+                usize::from(access == 1),
+                "cache access {access} retained expired configuration"
+            );
+            assert_eq!(polls.load(Ordering::SeqCst), 0);
+        }
     }
 
     #[tokio::test(start_paused = true)]
