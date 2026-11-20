@@ -65,9 +65,6 @@ rustls = { version = "0.23.41", optional = true, default-features = false, featu
 # Enforce TLS dependency minimums for consumers with their own lockfiles.
 rustls-webpki = { version = "0.103.16", optional = true, default-features = false }
 webpki-roots = { version = "1.0.11", optional = true, default-features = false }
-# `tls-rustls` only. Loads the OS trust store for the revocation verifier on Windows (see
-# `src/client/tls_revocation.rs`), the same store reqwest's `rustls-tls-native-roots` loads.
-rustls-native-certs = { version = "0.8", optional = true }
 tokio = { version = "1", features = ["full", "sync"] }
 
 # Serialization
@@ -152,6 +149,9 @@ pkcs8 = { version = "0.10", features = ["encryption", "pem", "std"] }           
 # `windows-sys` is already in the lock file; no new packages.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
+# `tls-rustls` on Windows only. Loads the OS trust store for the revocation verifier (see
+# `src/client/tls_revocation.rs`), the same store reqwest's `rustls-tls-native-roots` loads.
+rustls-native-certs = { version = "0.8", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util"] }
