@@ -14,6 +14,10 @@ layout, or npm publishing. Pure-kernel changes go in the root
 
 ### Added
 
+- `ConnectionOptions.enableHttp2` selects HTTP/2 negotiation for HTTPS requests.
+  It defaults to enabled; set it to `false` to force HTTP/1.1. Configured proxies
+  force HTTP/1.1 for the entire kernel client.
+
 ### Changed
 
 ### Updated

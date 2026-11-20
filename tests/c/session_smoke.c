@@ -240,6 +240,8 @@ static void test_u2m_and_header_setters(void) {
   rc = kernel_session_config_set_sea_response_compression_enabled(config, true);
   CHECK(rc == KernelStatusCode_Success,
         "set_sea_response_compression_enabled succeeds");
+  rc = kernel_session_config_set_http2_enabled(config, false);
+  CHECK(rc == KernelStatusCode_Success, "set_http2_enabled succeeds");
   rc = kernel_session_config_set_custom_header(config, NULL, "v");
   CHECK(rc == KernelStatusCode_InvalidArgument, "set_custom_header(NULL name) → InvalidArgument");
   rc = kernel_session_config_set_custom_header(config, "X-Foo", NULL);

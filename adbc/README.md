@@ -98,7 +98,7 @@ The main database option families are:
 | Namespace | `adbc.databricks.catalog`, `adbc.databricks.schema` |
 | Attribution | `adbc.databricks.user_agent_entry` |
 | Session | `adbc.databricks.session_conf.<name>`, `adbc.databricks.ssp_ansi_mode`, `adbc.databricks.ssp_timezone`, `adbc.databricks.query_tags` |
-| HTTP | request/overall timeouts, idle pool size, retry limits/backoff, response compression, JSON custom headers |
+| HTTP | HTTP/2 negotiation, request/overall timeouts, idle pool size, retry limits/backoff, response compression, JSON custom headers |
 | Proxy | URL, username, password, bypass hosts |
 | TLS/mTLS | CA file or PEM, client certificate/key file or PEM, self-signed and hostname-verification controls |
 | Logging | filter and file |
@@ -106,6 +106,10 @@ The main database option families are:
 | Results | complex datatype support, geospatial representation, CloudFetch enablement and buffering |
 | Execution | `adbc.databricks.enable_direct_results` (default `true`); set `false` to use `wait_timeout=0s` and status polling |
 | Metadata | `adbc.databricks.metadata.escape_catalog_name` |
+
+HTTPS requests negotiate HTTP/2 with HTTP/1.1 fallback by default. Set
+`adbc.databricks.http.http2_enabled` to `false` to force HTTP/1.1 for session
+HTTPS traffic. Configured proxies force HTTP/1.1, including bypassed destinations.
 
 The optional user-agent entry is appended to the driver-owned identity as
 `RustADBCDatabricksDriver/<version> (<entry>)`. Set it through

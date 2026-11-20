@@ -748,6 +748,11 @@ impl std::fmt::Debug for AuthConfig {
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct HttpConfig {
+    /// Negotiate HTTP/2 for HTTPS requests, with HTTP/1.1 fallback.
+    /// Defaults to `true`. Set to `false` to use HTTP/1.1 only.
+    /// A configured proxy forces HTTP/1.1 for every request on the client.
+    pub http2_enabled: bool,
+
     /// Whether authenticated SEA requests may negotiate HTTP response compression.
     /// Defaults to `false` because inline Arrow results are already LZ4-compressed.
     pub sea_response_compression_enabled: bool,
@@ -761,13 +766,11 @@ pub struct HttpConfig {
     /// Retrying stops once cumulative elapsed time exceeds this.
     pub overall_timeout: Duration,
 
-    /// Connection pool size (max idle warm sockets per remote host).
-    ///
-    /// Defaults to `100`, matching the JDBC driver's `HttpConnectionPoolSize`
-    /// default. Raise this for workloads that burst many concurrent
-    /// `executeStatement` calls or CloudFetch chunk downloads against a
-    /// single host; too low a value forces fresh TLS handshakes when the
-    /// pool fills.
+    /// Maximum idle connections retained per host, defaulting to `100`,
+    /// matching the JDBC driver's `HttpConnectionPoolSize`.
+    /// Higher values preserve more warm HTTP/1.1 connections between bursts.
+    /// HTTP/2 requests multiplex on a shared connection; this does not
+    /// limit active requests or HTTP/2 streams.
     pub pool_max_idle_per_host: usize,
 
     /// Minimum backoff wait between retry attempts. Also the floor for
@@ -834,6 +837,7 @@ pub struct HttpConfig {
 impl Default for HttpConfig {
     fn default() -> Self {
         Self {
+            http2_enabled: true,
             sea_response_compression_enabled: false,
             request_timeout: Duration::from_secs(120),
             overall_timeout: Duration::from_secs(900),
