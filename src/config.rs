@@ -1053,14 +1053,25 @@ pub struct TlsConfig {
     /// CryptoAPI then checks every certificate in the chain it builds except the root.
     /// Only the revocation bits are read. The trust bits are ignored. CRL and OCSP
     /// retrieval uses Windows networking and proxy settings, not [`ProxyConfig`], and
-    /// Windows caches the results. Each handshake waits at most 10 s in total for those
-    /// fetches. A caller on its own `current_thread` runtime can be stalled by that
-    /// wait. Session resumption is disabled while checking is on.
+    /// Windows caches the results. The check is synchronous and runs inside the TLS
+    /// handshake, so it blocks the calling task until CryptoAPI returns, even on a
+    /// multi-thread runtime. A connect or operation timeout on that task can be exceeded
+    /// by up to the revocation budget (about 10 s for CRL and OCSP retrieval in total;
+    /// AIA and other chain-building fetches are bounded per URL, not in total). On a
+    /// `current_thread` runtime the whole runtime waits. Session resumption is disabled
+    /// while checking is on.
     pub check_certificate_revocation: Option<bool>,
 
     /// With [`Self::check_certificate_revocation`] on, accept a chain whose status
     /// cannot be determined (a fetch failure or timeout, an offline status, a partial
     /// chain). Default off. Matches Simba's strict and accept-undetermined modes.
+    ///
+    /// In strict mode (this option unset or false), an undetermined status is a
+    /// certificate error, and the kernel treats it as permanent: it is not retried.
+    /// That is by design, so a fetch outage fails the connection at once rather than
+    /// after retries. To tolerate transient revocation-service outages, set this option
+    /// (the ODBC driver's `AcceptUndeterminedRevocation=1`). A revoked status is
+    /// permanent in both modes.
     pub accept_undetermined_certificate_revocation: Option<bool>,
 }
 

@@ -21,7 +21,10 @@ changes go in their respective binding's NEXT_CHANGELOG.
   `TlsConfig::accept_undetermined_certificate_revocation`, or with
   `kernel_session_config_set_tls_certificate_revocation`. CRL and OCSP fetches
   use Windows' networking and proxy settings, and Windows caches their results.
-  Session resumption is disabled while revocation is on.
+  The check is synchronous and runs inside the TLS handshake, so a connect or
+  operation timeout can be exceeded by up to the revocation budget (about 10 s
+  for CRL and OCSP retrieval in total). Session resumption is disabled while
+  revocation is on.
 
 ### Changed
 
