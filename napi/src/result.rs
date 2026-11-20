@@ -71,11 +71,15 @@ fn encode_ipc_batches(schema: &SchemaRef, batches: &[RecordBatch]) -> napi::Resu
     }
     // IPC-decoded arrays can share a much larger backing buffer. Reserve for
     // the slices being encoded, with slack for schema and message framing.
+    // Unsupported sizing falls back to the writer's normal buffer growth.
     let estimated = batches
         .iter()
         .map(sliced_batch_bytes)
-        .fold(4096usize, usize::saturating_add)
-        .min(IPC_TARGET_BYTES);
+        .filter(|&bytes| bytes != usize::MAX)
+        .fold(
+            4096usize.saturating_add(batches.len().saturating_mul(1024)),
+            usize::saturating_add,
+        );
     let mut buf: Vec<u8> = Vec::with_capacity(estimated);
     {
         let mut writer =
@@ -260,6 +264,39 @@ mod tests {
         assert_eq!(decoded.len(), 1, "exactly one batch decoded");
         assert_eq!(decoded[0].num_rows(), 3);
         assert_eq!(decoded[0].schema().fields(), schema.fields());
+    }
+
+    #[test]
+    fn oversized_owned_batch_does_not_retain_a_doubled_output_buffer() {
+        use arrow_array::StringArray;
+        let batch = RecordBatch::try_from_iter([(
+            "value",
+            Arc::new(StringArray::from(vec![Some("x".repeat(1536 * 1024)), None]))
+                as arrow_array::ArrayRef,
+        )])
+        .unwrap();
+        let bytes = encode_ipc_stream(&batch.schema(), Some(&batch)).unwrap();
+        assert!(bytes.len() > IPC_TARGET_BYTES);
+        assert!(bytes.capacity() < bytes.len() * 11 / 10);
+        assert_eq!(decode(bytes), vec![batch]);
+    }
+
+    #[test]
+    fn message_framing_does_not_double_the_output_buffer() {
+        use arrow_array::{ArrayRef, Int64Array};
+        let batch = RecordBatch::try_from_iter((0..16).map(|column| {
+            (
+                format!("column{column}"),
+                Arc::new(Int64Array::from_iter(
+                    (0..480).map(|row| (row % 11 != 0).then_some(row + column)),
+                )) as ArrayRef,
+            )
+        }))
+        .unwrap();
+        let batches = vec![batch; 16];
+        let bytes = encode_ipc_batches(&batches[0].schema(), &batches).unwrap();
+        assert!(bytes.capacity() < bytes.len() * 11 / 10);
+        assert_eq!(decode(bytes), batches);
     }
 
     struct Source {

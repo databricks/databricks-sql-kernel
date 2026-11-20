@@ -474,8 +474,8 @@ pub struct ResultStream {
     /// `next_row_in_batch` reads and increments.
     current_row_idx: usize,
 
-    /// Flips to `true` once the wrapped reader returns its first
-    /// `None`. Subsequent `next_batch` calls short-circuit to
+    /// Flips to `true` when a normal fetch or first-batch peek observes
+    /// the end. Ready-only lookahead leaves this false. Later `next_batch` calls return
     /// `Ok(None)` without re-entering the reader — saves a wasted
     /// call on readers whose `next_batch` is non-trivial (CloudFetch
     /// in particular checks state and may take a runtime tick).
@@ -758,6 +758,10 @@ impl ResultStream {
     /// end-of-stream do not finalize telemetry or clear the current batch.
     /// Call `next_batch` (or `try_next_batch`) to deliver a buffered error or
     /// observe the end and finalize consumption. Readers may opt out of probing.
+    ///
+    /// `Pending` can persist indefinitely for opt-out readers or a buffered
+    /// error. Repeated calls need not make progress; fall back to `next_batch`
+    /// to await the next outcome rather than polling this method alone.
     pub fn try_next_ready_batch(&mut self) -> Result<TryNextBatch<'_>> {
         self.try_next_batch_inner(false)
     }
