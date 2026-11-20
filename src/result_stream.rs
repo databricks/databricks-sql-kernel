@@ -747,6 +747,17 @@ impl ResultStream {
     /// Return the next batch if it is already available without waiting for
     /// network or background-prefetch progress.
     pub fn try_next_batch(&mut self) -> Result<TryNextBatch<'_>> {
+        self.try_next_batch_inner(true)
+    }
+
+    /// Non-blocking lookahead for bindings packing ready batches. End-of-stream
+    /// leaves the current batch and telemetry untouched until a normal fetch,
+    /// so returning a payload does not prematurely mark it fully consumed.
+    pub fn try_next_ready_batch(&mut self) -> Result<TryNextBatch<'_>> {
+        self.try_next_batch_inner(false)
+    }
+
+    fn try_next_batch_inner(&mut self, finalize_end: bool) -> Result<TryNextBatch<'_>> {
         if let Some(batch) = self.prefetched.take() {
             self.set_current_batch(batch.map_err(|error| *error)?);
             return Ok(TryNextBatch::Ready(
@@ -754,7 +765,9 @@ impl ResultStream {
             ));
         }
         if self.exhausted {
-            self.finalize_telemetry(None);
+            if finalize_end {
+                self.finalize_telemetry(None);
+            }
             return Ok(TryNextBatch::End);
         }
 
@@ -770,6 +783,7 @@ impl ResultStream {
                 ))
             }
             Ok(crate::reader::TryNextBatch::Pending) => Ok(TryNextBatch::Pending),
+            Ok(crate::reader::TryNextBatch::End) if !finalize_end => Ok(TryNextBatch::End),
             Ok(crate::reader::TryNextBatch::End) => {
                 self.current = None;
                 self.current_row_idx = 0;
@@ -1363,6 +1377,51 @@ mod tests {
         assert!(stream.next_batch().await.unwrap().is_none());
         // Subsequent calls keep returning None without crashing.
         assert!(stream.next_batch().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn ready_lookahead_does_not_finalize_end_before_payload_delivery() {
+        for close_before_end in [false, true] {
+            let schema = schema_for(vec![Field::new("a", DataType::Int32, false)]);
+            let batch =
+                RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![1]))]).unwrap();
+            let mut stream = stream_with(batch).await;
+            stream.attach_telemetry(StatementTelemetry::noop());
+            assert!(stream.next_batch().await.unwrap().is_some());
+            assert!(matches!(
+                stream.try_next_ready_batch().unwrap(),
+                TryNextBatch::End
+            ));
+            assert!(stream.current().is_some());
+            assert!(!stream.exhausted);
+            assert!(!stream.telemetry.as_ref().unwrap().finalized);
+            assert!(!stream.telemetry.as_ref().unwrap().consumed_recorded);
+            if close_before_end {
+                stream.finish_telemetry();
+                assert!(!stream.telemetry.as_ref().unwrap().consumed_recorded);
+            } else {
+                assert!(stream.next_batch().await.unwrap().is_none());
+                assert!(stream.telemetry.as_ref().unwrap().consumed_recorded);
+            }
+            assert!(stream.telemetry.as_ref().unwrap().finalized);
+        }
+    }
+
+    #[tokio::test]
+    async fn ready_lookahead_preserves_unconsumed_empty_stream() {
+        let schema = schema_for(vec![Field::new("a", DataType::Int32, false)]);
+        let mut stream = ResultStream::from_reader(Box::new(InMemoryReader::new(schema, vec![])))
+            .await
+            .unwrap();
+        stream.attach_telemetry(StatementTelemetry::noop());
+        assert!(stream.peek_first_batch().await.unwrap().is_none());
+        assert!(matches!(
+            stream.try_next_ready_batch().unwrap(),
+            TryNextBatch::End
+        ));
+        assert!(!stream.telemetry.as_ref().unwrap().finalized);
+        assert!(stream.next_batch().await.unwrap().is_none());
+        assert!(stream.telemetry.as_ref().unwrap().finalized);
     }
 
     #[tokio::test]

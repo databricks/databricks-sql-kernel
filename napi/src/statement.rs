@@ -84,8 +84,11 @@ impl BatchSource for AnyInner {
         &mut self,
     ) -> databricks_sql_kernel::Result<databricks_sql_kernel::result_stream::TryNextBatch<'_>> {
         match self {
-            AnyInner::Executed(statement) => statement.executed.try_next_batch(),
-            AnyInner::Metadata(stream) => stream.try_next_batch(),
+            AnyInner::Executed(statement) => statement
+                .executed
+                .result_stream_mut()
+                .try_next_ready_batch(),
+            AnyInner::Metadata(stream) => stream.try_next_ready_batch(),
         }
     }
 

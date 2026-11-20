@@ -118,7 +118,7 @@ impl BatchSource for ResultStream {
     }
 
     fn try_next_batch(&mut self) -> databricks_sql_kernel::Result<TryNextBatch<'_>> {
-        self.try_next_batch()
+        self.try_next_ready_batch()
     }
 }
 
