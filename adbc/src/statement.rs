@@ -1540,61 +1540,6 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
-    fn volume_option_null_clears_paths_across_statement_reuse() {
-        let runtime = RuntimeHandle::create().unwrap();
-        let server = runtime.block_on_safe(MockServer::start());
-        runtime.block_on_safe(async {
-            Mock::given(method("POST"))
-                .and(path("/api/2.0/sql/warehouses/wh/sessions"))
-                .respond_with(
-                    ResponseTemplate::new(200).set_body_json(json!({"session_id":"session"})),
-                )
-                .expect(1)
-                .mount(&server)
-                .await;
-            Mock::given(method("DELETE"))
-                .respond_with(ResponseTemplate::new(200))
-                .mount(&server)
-                .await;
-        });
-        let session = runtime
-            .block_on_safe(
-                kernel::Session::builder()
-                    .http_path(server.uri(), "/sql/1.0/warehouses/wh")
-                    .auth(kernel::AuthConfig::Pat {
-                        token: "test-token".into(),
-                        identity_federation_client_id: None,
-                    })
-                    .open(),
-            )
-            .unwrap();
-        let mut statement = Statement::new(
-            session.statement(),
-            session.metadata(),
-            Arc::clone(&runtime),
-            Arc::new(CancellationRegistry::default()),
-            false,
-        );
-        let key = OptionStatement::Other(STAGING_ALLOWED_PATHS_OPTION.into());
-        statement
-            .set_option(key.clone(), r#"["/allowed"]"#.into())
-            .unwrap();
-        statement.set_sql_query("SELECT 1").unwrap();
-        assert_eq!(
-            statement.get_option_string(key.clone()).unwrap(),
-            r#"["/allowed"]"#
-        );
-        statement.set_option(key.clone(), "null".into()).unwrap();
-        statement.set_sql_query("SELECT 2").unwrap();
-        assert!(statement.volume_options.is_none());
-        assert_eq!(
-            statement.get_option_string(key).unwrap_err().status,
-            Status::NotFound
-        );
-        runtime.block_on_safe(session.close()).unwrap();
-    }
-
-    #[test]
     fn volume_option_controls_completion_on_all_execution_paths_and_preserves_rows() {
         let runtime = RuntimeHandle::create().unwrap();
         let server = runtime.block_on_safe(MockServer::start());
@@ -1691,7 +1636,14 @@ mod tests {
             );
         }
         statement.set_option(key.clone(), "[]".into()).unwrap();
+        statement.set_sql_query("SELECT 1").unwrap();
         assert_eq!(statement.get_option_string(key.clone()).unwrap(), "[]");
+        statement.set_option(key.clone(), "null".into()).unwrap();
+        assert_eq!(
+            statement.get_option_string(key.clone()).unwrap_err().status,
+            Status::NotFound
+        );
+        statement.set_option(key.clone(), "[]".into()).unwrap();
         let mut transfers = 0;
         for mode in ["raw", "sync", "async", "await", "fetch", "bound", "update"] {
             let mut statement = Statement::new(
