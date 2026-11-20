@@ -51,21 +51,9 @@ pub struct ArrowSchema {
 /// Encode an Arrow schema (and an optional single record batch) as a
 /// complete, self-contained Arrow IPC stream payload.
 ///
-/// Shared single source of truth for every batch/schema that crosses
-/// the napi boundary: the sync `Statement` path (`schema()` /
-/// `fetchNextBatch()` in `statement.rs`) and the async
-/// `AsyncResultHandle` path (`async_statement.rs`) both call this, so
-/// the two emit byte-identical envelopes and route encode failures
-/// through the same kernel error envelope (`napi_err_from_kernel`) —
-/// the TS reviver sees a typed `KernelError(code='Internal')` rather
-/// than a bare `GenericFailure` string. Lives here in `result.rs`
-/// because this module already owns `ArrowBatch` / `ArrowSchema`, the
-/// payload types these bytes are wrapped in.
-///
-/// Returning a self-contained IPC stream per call is wasteful
-/// header-wise but lets the JS adapter stay stateless — it decodes
-/// each `ipcBytes` independently via the same `apache-arrow`
-/// `RecordBatchReader` path.
+/// Schema getters and `IpcStream` share the same writer and typed error
+/// envelope. Each payload stays self-contained for stateless JS readers;
+/// fetch paths amortize the schema header across ready record batches.
 pub(crate) fn encode_ipc_stream(
     schema: &SchemaRef,
     batch: Option<&RecordBatch>,
