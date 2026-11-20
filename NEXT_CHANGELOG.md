@@ -16,7 +16,7 @@ changes go in their respective binding's NEXT_CHANGELOG.
 
 ### Changed
 
-- Sessions with matching HTTP settings on the same Tokio runtime reuse the HTTP connection pool. Pools are bounded and expire after 90 seconds without a new session; authentication and session state remain independent.
+- Sessions can reuse a matching HTTP connection pool after its previous HTTP client is dropped; live sessions keep exclusive pools and independent idle-socket limits. Idle retention is bounded to 105 seconds (including TLS/proxy configuration), and pools older than five minutes are never reused, bounding system-trust snapshots.
 - Rust ADBC requests identify themselves as `RustADBCDatabricksDriver/<version>`
   with an optional partner entry from `adbc.databricks.user_agent_entry`
   (`adbc.spark.user_agent_entry` is a compatibility alias). `User-Agent` in
@@ -32,6 +32,7 @@ changes go in their respective binding's NEXT_CHANGELOG.
 
 ### Fixed
 
+- Closing a `Session` now frees its transport, HTTP client and tokio runtime handle. A reference cycle between the transport and its result-reader factory kept them alive, so bindings that run one tokio runtime per session (Python) leaked four file descriptors per closed session until the process hit `Too many open files`.
 - `Session::open` authenticates once before resolving feature flags. A failed OAuth token request now fails the open immediately instead of being sent a second time by CreateSession.
 - A timed-out or reset CloudFetch download no longer writes the presigned URL's signature (`sig=`, `X-Amz-Signature`) to the log or the returned error. The request URL in those messages now ends at the path, and debug request lines stop at `?`.
 - Closing an OAuth session (M2M, M2M private key, U2M or Azure service principal) now frees its HTTP client and auth provider. The provider held the HTTP client strongly while the client owned the provider, so the pair and the provider's tokio runtime handle leaked for every closed session.

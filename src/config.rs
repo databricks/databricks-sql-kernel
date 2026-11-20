@@ -761,7 +761,12 @@ pub struct HttpConfig {
     /// Retrying stops once cumulative elapsed time exceeds this.
     pub overall_timeout: Duration,
 
-    /// Connection pool size (max idle warm sockets per remote host).
+    /// Per-session connection pool size (max idle warm sockets per remote host).
+    /// A live session has exclusive use of its pool. After the HTTP client is
+    /// dropped, a matching session on the same runtime may reuse that pool.
+    /// Idle pools, including sockets and TLS/proxy configuration, are retained
+    /// for up to 105 seconds. New sessions never reuse a pool older than five
+    /// minutes; system trust is a snapshot until it is rebuilt.
     ///
     /// Defaults to `100`, matching the JDBC driver's `HttpConnectionPoolSize`
     /// default. Raise this for workloads that burst many concurrent

@@ -265,7 +265,7 @@ impl TlsConfig {
 }
 
 /// Configuration for the HTTP client.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct HttpClientConfig {
     /// Whether authenticated SEA requests may negotiate HTTP response compression.
     pub sea_response_compression_enabled: bool,
@@ -382,7 +382,7 @@ fn build_mtls_identity(cert_pem: &[u8], key_pem: &[u8]) -> Result<reqwest::Ident
 /// (which authenticate via form-encoded credentials, not Bearer tokens).
 #[derive(Debug)]
 pub struct DatabricksHttpClient {
-    client: Client,
+    client: super::pool::PooledClient,
     config: HttpClientConfig,
     auth_provider: OnceLock<Arc<dyn AuthProvider>>,
     retry_configs: HashMap<RequestCategory, RetryConfig>,
@@ -532,7 +532,7 @@ impl DatabricksHttpClient {
         config: &HttpClientConfig,
         redirect: reqwest::redirect::Policy,
         pool_host: Option<&str>,
-    ) -> Result<Client> {
+    ) -> Result<super::pool::PooledClient> {
         let mut builder = Client::builder()
             .connect_timeout(config.connect_timeout)
             // `read_timeout` is a historical name; reqwest applies this as
@@ -724,8 +724,8 @@ impl DatabricksHttpClient {
             })
         };
         match pool_host {
-            Some(host) => super::pool::shared_client(host, config, build),
-            None => build(),
+            Some(host) => super::pool::session_client(host, config, build),
+            None => build().map(super::pool::PooledClient::from),
         }
     }
 

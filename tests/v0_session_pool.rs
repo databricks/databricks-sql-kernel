@@ -1,5 +1,6 @@
 use databricks_sql_kernel::{AuthConfig, DefaultOpts, HttpConfig, Session, TlsConfig};
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -16,7 +17,6 @@ struct RecordedRequest {
 
 struct Server {
     host: String,
-    connections: Arc<AtomicUsize>,
     requests: Arc<Mutex<Vec<RecordedRequest>>>,
     task: tokio::task::JoinHandle<()>,
 }
@@ -96,7 +96,6 @@ impl Server {
         });
         Self {
             host,
-            connections,
             requests,
             task,
         }
@@ -132,7 +131,7 @@ async fn open(
         .unwrap()
 }
 
-async fn sessions_share_connections_not_authentication_or_catalogs() {
+async fn sessions_reuse_returned_pools_not_active_pools_or_session_state() {
     let server = Server::start().await;
     let first = open(
         &server,
@@ -163,20 +162,13 @@ async fn sessions_share_connections_not_authentication_or_catalogs() {
     second.close().await.unwrap();
     third.close().await.unwrap();
     let requests = server.requests.lock().unwrap();
-    assert_eq!(
-        server.connections.load(Ordering::SeqCst),
-        1,
-        "request connections: {:?}",
-        requests
-            .iter()
-            .map(|request| (&request.method, request.connection))
-            .collect::<Vec<_>>()
-    );
     let creates: Vec<_> = requests
         .iter()
         .filter(|request| request.method == "POST")
         .collect();
     assert_eq!(creates.len(), 3);
+    assert_ne!(creates[0].connection, creates[1].connection);
+    assert_ne!(creates[1].connection, creates[2].connection);
     for (request, (token, catalog)) in creates.iter().zip([
         ("dapi_first", "first_catalog"),
         ("dapi_second", "second_catalog"),
@@ -190,9 +182,9 @@ async fn sessions_share_connections_not_authentication_or_catalogs() {
     }
 }
 
-async fn different_headers_timeouts_and_tls_settings_use_separate_connections() {
+async fn transport_settings_partition_pools_but_per_request_headers_do_not() {
     let server = Server::start().await;
-    for variant in 0..4 {
+    for variant in 0..5 {
         let mut http = HttpConfig::default();
         let mut tls = TlsConfig::default();
         match variant {
@@ -201,12 +193,40 @@ async fn different_headers_timeouts_and_tls_settings_use_separate_connections() 
                 .push(("x-tenant".to_owned(), "other".to_owned())),
             2 => http.request_timeout += Duration::from_secs(1),
             3 => tls.accept_self_signed = true,
+            4 => http
+                .custom_headers
+                .push(("User-Agent".to_owned(), "other-agent".to_owned())),
             _ => {}
         }
         let session = open(&server, "dapi_token", "catalog", http, tls).await;
         session.close().await.unwrap();
     }
-    assert_eq!(server.connections.load(Ordering::SeqCst), 4);
+    let requests = server.requests.lock().unwrap();
+    let creates: Vec<_> = requests
+        .iter()
+        .filter(|request| request.method == "POST")
+        .collect();
+    assert_eq!(creates.len(), 5);
+    for left in 0..creates.len() {
+        for right in left + 1..creates.len() {
+            if (left, right) != (0, 1) {
+                assert_ne!(creates[left].connection, creates[right].connection);
+            }
+        }
+    }
+    for (index, request) in creates.iter().enumerate() {
+        assert_eq!(
+            request
+                .headers
+                .iter()
+                .any(|header| header.eq_ignore_ascii_case("x-tenant: other")),
+            index == 1
+        );
+    }
+    assert!(creates[4]
+        .headers
+        .iter()
+        .any(|header| header.eq_ignore_ascii_case("user-agent: other-agent")));
 }
 
 async fn concurrent_sessions_keep_their_authentication_and_catalogs() {
@@ -216,24 +236,37 @@ async fn concurrent_sessions_keep_their_authentication_and_catalogs() {
         async move {
             let token = format!("dapi_concurrent_{index}");
             let catalog = format!("catalog_{index}");
-            let session = open(
+            open(
                 server,
                 &token,
                 &catalog,
                 HttpConfig::default(),
                 TlsConfig::default(),
             )
-            .await;
-            session.close().await.unwrap();
+            .await
         }
     });
-    futures::future::join_all(sessions).await;
+    let sessions = futures::future::join_all(sessions).await;
+    futures::future::join_all(
+        sessions
+            .into_iter()
+            .map(|session| async move { session.close().await.unwrap() }),
+    )
+    .await;
     let requests = server.requests.lock().unwrap();
     let creates: Vec<_> = requests
         .iter()
         .filter(|request| request.method == "POST")
         .collect();
     assert_eq!(creates.len(), 10);
+    assert_eq!(
+        creates
+            .iter()
+            .map(|request| request.connection)
+            .collect::<HashSet<_>>()
+            .len(),
+        10
+    );
     for index in 0..10 {
         let catalog = format!("catalog_{index}");
         let request = creates
@@ -258,13 +291,19 @@ async fn separate_runtimes_never_share_clients() {
                     .unwrap()
             })
             .collect();
-        for runtime in runtimes.iter().rev().chain(runtimes.iter()) {
+        for index in (0..3).rev().chain(0..3) {
+            let runtime = &runtimes[index];
             runtime.block_on(async {
                 let session = Session::builder()
                     .http_path(host.clone(), "/sql/1.0/warehouses/test")
                     .auth(AuthConfig::Pat {
                         token: "dapi_runtime".into(),
                         identity_federation_client_id: None,
+                    })
+                    .defaults({
+                        let mut defaults = DefaultOpts::default();
+                        defaults.catalog = Some(index.to_string());
+                        defaults
                     })
                     .open()
                     .await
@@ -275,7 +314,28 @@ async fn separate_runtimes_never_share_clients() {
     })
     .await
     .unwrap();
-    assert_eq!(server.connections.load(Ordering::SeqCst), 3);
+    let requests = server.requests.lock().unwrap();
+    let creates: Vec<_> = requests
+        .iter()
+        .filter(|request| request.method == "POST")
+        .collect();
+    assert_eq!(creates.len(), 6);
+    let groups: Vec<HashSet<_>> = (0..3)
+        .map(|index| {
+            let catalog = index.to_string();
+            creates
+                .iter()
+                .filter(|request| request.body["catalog"] == catalog)
+                .map(|request| request.connection)
+                .collect()
+        })
+        .collect();
+    for left in 0..groups.len() {
+        assert!(!groups[left].is_empty());
+        for right in left + 1..groups.len() {
+            assert!(groups[left].is_disjoint(&groups[right]));
+        }
+    }
 }
 
 async fn changed_root_file_contents_do_not_reuse_old_trust() {
@@ -305,7 +365,13 @@ async fn changed_root_file_contents_do_not_reuse_old_trust() {
     )
     .await;
     second.close().await.unwrap();
-    assert_eq!(server.connections.load(Ordering::SeqCst), 2);
+    let requests = server.requests.lock().unwrap();
+    let creates: Vec<_> = requests
+        .iter()
+        .filter(|request| request.method == "POST")
+        .collect();
+    assert_eq!(creates.len(), 2);
+    assert_ne!(creates[0].connection, creates[1].connection);
 }
 
 #[test]
@@ -331,9 +397,9 @@ fn session_pool_end_to_end() {
         .unwrap()
         .block_on(async {
             tokio::time::timeout(Duration::from_secs(20), async {
-                sessions_share_connections_not_authentication_or_catalogs().await;
+                sessions_reuse_returned_pools_not_active_pools_or_session_state().await;
                 concurrent_sessions_keep_their_authentication_and_catalogs().await;
-                different_headers_timeouts_and_tls_settings_use_separate_connections().await;
+                transport_settings_partition_pools_but_per_request_headers_do_not().await;
                 separate_runtimes_never_share_clients().await;
                 changed_root_file_contents_do_not_reuse_old_trust().await;
             })
