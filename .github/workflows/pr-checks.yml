@@ -271,6 +271,6 @@ jobs:
         shell: pwsh
         run: cargo clippy -p databricks-sql-kernel --no-default-features --features tls-rustls --all-targets -- -D warnings
 
-      - name: Test Windows revocation (tls-rustls)
+      - name: Test client behavior (tls-rustls, Windows)
         shell: pwsh
-        run: cargo test -p databricks-sql-kernel --no-default-features --features tls-rustls --lib client::tls_revocation
+        run: cargo test -p databricks-sql-kernel --no-default-features --features tls-rustls --lib client::
