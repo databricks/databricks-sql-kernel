@@ -1092,6 +1092,14 @@ impl std::fmt::Debug for TlsConfig {
                 "client_key_pem",
                 &self.client_key_pem.as_ref().map(|_| "<redacted>"),
             )
+            .field(
+                "check_certificate_revocation",
+                &self.check_certificate_revocation,
+            )
+            .field(
+                "accept_undetermined_certificate_revocation",
+                &self.accept_undetermined_certificate_revocation,
+            )
             .finish()
     }
 }
@@ -2229,6 +2237,24 @@ mod tests {
         assert!(
             s.contains("bytes>"),
             "expected cert byte-count summary, got: {s}"
+        );
+    }
+
+    #[test]
+    fn tls_config_debug_shows_revocation_policy() {
+        let tls = TlsConfig {
+            check_certificate_revocation: Some(true),
+            accept_undetermined_certificate_revocation: Some(false),
+            ..TlsConfig::default()
+        };
+        let s = format!("{tls:?}");
+        assert!(
+            s.contains("check_certificate_revocation: Some(true)"),
+            "revocation check missing from Debug: {s}"
+        );
+        assert!(
+            s.contains("accept_undetermined_certificate_revocation: Some(false)"),
+            "accept-undetermined missing from Debug: {s}"
         );
     }
 }
