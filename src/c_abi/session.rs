@@ -3510,12 +3510,18 @@ mod revocation_open_tests {
             );
         }
     }
+}
 
-    /// Strict revocation through the C ABI, on Windows with tls-rustls: a leaf that its CRL
-    /// revokes fails session open. The TLS endpoint is a local server, and its chain and CRL
-    /// come from the revocation test fixture. The failure is in the TLS handshake, before any
-    /// HTTP request, so no SEA server is needed.
-    #[cfg(all(windows, feature = "tls-rustls"))]
+/// Strict revocation through the C ABI, on Windows with tls-rustls. Its own module, because the
+/// unsupported-platform module above is compiled only where this one is not.
+#[cfg(all(test, windows, feature = "tls-rustls"))]
+mod revocation_open_windows_tests {
+    use super::*;
+    use std::ffi::{CStr, CString};
+
+    /// A leaf that its CRL revokes fails session open. The TLS endpoint is a local server, and
+    /// its chain and CRL come from the revocation test fixture. The failure is in the TLS
+    /// handshake, before any HTTP request, so no SEA server is needed.
     #[test]
     fn tls_revocation_strict_open_rejects_a_revoked_leaf() {
         use crate::client::tls_revocation::tests::{fixture, Served};
