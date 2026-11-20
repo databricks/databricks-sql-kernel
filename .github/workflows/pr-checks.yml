@@ -273,4 +273,8 @@ jobs:
 
       - name: Test client behavior (tls-rustls, Windows)
         shell: pwsh
-        run: "cargo test -p databricks-sql-kernel --no-default-features --features tls-rustls --lib client::"
+        # Two runs: the client:: suite, then the C ABI revocation open test, which is not under client::.
+        run: |
+          cargo test -p databricks-sql-kernel --no-default-features --features tls-rustls --lib client::
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test -p databricks-sql-kernel --no-default-features --features tls-rustls --lib c_abi::session::revocation_open_windows_tests
