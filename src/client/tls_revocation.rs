@@ -48,11 +48,11 @@ use windows_sys::Win32::Security::Cryptography::{
     CertAddCertificateContextToStore, CertCloseStore, CertCreateCertificateChainEngine,
     CertCreateCertificateContext, CertFreeCertificateChain, CertFreeCertificateChainEngine,
     CertFreeCertificateContext, CertGetCertificateChain, CertOpenStore, CERT_CHAIN_CONTEXT,
-    CERT_CHAIN_ENGINE_CONFIG, CERT_CHAIN_PARA, CERT_CHAIN_REVOCATION_ACCUMULATIVE_TIMEOUT,
-    CERT_CHAIN_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT, CERT_CONTEXT, CERT_STORE_ADD_ALWAYS,
-    CERT_STORE_PROV_MEMORY, CERT_TRUST_IS_OFFLINE_REVOCATION, CERT_TRUST_IS_PARTIAL_CHAIN,
-    CERT_TRUST_IS_REVOKED, CERT_TRUST_REVOCATION_STATUS_UNKNOWN, HCERTCHAINENGINE, HCERTSTORE,
-    PKCS_7_ASN_ENCODING, X509_ASN_ENCODING,
+    CERT_CHAIN_ENGINE_CONFIG, CERT_CHAIN_EXCLUSIVE_ENABLE_CA_FLAG, CERT_CHAIN_PARA,
+    CERT_CHAIN_REVOCATION_ACCUMULATIVE_TIMEOUT, CERT_CHAIN_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT,
+    CERT_CONTEXT, CERT_STORE_ADD_ALWAYS, CERT_STORE_PROV_MEMORY, CERT_TRUST_IS_OFFLINE_REVOCATION,
+    CERT_TRUST_IS_PARTIAL_CHAIN, CERT_TRUST_IS_REVOKED, CERT_TRUST_REVOCATION_STATUS_UNKNOWN,
+    HCERTCHAINENGINE, HCERTSTORE, PKCS_7_ASN_ENCODING, X509_ASN_ENCODING,
 };
 
 #[cfg(test)]
@@ -350,6 +350,9 @@ impl ChainEngine {
         let config = CERT_CHAIN_ENGINE_CONFIG {
             cbSize: std::mem::size_of::<CERT_CHAIN_ENGINE_CONFIG>() as u32,
             hExclusiveRoot: roots.0,
+            // Without this flag a CA certificate that is not self-signed is not treated as a
+            // root, so a custom CA configured as an intermediate would leave the chain partial.
+            dwExclusiveFlags: CERT_CHAIN_EXCLUSIVE_ENABLE_CA_FLAG,
             ..Default::default()
         };
         let mut engine: HCERTCHAINENGINE = null_mut();
