@@ -756,6 +756,7 @@ impl ResultStream {
 
     /// Non-blocking lookahead for bindings packing ready batches. Errors and
     /// end-of-stream do not finalize telemetry or clear the current batch.
+    /// `Ready` advances the stream, replaces `current`, and resets the row cursor.
     /// Call `next_batch` (or `try_next_batch`) to deliver a buffered error or
     /// observe the end and finalize consumption. Readers may opt out of probing.
     ///
