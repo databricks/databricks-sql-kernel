@@ -1051,7 +1051,10 @@ pub struct TlsConfig {
     ///
     /// Trust, name and signatures are still decided by webpki, as with checking off.
     /// CryptoAPI then checks every certificate in the chain it builds except the root.
-    /// Only the revocation bits are read. The trust bits are ignored. CRL and OCSP
+    /// Only the revocation bits are read. The trust bits are ignored. A trust anchor is not
+    /// revocation-checked, including a self-signed server certificate configured as a custom CA,
+    /// as in RFC 5280, the JDK PKIX path validator and CryptoAPI's exclude-root flag. The leaf
+    /// and the other chain certificates are checked. CRL and OCSP
     /// retrieval uses Windows networking and proxy settings, not [`ProxyConfig`], and
     /// Windows caches the results. The check is synchronous and runs inside the TLS
     /// handshake, so it blocks the calling task until CryptoAPI returns, even on a
