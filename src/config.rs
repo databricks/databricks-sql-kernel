@@ -1054,7 +1054,10 @@ pub struct TlsConfig {
     /// Only the revocation bits are read. The trust bits are ignored. A trust anchor is not
     /// revocation-checked, including a self-signed server certificate configured as a custom CA,
     /// as in RFC 5280, the JDK PKIX path validator and CryptoAPI's exclude-root flag. The leaf
-    /// and the other chain certificates are checked. CRL and OCSP
+    /// and the other chain certificates are checked. A chain with an invalid signature on any
+    /// element is undetermined, never good. A non-empty stapled OCSP response from the server is
+    /// attached to the leaf, so CryptoAPI can use it without a fetch. rustls's client requests
+    /// OCSP stapling by default, and an empty or refused response is ignored. CRL and OCSP
     /// retrieval uses Windows networking and proxy settings, not [`ProxyConfig`], and
     /// Windows caches the results. The check is synchronous and runs inside the TLS
     /// handshake, so it blocks the calling task until CryptoAPI returns, even on a
