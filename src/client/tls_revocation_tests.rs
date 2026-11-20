@@ -492,6 +492,55 @@ async fn check(scenario: &Scenario, accept: bool, want: Outcome) {
     }
 }
 
+/// A PEM certificate for `der`, for configuring a custom CA.
+fn pem_of(der: &[u8]) -> Vec<u8> {
+    use base64::Engine as _;
+    let body = base64::engine::general_purpose::STANDARD.encode(der);
+    let lines: Vec<&str> = body
+        .as_bytes()
+        .chunks(64)
+        .map(|chunk| std::str::from_utf8(chunk).unwrap())
+        .collect();
+    format!(
+        "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n",
+        lines.join("\n")
+    )
+    .into_bytes()
+}
+
+#[tokio::test]
+async fn custom_ca_configured_as_the_intermediate_is_an_anchor() {
+    // The custom CA is the intermediate, not the root. Webpki anchors the chain at it, so the
+    // check must treat it as the chain's root (it is excluded), and the leaf is still checked.
+    let good = fixture(Some(Served::Good), Served::Good, "127.0.0.1");
+    let mut config = HttpClientConfig::default();
+    config.tls.trusted_certificate_pem = Some(pem_of(&good.pki.intermediate_der));
+    config.max_connections_per_host = 0;
+    get(config, Some(false), good.addr)
+        .await
+        .expect("a good chain anchored at the intermediate passes in strict mode");
+
+    let revoked = fixture(Some(Served::Revoked), Served::Good, "127.0.0.1");
+    let mut config = HttpClientConfig::default();
+    config.tls.trusted_certificate_pem = Some(pem_of(&revoked.pki.intermediate_der));
+    config.max_connections_per_host = 0;
+    let err = get(config, Some(false), revoked.addr)
+        .await
+        .expect_err("a revoked leaf anchored at the intermediate is rejected");
+    assert!(err.contains("revoked"), "{err}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn multi_thread_runtime_checks_revocation() {
+    // The other tests run on current_thread, where `in_runtime_blocking` does not call
+    // block_in_place. This one takes that branch.
+    let fx = fixture(Some(Served::Revoked), Served::Good, "127.0.0.1");
+    let err = get(revocation_config(&fx.pki.root_pem), Some(false), fx.addr)
+        .await
+        .expect_err("a revoked leaf is rejected on a multi-thread runtime");
+    assert!(err.contains("revoked"), "{err}");
+}
+
 #[tokio::test]
 async fn revocation_outcomes_follow_the_policy_table() {
     for scenario in SCENARIOS {
