@@ -524,6 +524,10 @@ impl DatabricksHttpClient {
             })?;
         }
 
+        // `allow_self_signed` turns revocation off, so the effective mode is what this client
+        // stores and what the telemetry cache keys on. `build_reqwest_client` applies the same rule.
+        let revocation = revocation.filter(|_| config.tls.allow_self_signed != Some(true));
+
         // Follow redirects for normal traffic (reqwest's default policy).
         let client =
             Self::build_reqwest_client(&config, reqwest::redirect::Policy::default(), revocation)?;
@@ -793,13 +797,13 @@ impl DatabricksHttpClient {
         &self.config
     }
 
-    /// Returns the underlying reqwest client for building requests.
-    /// The revocation mode this client was built with: `None` when checking is off, otherwise
-    /// `Some(accept_undetermined)`.
+    /// The effective revocation mode: `None` when checking is off, including when
+    /// `allow_self_signed` disables it, otherwise `Some(accept_undetermined)`.
     pub(crate) fn revocation(&self) -> Option<bool> {
         self.revocation
     }
 
+    /// Returns the underlying reqwest client for building requests.
     pub fn inner(&self) -> &Client {
         &self.client
     }
@@ -1157,7 +1161,22 @@ mod tls_tests;
 
 #[cfg(test)]
 mod revocation_support_tests {
-    use super::revocation_unsupported_message;
+    use super::{revocation_unsupported_message, DatabricksHttpClient, HttpClientConfig};
+
+    #[test]
+    fn allow_self_signed_makes_the_effective_revocation_mode_off() {
+        // The requested mode is strict, but self-signed turns revocation off, so the stored
+        // (effective) mode is None. The telemetry cache keys on this value.
+        let mut config = HttpClientConfig::default();
+        config.tls.allow_self_signed = Some(true);
+        let retry = crate::client::retry::build_retry_configs(
+            &crate::client::retry::RetryConfig::default(),
+            &std::collections::HashMap::new(),
+        );
+        let client = DatabricksHttpClient::with_revocation(config, retry, Some(false))
+            .expect("self-signed with revocation builds a client");
+        assert_eq!(client.revocation(), None);
+    }
 
     #[test]
     fn revocation_message_covers_every_platform_and_backend() {
