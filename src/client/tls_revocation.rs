@@ -45,13 +45,14 @@ use rustls::{
     CertificateError, ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme,
 };
 use windows_sys::Win32::Security::Cryptography::{
-    CertAddCertificateContextToStore, CertCloseStore, CertCreateCertificateContext,
-    CertFreeCertificateChain, CertFreeCertificateContext, CertGetCertificateChain, CertOpenStore,
-    CERT_CHAIN_CONTEXT, CERT_CHAIN_PARA, CERT_CHAIN_REVOCATION_ACCUMULATIVE_TIMEOUT,
+    CertAddCertificateContextToStore, CertCloseStore, CertCreateCertificateChainEngine,
+    CertCreateCertificateContext, CertFreeCertificateChain, CertFreeCertificateChainEngine,
+    CertFreeCertificateContext, CertGetCertificateChain, CertOpenStore, CERT_CHAIN_CONTEXT,
+    CERT_CHAIN_ENGINE_CONFIG, CERT_CHAIN_PARA, CERT_CHAIN_REVOCATION_ACCUMULATIVE_TIMEOUT,
     CERT_CHAIN_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT, CERT_CONTEXT, CERT_STORE_ADD_ALWAYS,
     CERT_STORE_PROV_MEMORY, CERT_TRUST_IS_OFFLINE_REVOCATION, CERT_TRUST_IS_PARTIAL_CHAIN,
-    CERT_TRUST_IS_REVOKED, CERT_TRUST_REVOCATION_STATUS_UNKNOWN, HCERTSTORE, PKCS_7_ASN_ENCODING,
-    X509_ASN_ENCODING,
+    CERT_TRUST_IS_REVOKED, CERT_TRUST_REVOCATION_STATUS_UNKNOWN, HCERTCHAINENGINE, HCERTSTORE,
+    PKCS_7_ASN_ENCODING, X509_ASN_ENCODING,
 };
 
 #[cfg(test)]
@@ -207,11 +208,17 @@ fn trust_names(bits: u32) -> String {
         (CERT_TRUST_IS_NOT_SIGNATURE_VALID, "NOT_SIGNATURE_VALID"),
         (CERT_TRUST_IS_NOT_VALID_FOR_USAGE, "NOT_VALID_FOR_USAGE"),
         (CERT_TRUST_IS_UNTRUSTED_ROOT, "UNTRUSTED_ROOT"),
-        (CERT_TRUST_REVOCATION_STATUS_UNKNOWN, "REVOCATION_STATUS_UNKNOWN"),
+        (
+            CERT_TRUST_REVOCATION_STATUS_UNKNOWN,
+            "REVOCATION_STATUS_UNKNOWN",
+        ),
         (CERT_TRUST_IS_CYCLIC, "CYCLIC"),
         (CERT_TRUST_IS_PARTIAL_CHAIN, "PARTIAL_CHAIN"),
         (CERT_TRUST_IS_OFFLINE_REVOCATION, "OFFLINE_REVOCATION"),
-        (CERT_TRUST_NO_ISSUANCE_CHAIN_POLICY, "NO_ISSUANCE_CHAIN_POLICY"),
+        (
+            CERT_TRUST_NO_ISSUANCE_CHAIN_POLICY,
+            "NO_ISSUANCE_CHAIN_POLICY",
+        ),
     ];
     let names: Vec<&str> = NAMES
         .iter()
@@ -249,6 +256,31 @@ fn cryptoapi_status(leaf: &[u8], intermediates: &[&[u8]], custom_cas: &[&[u8]]) 
     let Some(leaf) = Context::new(leaf) else {
         return Status::Undetermined;
     };
+    let status = chain_status("default engine", &leaf, &store, null_mut());
+    // With a custom CA, Windows does not trust its root. The default engine can then end the
+    // chain at an untrusted root and report no revocation status, so the result is undetermined.
+    // Build again with an engine whose exclusive root is the custom CAs, which makes the chain
+    // complete for this check. Webpki still decides trust, and only the revocation bits are read.
+    if status != Status::Undetermined || custom_cas.is_empty() {
+        return status;
+    }
+    let Some(roots) = Store::memory() else {
+        return status;
+    };
+    for der in custom_cas {
+        roots.add(der);
+    }
+    let Some(engine) = ChainEngine::exclusive(&roots) else {
+        return status;
+    };
+    chain_status("exclusive-root engine", &leaf, &store, engine.0)
+}
+
+/// Builds the chain for `leaf` with `engine` (null is the default engine) and reads its
+/// revocation status. `label` names the engine in the test-only diagnostics.
+fn chain_status(label: &str, leaf: &Context, store: &Store, engine: HCERTCHAINENGINE) -> Status {
+    // Only the test-only diagnostics below read `label`.
+    let _ = label;
     let para = CERT_CHAIN_PARA {
         cbSize: std::mem::size_of::<CERT_CHAIN_PARA>() as u32,
         // Per-URL timeout for chain-building fetches (AIA). It is not a total.
@@ -256,11 +288,11 @@ fn cryptoapi_status(leaf: &[u8], intermediates: &[&[u8]], custom_cas: &[&[u8]]) 
         ..Default::default()
     };
     let mut chain: *mut CERT_CHAIN_CONTEXT = null_mut();
-    // SAFETY: the leaf and store are live, and `para` outlives the call. The null chain
-    // engine is the default, and null time is now.
+    // SAFETY: the engine, leaf and store are live for the call, and `para` outlives it. Null
+    // time is now.
     let built = unsafe {
         CertGetCertificateChain(
-            null_mut(),
+            engine,
             leaf.0,
             null(),
             store.0,
@@ -274,15 +306,40 @@ fn cryptoapi_status(leaf: &[u8], intermediates: &[&[u8]], custom_cas: &[&[u8]]) 
         // SAFETY: GetLastError reads the calling thread's last error and has no other effect.
         #[cfg(test)]
         eprintln!(
-            "revocation diagnostics: CertGetCertificateChain failed, GetLastError={}",
+            "revocation diagnostics [{label}]: CertGetCertificateChain failed, GetLastError={}",
             unsafe { GetLastError() }
         );
         return Status::Undetermined;
     }
     let chain = ChainContext(chain);
     #[cfg(test)]
-    eprintln!("revocation diagnostics: {}", chain.describe());
+    eprintln!("revocation diagnostics [{label}]: {}", chain.describe());
     chain.status()
+}
+
+/// A chain engine whose exclusive root is a store of custom CAs. Freed on drop.
+struct ChainEngine(HCERTCHAINENGINE);
+
+impl ChainEngine {
+    fn exclusive(roots: &Store) -> Option<Self> {
+        let config = CERT_CHAIN_ENGINE_CONFIG {
+            cbSize: std::mem::size_of::<CERT_CHAIN_ENGINE_CONFIG>() as u32,
+            hExclusiveRoot: roots.0,
+            ..Default::default()
+        };
+        let mut engine: HCERTCHAINENGINE = null_mut();
+        // SAFETY: `config` and the root store are live for the call, and `engine` is written
+        // only on success.
+        let created = unsafe { CertCreateCertificateChainEngine(&config, &mut engine) };
+        (created != 0 && !engine.is_null()).then_some(Self(engine))
+    }
+}
+
+impl Drop for ChainEngine {
+    fn drop(&mut self) {
+        // SAFETY: the engine came from `CertCreateCertificateChainEngine` and is freed once.
+        unsafe { CertFreeCertificateChainEngine(self.0) };
+    }
 }
 
 /// Runs a blocking wait. On a multi-thread runtime, block_in_place moves the worker's
@@ -472,4 +529,4 @@ pub(crate) fn client_config(tls: &TlsConfig, accept_undetermined: bool) -> Resul
 
 #[cfg(test)]
 #[path = "tls_revocation_tests.rs"]
-mod tests;
+pub(crate) mod tests;
