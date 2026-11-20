@@ -16,6 +16,8 @@ layout, or npm publishing. Pure-kernel changes go in the root
 
 ### Changed
 
+- Result fetches pack already-buffered Arrow batches into bounded IPC payloads to reduce Node.js crossings, without waiting for another download.
+
 ### Updated
 
 ### Fixed
