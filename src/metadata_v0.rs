@@ -490,6 +490,13 @@ pub struct Metadata {
     session: Arc<SessionInner>,
 }
 
+struct TablesExecution {
+    raw: ExecuteResult,
+    close_guard: Option<TablesCloseGuard>,
+}
+
+type TablesExecutionTask = tokio::task::JoinHandle<Result<Option<TablesExecution>>>;
+
 struct TablesCloseGuard {
     session: Arc<SessionInner>,
     statement_id: String,
@@ -941,22 +948,39 @@ impl Metadata {
             catalogs.close();
             Ok::<_, Error>((names, enumerated))
         };
-        let speculative = async {
-            if !SqlCommandBuilder::pattern_has_wildcards(pattern) || literal.contains(['%', '*']) {
-                return None;
-            }
+        let mut speculative = if SqlCommandBuilder::pattern_has_wildcards(pattern)
+            && !literal.contains(['%', '*'])
+            && !literal.chars().any(char::is_uppercase)
+        {
+            let metadata = Self::new(Arc::clone(&self.session));
+            let catalog = literal.clone();
+            let schema = schema_str.clone();
+            let table = table_str.clone();
+            let types = types_owned.clone();
+            // Detaching keeps an in-flight execute alive until its known ID
+            // can be closed, without retaining unused result batches.
             Some(
-                self.try_fetch_tables_for_catalog(
-                    literal.clone(),
-                    schema_str.clone(),
-                    table_str.clone(),
-                    types_owned.clone(),
-                )
-                .await,
+                self.session.runtime_handle().spawn(
+                    async move {
+                        let types_ref: Option<Vec<&str>> = types
+                            .as_ref()
+                            .map(|v| v.iter().map(String::as_str).collect());
+                        metadata
+                            .execute_tables_for_catalog(
+                                &catalog,
+                                schema.as_deref(),
+                                table.as_deref(),
+                                types_ref.as_deref(),
+                            )
+                            .await
+                    }
+                    .instrument(tracing::Span::current()),
+                ),
             )
+        } else {
+            None
         };
-        let (lookup, speculative) = futures::join!(lookup, speculative);
-        let (mut names, enumerated) = lookup?;
+        let (mut names, enumerated) = lookup.await?;
         // One correlatable line tying the fan-out back to its cause: how
         // many catalogs a wildcard `list_tables` matched (and will query),
         // vs how many exist. Lets on-call spot fan-out amplification (a
@@ -969,8 +993,8 @@ impl Metadata {
             "list_tables catalog wildcard fan-out"
         );
 
-        // No catalog matched → typed empty result, no further wire calls.
         if names.is_empty() {
+            drop(speculative);
             Self::observe_inline_result(telemetry);
             return ResultStream::from_reader(Box::new(EmptyReader::new(
                 GET_TABLES_SCHEMA.clone(),
@@ -985,26 +1009,29 @@ impl Metadata {
         const MAX_INFLIGHT: usize = 8;
 
         let mut all_batches: Vec<arrow_array::RecordBatch> = Vec::new();
-        if let Some(index) = names.iter().position(|name| name == &literal) {
-            match speculative {
-                Some(Ok(batches)) => {
-                    names.remove(index);
-                    all_batches = batches;
-                }
-                Some(Err(error)) if !thrift_shape::is_object_not_found(&error) => {
-                    return Err(error);
-                }
-                _ => {}
+        let mut inflight = FuturesUnordered::new();
+        if speculative.is_some() {
+            if let Some(index) = names.iter().position(|name| name == &literal) {
+                inflight.push(self.fetch_tables_for_catalog(
+                    names.remove(index),
+                    schema_str.clone(),
+                    table_str.clone(),
+                    types_owned.clone(),
+                    speculative.take(),
+                ));
             }
         }
-        let mut inflight = FuturesUnordered::new();
+        // Release completed unused responses now; pending executes finish
+        // and close on the session runtime without gating matched catalogs.
+        drop(speculative);
         let mut remaining = names.into_iter();
-        for name in remaining.by_ref().take(MAX_INFLIGHT) {
+        for name in remaining.by_ref().take(MAX_INFLIGHT - inflight.len()) {
             inflight.push(self.fetch_tables_for_catalog(
                 name,
                 schema_str.clone(),
                 table_str.clone(),
                 types_owned.clone(),
+                None,
             ));
         }
         while let Some(result) = inflight.next().await {
@@ -1015,6 +1042,7 @@ impl Metadata {
                     schema_str.clone(),
                     table_str.clone(),
                     types_owned.clone(),
+                    None,
                 ));
             }
         }
@@ -1043,46 +1071,45 @@ impl Metadata {
     }
 
     /// Fetch + reshape `SHOW TABLES IN CATALOG <catalog>` into JDBC-shape
-    /// batches. An object-not-found error (catalog dropped between
-    /// enumeration and this call) collapses to zero rows, matching the
-    /// JDBC empty-result contract. Used by the fan-out path.
+    /// batches. Only execute-phase not-found collapses to zero rows;
+    /// read and reshape errors always propagate. A speculative execute
+    /// that found no catalog is retried after discovery confirms it.
     async fn fetch_tables_for_catalog(
         &self,
         catalog: String,
         schema_pattern: Option<String>,
         table_pattern: Option<String>,
         table_types: Option<Vec<String>>,
-    ) -> Result<Vec<arrow_array::RecordBatch>> {
-        match self
-            .try_fetch_tables_for_catalog(catalog, schema_pattern, table_pattern, table_types)
-            .await
-        {
-            Err(error) if thrift_shape::is_object_not_found(&error) => Ok(Vec::new()),
-            result => result,
-        }
-    }
-
-    async fn try_fetch_tables_for_catalog(
-        &self,
-        catalog: String,
-        schema_pattern: Option<String>,
-        table_pattern: Option<String>,
-        table_types: Option<Vec<String>>,
+        speculative: Option<TablesExecutionTask>,
     ) -> Result<Vec<arrow_array::RecordBatch>> {
         let types_ref: Option<Vec<&str>> = table_types
             .as_ref()
             .map(|v| v.iter().map(String::as_str).collect());
-        let raw = self
-            .session
-            .transport()
-            .list_tables(
-                self.session.session_id(),
-                Some(catalog.as_str()),
-                schema_pattern.as_deref(),
-                table_pattern.as_deref(),
-                types_ref.as_deref(),
-            )
-            .await?;
+        let execution = match speculative {
+            Some(task) => task.await.map_err(|error| {
+                Error::internal().message(format!("Table metadata execution task failed: {error}"))
+            })??,
+            None => None,
+        };
+        let execution = match execution {
+            Some(execution) => Some(execution),
+            None => {
+                self.execute_tables_for_catalog(
+                    &catalog,
+                    schema_pattern.as_deref(),
+                    table_pattern.as_deref(),
+                    types_ref.as_deref(),
+                )
+                .await?
+            }
+        };
+        let Some(TablesExecution {
+            raw,
+            mut close_guard,
+        }) = execution
+        else {
+            return Ok(Vec::new());
+        };
         // Read + reshape into `out`. Capture the result rather than `?`-ing
         // out early: the fan-out opens one statement per catalog and
         // `ExecuteResult` has no Drop-based close, so a mid-stream read
@@ -1095,11 +1122,6 @@ impl Metadata {
         // redundant CloseStatement DELETE in that case, mirroring the
         // streaming metadata paths and the regular-query path in
         // `statement/mutable.rs`.
-        let stmt_id = close_id(&raw);
-        let mut close_guard = (!stmt_id.is_empty()).then(|| TablesCloseGuard {
-            session: Arc::clone(&self.session),
-            statement_id: stmt_id,
-        });
         let native = is_native_metadata_result(&raw);
         let mut reader = raw.reader;
         let read: Result<Vec<arrow_array::RecordBatch>> = async {
@@ -1131,6 +1153,37 @@ impl Metadata {
             close_task.await.ok();
         }
         read
+    }
+
+    async fn execute_tables_for_catalog(
+        &self,
+        catalog: &str,
+        schema_pattern: Option<&str>,
+        table_pattern: Option<&str>,
+        table_types: Option<&[&str]>,
+    ) -> Result<Option<TablesExecution>> {
+        let raw = match self
+            .session
+            .transport()
+            .list_tables(
+                self.session.session_id(),
+                Some(catalog),
+                schema_pattern,
+                table_pattern,
+                table_types,
+            )
+            .await
+        {
+            Ok(raw) => raw,
+            Err(error) if thrift_shape::is_object_not_found(&error) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let statement_id = close_id(&raw);
+        let close_guard = (!statement_id.is_empty()).then(|| TablesCloseGuard {
+            session: Arc::clone(&self.session),
+            statement_id,
+        });
+        Ok(Some(TablesExecution { raw, close_guard }))
     }
 
     /// `SHOW TABLES IN CATALOG <catalog>` (or `IN ALL CATALOGS` when

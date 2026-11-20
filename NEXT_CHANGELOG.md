@@ -16,7 +16,7 @@ changes go in their respective binding's NEXT_CHANGELOG.
 
 ### Changed
 
-- Table metadata overlaps catalog discovery with a scoped query for underscore patterns without percent or star characters in the literal scope, reusing the matching catalog's result even in a multi-catalog response. Speculation can delay remaining catalog queries; a miss may add one statement.
+- Table metadata overlaps catalog discovery with a scoped query for lowercase underscore patterns without percent or star characters in the literal scope, reusing the matching catalog's response while other matches run concurrently. A miss may add one statement, which finishes and closes independently when unused.
 - Rust ADBC requests identify themselves as `RustADBCDatabricksDriver/<version>`
   with an optional partner entry from `adbc.databricks.user_agent_entry`
   (`adbc.spark.user_agent_entry` is a compatibility alias). `User-Agent` in
