@@ -494,10 +494,7 @@ pub struct ResultStream {
     close_guard: Option<StatementCloseGuard>,
 
     telemetry: Option<ResultStreamTelemetry>,
-    volume: Option<(
-        Arc<crate::volume::VolumeState>,
-        Arc<crate::client::http::StorageClient>,
-    )>,
+    volume: Option<Arc<crate::volume::VolumeState>>,
 }
 
 struct ResultStreamTelemetry {
@@ -644,14 +641,9 @@ impl ResultStream {
         Ok(stream)
     }
 
-    pub(crate) fn attach_volume(
-        &mut self,
-        marked: bool,
-        state: Arc<crate::volume::VolumeState>,
-        client: Arc<crate::client::http::StorageClient>,
-    ) {
+    pub(crate) fn attach_volume(&mut self, marked: bool, state: Arc<crate::volume::VolumeState>) {
         if marked {
-            self.volume = Some((state, client));
+            self.volume = Some(state);
         }
     }
 
@@ -660,7 +652,7 @@ impl ResultStream {
         self.volume.is_some()
     }
 
-    /// Complete a marked instruction without consuming its result row.
+    /// Complete a server-marked file transfer while retaining its instruction rows.
     ///
     /// Ordinary results and read-only attachments have no transfer authority.
     /// `NeedsInputStream` requests owned bytes for the server's stream sentinel;
@@ -670,9 +662,15 @@ impl ResultStream {
         options: &crate::volume::VolumeOptions,
         input_bytes: Option<Vec<u8>>,
     ) -> Result<crate::volume::VolumeCompletion> {
-        let Some((state, client)) = self.volume.clone() else {
+        let Some(state) = self.volume.clone() else {
             return Ok(crate::volume::VolumeCompletion::NotVolume);
         };
+        if !state.completion.initialized()
+            && (self.current.is_some() || (self.exhausted && self.prefetched.is_empty()))
+        {
+            return Err(Error::invalid_state()
+                .message("complete_volume_operation must be called before reading result rows"));
+        }
         let result = state
             .complete(
                 async {
@@ -693,18 +691,22 @@ impl ResultStream {
                             .as_mut()
                             .expect("Volume completion retains its reader")
                             .next_batch()
-                            .await?
+                            .await
                         {
-                            Some(batch) if batch.num_rows() != 0 => {
+                            Err(error) => {
+                                self.prefetched.push_back(Err(Box::new(error.clone())));
+                                return Err(error);
+                            }
+                            Ok(Some(batch)) if batch.num_rows() != 0 => {
                                 self.prefetched.push_back(Ok(ResultBatch::Arrow(batch)));
                                 return Err(Error::invalid_argument()
                                     .message("Expected one Volume instruction row"));
                             }
-                            Some(_) => {}
-                            None => self.exhausted = true,
+                            Ok(Some(_)) => {}
+                            Ok(None) => self.exhausted = true,
                         }
                     }
-                    Ok((batch, client.get().await?.clone()))
+                    Ok(batch)
                 },
                 options,
                 input_bytes,
@@ -717,11 +719,11 @@ impl ResultStream {
     }
 
     pub(crate) fn volume_state(&self) -> Option<Arc<crate::volume::VolumeState>> {
-        self.volume.as_ref().map(|(state, _)| Arc::clone(state))
+        self.volume.as_ref().map(Arc::clone)
     }
 
     pub(crate) fn cancel_volume(&self) {
-        if let Some((state, _)) = &self.volume {
+        if let Some(state) = &self.volume {
             state.cancel();
         }
     }

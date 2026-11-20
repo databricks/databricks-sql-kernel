@@ -327,7 +327,7 @@ impl ExecutedStatement {
         Ok(inner.exec.result_stream().is_volume_operation())
     }
 
-    #[pyo3(signature = (allowed_paths, remove_not_found_is_success=false, input_bytes=None))]
+    #[pyo3(signature = (allowed_paths, remove_not_found_is_success, input_bytes=None))]
     fn complete_volume_operation(
         &mut self,
         py: Python<'_>,
@@ -336,18 +336,14 @@ impl ExecutedStatement {
         input_bytes: Option<Vec<u8>>,
     ) -> PyResult<crate::result_stream::VolumeCompletion> {
         let inner = alive_mut!(self, "ExecutedStatement");
-        let runtime = inner.runtime.clone();
-        let options = databricks_sql_kernel::VolumeOptions {
-            allowed_paths: allowed_paths.into_iter().map(Into::into).collect(),
-            remove_not_found_is_success,
-        };
-        let stream = inner.exec.result_stream_mut();
-        let outcome = run_kernel_interruptible!(
+        crate::result_stream::complete_volume(
             py,
-            &runtime,
-            stream.complete_volume_operation(&options, input_bytes)
-        )?;
-        Ok(outcome.into())
+            &inner.runtime,
+            inner.exec.result_stream_mut(),
+            allowed_paths,
+            remove_not_found_is_success,
+            input_bytes,
+        )
     }
 
     #[getter]

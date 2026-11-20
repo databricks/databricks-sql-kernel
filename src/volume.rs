@@ -31,17 +31,33 @@ use tokio_util::sync::CancellationToken;
 /// Local file authorization and driver-specific storage response policy.
 ///
 /// Requested and resolved paths must be within allowed roots. Symlinks between
-/// authorized roots work; path components must remain stable during file access.
+/// authorized roots work; `..` collapses before symlink resolution. Path components
+/// must remain stable during file access.
 /// GET downloads into a temporary file, beside the destination when its directory
 /// allows it and in the system temporary directory otherwise, then copies it into
 /// the destination in place. Download failure or cancellation before publication
 /// preserves existing bytes; a failure during the copy can leave the destination
 /// partially written. Cancellation after publication starts does not interrupt it.
 /// GET decodes gzip Content-Encoding before writing the downloaded bytes.
+/// The storage idle timeout bounds GET reads, PUT upload progress and the wait for
+/// the PUT response. A stream PUT that storage redirects is sent again with its
+/// full body, and that resend has no idle bound. A cancelled PUT or REMOVE may
+/// already have changed storage.
+#[non_exhaustive]
 #[derive(Debug, Clone, Default)]
 pub struct VolumeOptions {
     pub allowed_paths: Vec<PathBuf>,
     pub remove_not_found_is_success: bool,
+}
+
+impl VolumeOptions {
+    /// Configure local roots and the binding's missing-object REMOVE policy.
+    pub fn new(allowed_paths: Vec<PathBuf>, remove_not_found_is_success: bool) -> Self {
+        Self {
+            allowed_paths,
+            remove_not_found_is_success,
+        }
+    }
 }
 
 /// Result of explicitly completing a server-marked Volume instruction.
@@ -56,8 +72,8 @@ pub enum VolumeCompletion {
 #[derive(Default)]
 pub(crate) struct VolumeState {
     retry: RetryConfig,
-    read_timeout: Option<std::time::Duration>,
-    completion: OnceCell<Result<VolumeCompletion>>,
+    storage: Arc<crate::client::http::StorageClient>,
+    pub(crate) completion: OnceCell<Result<VolumeCompletion>>,
     cancellation: CancellationToken,
     started: AtomicBool,
 }
@@ -69,12 +85,12 @@ fn cancelled() -> Error {
 impl VolumeState {
     pub(crate) fn new(
         retry: RetryConfig,
-        read_timeout: Option<std::time::Duration>,
+        storage: Arc<crate::client::http::StorageClient>,
         cancellation: CancellationToken,
     ) -> Arc<Self> {
         Arc::new(Self {
             retry,
-            read_timeout,
+            storage,
             cancellation,
             ..Self::default()
         })
@@ -86,7 +102,7 @@ impl VolumeState {
 
     pub(crate) async fn complete(
         &self,
-        prepare: impl std::future::Future<Output = Result<(RecordBatch, Client)>>,
+        prepare: impl std::future::Future<Output = Result<RecordBatch>>,
         options: &VolumeOptions,
         input_bytes: Option<Vec<u8>>,
     ) -> Result<VolumeCompletion> {
@@ -98,7 +114,7 @@ impl VolumeState {
                     return Ok(Err(cancelled()));
                 }
                 let complete = async {
-                    let (batch, client) = tokio::select! {
+                    let batch = tokio::select! {
                         biased;
                         result = prepare => result?,
                         _ = self.cancellation.cancelled() => return Err(cancelled()),
@@ -109,7 +125,12 @@ impl VolumeState {
                     {
                         return Ok(VolumeCompletion::NeedsInputStream);
                     }
-                    self.transfer(instruction, &client, options, input_bytes)
+                    let client = tokio::select! {
+                        biased;
+                        client = self.storage.get() => client?,
+                        _ = self.cancellation.cancelled() => return Err(cancelled()),
+                    };
+                    self.transfer(instruction, client, options, input_bytes)
                         .await
                 };
                 let result = complete.await;
@@ -160,12 +181,12 @@ impl VolumeState {
                 Err(error) => error,
             };
             if !error.retryable || attempt >= self.retry.max_retries {
-                return Err(error.with_retryable(false));
+                return Err(error.message(format!("after {} attempts", attempt + 1)));
             }
             let wait = calculate_backoff(&self.retry, attempt, retry_after.as_deref());
             // Retry budgets govern recovery, not the duration of a healthy transfer.
             if started.elapsed().saturating_add(wait) >= self.retry.overall_timeout {
-                return Err(error.with_retryable(false));
+                return Err(error.message(format!("after {} attempts", attempt + 1)));
             }
             tokio::select! {
                 _ = tokio::time::sleep(wait) => {}
@@ -242,30 +263,55 @@ impl VolumeState {
         let mut request = client
             .request(method, &instruction.url)
             .headers(instruction.headers.clone());
-        if let Some(bytes) = input {
-            request = request
-                .headers(HeaderMap::from_iter([(
-                    reqwest::header::CONTENT_LENGTH,
-                    bytes.len().into(),
-                )]))
-                .body(bytes.clone());
-        }
         let upload_error = Arc::new(Mutex::new(None));
-        if let Some((file, length)) = source {
+        let (progress, changed) = tokio::sync::watch::channel(tokio::time::Instant::now());
+        let reader: Option<(Box<dyn tokio::io::AsyncRead + Unpin + Send>, u64)> =
+            if let Some((file, length)) = source {
+                Some((Box::new(tokio::fs::File::from_std(file)), length))
+            } else {
+                input.map(|bytes| {
+                    (
+                        Box::new(std::io::Cursor::new(bytes.clone())) as _,
+                        bytes.len() as u64,
+                    )
+                })
+            };
+        if let Some((reader, length)) = reader {
             request = request
                 .headers(HeaderMap::from_iter([(
                     reqwest::header::CONTENT_LENGTH,
                     length.into(),
                 )]))
                 .body(upload_body(
-                    tokio::fs::File::from_std(file),
+                    reader,
                     local_file.clone(),
                     Arc::clone(&upload_error),
+                    progress,
                 ));
         }
         let transfer = async {
-            let mut response =
-                storage_send(request, self.read_timeout, upload, upload_error).await?;
+            let mut response = storage_send(
+                request,
+                self.storage.read_timeout,
+                upload,
+                upload_error,
+                changed,
+            )
+            .await?;
+            if let Some(bytes) = input.filter(|_| matches!(response.status().as_u16(), 307 | 308)) {
+                // Reusable bytes let reqwest apply its redirect and credential policy.
+                response = client
+                    .put(&instruction.url)
+                    .headers(instruction.headers.clone())
+                    .headers(HeaderMap::from_iter([(
+                        reqwest::header::CONTENT_LENGTH,
+                        bytes.len().into(),
+                    )]))
+                    .body(reqwest::Body::from(bytes.clone()))
+                    .send()
+                    .await
+                    .map_err(storage_error)?;
+            }
             let status = response.status();
             if !(status.is_success()
                 || (remove && status.as_u16() == 404 && options.remove_not_found_is_success))
@@ -275,15 +321,47 @@ impl VolumeState {
                     .get(reqwest::header::RETRY_AFTER)
                     .and_then(|value| value.to_str().ok())
                     .map(str::to_owned);
-                return Err(Error::from_http_status(status.as_u16())
+                let mut error = Error::from_http_status(status.as_u16())
                     .with_error_code("VOLUME_STORAGE_HTTP_ERROR")
-                    .with_retryable(matches!(status.as_u16(), 408 | 429 | 500 | 502 | 503 | 504))
+                    .with_retryable(
+                        !crate::client::retry::is_non_retryable_status(status.as_u16())
+                            && RetryStrategy::for_request(
+                                RequestType::CloudFetchDownload,
+                                &self.retry,
+                            )
+                            .is_retryable_status(status, retry_after.is_some()),
+                    )
                     .message(format!(
                         "Volume storage request failed: HTTP {}",
                         status.as_u16()
-                    )));
+                    ));
+                let mut body = Vec::new();
+                while body.len() < 4096 {
+                    match storage_read(self.storage.read_timeout, !upload, async {
+                        response.chunk().await.map_err(response_body_error)
+                    })
+                    .await
+                    {
+                        Ok(Some(chunk)) => {
+                            body.extend_from_slice(&chunk[..chunk.len().min(4096 - body.len())])
+                        }
+                        _ => break,
+                    }
+                }
+                let text = String::from_utf8_lossy(&body);
+                for tag in ["Code", "Message"] {
+                    if let Some(value) = text
+                        .split_once(&format!("<{tag}>"))
+                        .and_then(|(_, tail)| tail.split_once(&format!("</{tag}>")))
+                        .map(|(value, _)| value)
+                        .filter(|value| !value.contains(['<', '>']))
+                    {
+                        error = error.message(format!("{tag}: {value}"));
+                    }
+                }
+                return Err(error);
             }
-            while let Some(bytes) = storage_read(self.read_timeout, !upload, async {
+            while let Some(bytes) = storage_read(self.storage.read_timeout, !upload, async {
                 response.chunk().await.map_err(response_body_error)
             })
             .await?
@@ -342,13 +420,18 @@ fn upload_body(
     reader: impl tokio::io::AsyncRead + Unpin + Send + 'static,
     path: String,
     error: Arc<Mutex<Option<Error>>>,
+    progress: tokio::sync::watch::Sender<tokio::time::Instant>,
 ) -> reqwest::Body {
-    reqwest::Body::wrap_stream(ReaderStream::with_capacity(reader, 256 * 1024).map_err(
-        move |cause| {
-            *error.lock().unwrap_or_else(|e| e.into_inner()) = Some(local_error(cause, &path));
-            std::io::Error::other("Volume upload source could not be read")
-        },
-    ))
+    reqwest::Body::wrap_stream(
+        ReaderStream::with_capacity(reader, 256 * 1024)
+            .inspect_ok(move |_| {
+                progress.send_replace(tokio::time::Instant::now());
+            })
+            .map_err(move |cause| {
+                *error.lock().unwrap_or_else(|e| e.into_inner()) = Some(local_error(cause, &path));
+                std::io::Error::other("Volume upload source could not be read")
+            }),
+    )
 }
 
 fn invalid(message: &str) -> Error {
@@ -360,10 +443,23 @@ async fn storage_send(
     timeout: Option<std::time::Duration>,
     upload: bool,
     upload_error: Arc<Mutex<Option<Error>>>,
+    mut progress: tokio::sync::watch::Receiver<tokio::time::Instant>,
 ) -> Result<reqwest::Response> {
     let send = async { request.send().await.map_err(storage_error) };
-    let response = if upload {
-        // Request-body production does not establish that transport buffers have flushed.
+    tokio::pin!(send);
+    let response = if let (true, Some(timeout)) = (upload, timeout) {
+        loop {
+            let deadline = *progress.borrow_and_update() + timeout;
+            tokio::select! {
+                biased;
+                response = &mut send => break response,
+                _ = progress.changed(), if progress.has_changed().is_ok() => {}
+                _ = tokio::time::sleep_until(deadline) => break Err(Error::network_error()
+                    .with_error_code("VOLUME_STORAGE_NETWORK_ERROR")
+                    .with_retryable(false).message("Volume storage upload or response wait timed out")),
+            }
+        }
+    } else if upload {
         send.await
     } else {
         storage_read(timeout, true, send).await
@@ -422,7 +518,7 @@ fn response_body_error(error: reqwest::Error) -> Error {
 }
 
 fn local_error(error: std::io::Error, path: &str) -> Error {
-    let mut result = match error.kind() {
+    match error.kind() {
         std::io::ErrorKind::NotFound => Error::not_found(),
         std::io::ErrorKind::PermissionDenied => Error::permission_denied(),
         std::io::ErrorKind::InvalidInput
@@ -432,13 +528,12 @@ fn local_error(error: std::io::Error, path: &str) -> Error {
     }
     .with_error_code("VOLUME_LOCAL_FILE_ERROR")
     .with_sql_state("HY000")
-    .message(format!("{error}: {path}"));
-    result.local_error = Some(Box::new(LocalFileError {
+    .message(format!("{error}: {path}"))
+    .with_local_error(LocalFileError {
         raw_os_error: error.raw_os_error(),
         kind: error.kind(),
         path: path.to_owned(),
-    }));
-    result
+    })
 }
 
 fn normalize(path: &Path) -> Result<PathBuf> {
@@ -655,7 +750,7 @@ mod tests {
     use super::*;
     use arrow_array::builder::{MapBuilder, StringBuilder};
     use arrow_array::{ArrayRef, RecordBatch};
-    use arrow_schema::{DataType, Field, Schema};
+    use arrow_schema::{Field, Schema};
     #[cfg(unix)]
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::time::Duration;
@@ -698,7 +793,7 @@ mod tests {
                 max_wait: Duration::ZERO,
                 ..Default::default()
             },
-            None,
+            Arc::default(),
             Default::default(),
         )
     }
@@ -725,6 +820,7 @@ mod tests {
             FailedRead(Some(cause)),
             source.to_str().unwrap().into(),
             Arc::clone(&captured),
+            tokio::sync::watch::channel(tokio::time::Instant::now()).0,
         );
         let error = storage_send(
             Client::new()
@@ -733,6 +829,7 @@ mod tests {
             None,
             true,
             captured,
+            tokio::sync::watch::channel(tokio::time::Instant::now()).1,
         )
         .await
         .unwrap_err();
@@ -749,31 +846,26 @@ mod tests {
     async fn transient_storage_statuses_replay_full_inputs_and_cache_completion() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         for (operation, stream) in [("PUT", false), ("PUT", true), ("GET", false)] {
-            let statuses: &[u16] = &[503];
-            let requests = statuses.len() as u64 + 1;
+            let requests = 2;
             let server = MockServer::start().await;
             let attempts = Arc::new(AtomicUsize::new(0));
             let count = Arc::clone(&attempts);
-            Mock::given(method(if operation == "REMOVE" {
-                "DELETE"
-            } else {
-                operation
-            }))
-            .and(path("/object"))
-            .and(header("x-storage-token", "server-token"))
-            .respond_with(move |request: &wiremock::Request| {
-                if operation == "PUT" {
-                    assert_eq!(request.body, b"payload");
-                }
-                if let Some(status) = statuses.get(count.fetch_add(1, Ordering::SeqCst)) {
-                    ResponseTemplate::new(*status).insert_header("retry-after", "0")
-                } else {
-                    ResponseTemplate::new(200).set_body_bytes(b"payload")
-                }
-            })
-            .expect(requests)
-            .mount(&server)
-            .await;
+            Mock::given(method(operation))
+                .and(path("/object"))
+                .and(header("x-storage-token", "server-token"))
+                .respond_with(move |request: &wiremock::Request| {
+                    if operation == "PUT" {
+                        assert_eq!(request.body, b"payload");
+                    }
+                    if count.fetch_add(1, Ordering::SeqCst) == 0 {
+                        ResponseTemplate::new(503).insert_header("retry-after", "0")
+                    } else {
+                        ResponseTemplate::new(200).set_body_bytes(b"payload")
+                    }
+                })
+                .expect(requests)
+                .mount(&server)
+                .await;
             let dir = tempfile::tempdir().unwrap();
             let file = dir.path().join("file");
             std::fs::write(
@@ -792,12 +884,11 @@ mod tests {
             };
             let batch = instruction(operation, &format!("{}/object", server.uri()), local);
             let state = transfer_state(6);
-            let client = Client::new();
             let options = options(dir.path());
             assert_eq!(
                 state
                     .complete(
-                        async { Ok((batch.clone(), client.clone())) },
+                        async { Ok(batch.clone()) },
                         &options,
                         stream.then(|| b"payload".to_vec())
                     )
@@ -807,11 +898,7 @@ mod tests {
             );
             assert_eq!(
                 state
-                    .complete(
-                        async { Ok((batch.clone(), client.clone())) },
-                        &options,
-                        None
-                    )
+                    .complete(async { Ok(batch.clone()) }, &options, None)
                     .await
                     .unwrap(),
                 VolumeCompletion::Completed
@@ -823,14 +910,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn permanent_statuses_and_retry_limits_preserve_terminal_errors() {
-        for (operation, status, retries, budget, requests) in [
-            ("PUT", 307, 2, Duration::from_secs(10), 1),
-            ("REMOVE", 403, 2, Duration::from_secs(10), 1),
-            ("REMOVE", 404, 2, Duration::from_secs(10), 1),
-            ("REMOVE", 503, 0, Duration::from_secs(10), 1),
-            ("REMOVE", 503, 2, Duration::ZERO, 1),
-            ("REMOVE", 503, 2, Duration::from_secs(10), 3),
+    async fn storage_statuses_and_retry_limits_preserve_classification() {
+        for (operation, status, retries, budget, requests, missing_success) in [
+            ("PUT", 307, 2, Duration::from_secs(10), 1, true),
+            ("REMOVE", 403, 2, Duration::from_secs(10), 1, true),
+            ("REMOVE", 404, 2, Duration::from_secs(10), 1, true),
+            ("REMOVE", 404, 2, Duration::from_secs(10), 1, false),
+            ("REMOVE", 503, 0, Duration::from_secs(10), 1, true),
+            ("REMOVE", 503, 2, Duration::ZERO, 1, true),
+            ("REMOVE", 503, 2, Duration::from_secs(10), 3, true),
         ] {
             let server = MockServer::start().await;
             Mock::given(method(if operation == "PUT" { "PUT" } else { "DELETE" }))
@@ -838,7 +926,8 @@ mod tests {
                 .respond_with(
                     ResponseTemplate::new(status)
                         .insert_header("retry-after", "0")
-                        .insert_header("location", "/redirected"),
+                        .insert_header("location", "/redirected")
+                        .set_body_string("<Error><Code>AccessDenied</Code><Message>Permission refused</Message><SignatureProvided>secret</SignatureProvided></Error>"),
                 )
                 .expect(requests)
                 .mount(&server)
@@ -848,7 +937,7 @@ mod tests {
             std::fs::write(&file, b"payload").unwrap();
             let options = VolumeOptions {
                 allowed_paths: vec![directory.path().to_owned()],
-                remove_not_found_is_success: true,
+                remove_not_found_is_success: missing_success,
             };
             let state = VolumeState::new(
                 RetryConfig {
@@ -858,7 +947,7 @@ mod tests {
                     max_wait: Duration::ZERO,
                     ..Default::default()
                 },
-                None,
+                Arc::default(),
                 Default::default(),
             );
             let batch = instruction(
@@ -868,9 +957,9 @@ mod tests {
             );
             for _ in 0..2 {
                 let result = state
-                    .complete(async { Ok((batch.clone(), Client::new())) }, &options, None)
+                    .complete(async { Ok(batch.clone()) }, &options, None)
                     .await;
-                if status == 404 {
+                if status == 404 && missing_success {
                     assert_eq!(result.unwrap(), VolumeCompletion::Completed);
                     continue;
                 }
@@ -880,7 +969,11 @@ mod tests {
                     error.error_code.as_deref(),
                     Some("VOLUME_STORAGE_HTTP_ERROR")
                 );
-                assert!(!error.retryable);
+                assert_eq!(error.retryable, status == 503);
+                assert!(error.message.contains("AccessDenied"));
+                assert!(error
+                    .message
+                    .contains(&format!("after {requests} attempts")));
                 assert!(!error.message.contains("secret"));
             }
         }
@@ -900,17 +993,12 @@ mod tests {
                 max_wait: Duration::from_secs(30),
                 ..Default::default()
             },
-            None,
+            Arc::default(),
             Default::default(),
         );
         let batch = instruction("REMOVE", &server.uri(), Path::new(""));
-        let client = Client::new();
         let options = VolumeOptions::default();
-        let complete = state.complete(
-            async { Ok((batch.clone(), client.clone())) },
-            &options,
-            None,
-        );
+        let complete = state.complete(async { Ok(batch.clone()) }, &options, None);
         let cancel = async {
             while server.received_requests().await.unwrap().is_empty() {
                 tokio::task::yield_now().await;
@@ -944,14 +1032,9 @@ mod tests {
             Path::new("__input_stream__"),
         );
         let state = transfer_state(0);
-        let client = Client::new();
         assert_eq!(
             state
-                .complete(
-                    async { Ok((batch.clone(), client.clone())) },
-                    &VolumeOptions::default(),
-                    None
-                )
+                .complete(async { Ok(batch.clone()) }, &VolumeOptions::default(), None)
                 .await
                 .unwrap(),
             VolumeCompletion::NeedsInputStream
@@ -960,7 +1043,7 @@ mod tests {
         assert_eq!(
             state
                 .complete(
-                    async { Ok((batch.clone(), client.clone())) },
+                    async { Ok(batch.clone()) },
                     &VolumeOptions::default(),
                     Some(vec![])
                 )
@@ -972,7 +1055,7 @@ mod tests {
         assert_eq!(
             state
                 .complete(
-                    async { Ok((batch.clone(), client.clone())) },
+                    async { Ok(batch.clone()) },
                     &VolumeOptions::default(),
                     Some(vec![1])
                 )
@@ -1007,11 +1090,7 @@ mod tests {
         let batch = instruction("GET", &format!("{}/ok", server.uri()), &dest);
         let completed = transfer_state(0);
         completed
-            .complete(
-                async { Ok((batch.clone(), Client::new())) },
-                &options(dir.path()),
-                None,
-            )
+            .complete(async { Ok(batch.clone()) }, &options(dir.path()), None)
             .await
             .unwrap();
         #[cfg(unix)]
@@ -1042,11 +1121,7 @@ mod tests {
                 let state = transfer_state(0);
                 assert_eq!(
                     state
-                        .complete(
-                            async { Ok((batch.clone(), Client::new())) },
-                            &options(dir.path()),
-                            None
-                        )
+                        .complete(async { Ok(batch.clone()) }, &options(dir.path()), None)
                         .await
                         .unwrap(),
                     VolumeCompletion::Completed
@@ -1069,11 +1144,7 @@ mod tests {
             &dest,
         );
         let error = state
-            .complete(
-                async { Ok((batch.clone(), Client::new())) },
-                &options(dir.path()),
-                None,
-            )
+            .complete(async { Ok(batch.clone()) }, &options(dir.path()), None)
             .await
             .unwrap_err();
         assert_eq!(error.http_status, Some(403));
@@ -1096,7 +1167,6 @@ mod tests {
             .success());
         let state = transfer_state(0);
         let canceller = Arc::clone(&state);
-        let client = Client::new();
         let batch = instruction("PUT", "http://unused.invalid/object", &source);
         let (release, released) = std::sync::mpsc::channel();
         let writer = std::thread::spawn(move || {
@@ -1117,7 +1187,7 @@ mod tests {
             .complete(
                 async {
                     release.send(()).unwrap();
-                    Ok((batch, client))
+                    Ok(batch)
                 },
                 &options(dir.path()),
                 None,
@@ -1149,14 +1219,9 @@ mod tests {
         std::fs::write(&dest, b"old").unwrap();
         let batch = instruction("GET", &server.uri(), &dest);
         let options = options(dir.path());
-        let client = Client::new();
         for cancel in [false, true] {
             let state = transfer_state(0);
-            let mut future = Box::pin(state.complete(
-                async { Ok((batch.clone(), client.clone())) },
-                &options,
-                None,
-            ));
+            let mut future = Box::pin(state.complete(async { Ok(batch.clone()) }, &options, None));
             tokio::select! {
                 result = &mut future => panic!("unexpected early completion: {result:?}"),
                 _ = async {
@@ -1176,11 +1241,7 @@ mod tests {
             drop(future);
             assert_eq!(
                 state
-                    .complete(
-                        async { Ok((batch.clone(), client.clone())) },
-                        &options,
-                        None
-                    )
+                    .complete(async { Ok(batch.clone()) }, &options, None)
                     .await
                     .unwrap_err()
                     .code,
@@ -1237,17 +1298,17 @@ mod tests {
                 transfer_state(if operation == "PUT" { 1 } else { 0 })
                     .retry
                     .clone(),
-                Some(Duration::from_millis(150)),
+                Arc::new(
+                    crate::client::DatabricksHttpClient::with_default_retry(Default::default())
+                        .unwrap()
+                        .storage_client(Some(Duration::from_millis(150))),
+                ),
                 Default::default(),
             );
             let batch = instruction(operation, &url, &dest);
             let error = tokio::time::timeout(
                 Duration::from_secs(2),
-                state.complete(
-                    async { Ok((batch.clone(), Client::new())) },
-                    &options(dir.path()),
-                    None,
-                ),
+                state.complete(async { Ok(batch.clone()) }, &options(dir.path()), None),
             )
             .await
             .unwrap()
@@ -1259,11 +1320,7 @@ mod tests {
             );
             assert!(error.message.contains("read timed out"));
             let repeated = state
-                .complete(
-                    async { Ok((batch.clone(), Client::new())) },
-                    &options(dir.path()),
-                    None,
-                )
+                .complete(async { Ok(batch.clone()) }, &options(dir.path()), None)
                 .await
                 .unwrap_err();
             assert_eq!(repeated.message, error.message);
@@ -1275,7 +1332,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_inactivity_resets_on_progress_and_put_has_no_header_deadline() {
+    async fn get_progress_and_file_and_stream_put_idle_limits() {
         use tokio::io::AsyncReadExt;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -1296,12 +1353,16 @@ mod tests {
         let dest = dir.path().join("download");
         let state = VolumeState::new(
             transfer_state(0).retry.clone(),
-            Some(Duration::from_millis(150)),
+            Arc::new(
+                crate::client::DatabricksHttpClient::with_default_retry(Default::default())
+                    .unwrap()
+                    .storage_client(Some(Duration::from_millis(150))),
+            ),
             Default::default(),
         );
         state
             .complete(
-                async { Ok((instruction("GET", &url, &dest), Client::new())) },
+                async { Ok(instruction("GET", &url, &dest)) },
                 &options(dir.path()),
                 None,
             )
@@ -1313,7 +1374,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("PUT"))
             .and(body_bytes(b"xxxxx"))
-            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(300)))
+            .respond_with(ResponseTemplate::new(200))
             .expect(1)
             .mount(&server)
             .await;
@@ -1325,7 +1386,8 @@ mod tests {
             }
         });
         let error = Arc::new(Mutex::new(None));
-        let body = upload_body(reader, "input".into(), Arc::clone(&error));
+        let (progress, changed) = tokio::sync::watch::channel(tokio::time::Instant::now());
+        let body = upload_body(reader, "input".into(), Arc::clone(&error), progress);
         storage_send(
             Client::new()
                 .put(server.uri())
@@ -1334,10 +1396,69 @@ mod tests {
             Some(Duration::from_millis(150)),
             true,
             error,
+            changed,
         )
         .await
         .unwrap();
         producer.await.unwrap();
+
+        for stream in [false, true] {
+            for header_wait in [false, true] {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let url = format!("http://{}", listener.local_addr().unwrap());
+                let payload = vec![b'x'; 16 * 1024 * 1024];
+                std::fs::write(&dest, &payload).unwrap();
+                let length = payload.len();
+                let peer = tokio::spawn(async move {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    if header_wait {
+                        let mut headers = Vec::new();
+                        while !headers.ends_with(b"\r\n\r\n") {
+                            headers.push(socket.read_u8().await.unwrap());
+                        }
+                        let mut remaining = length;
+                        let mut buffer = vec![0; 256 * 1024];
+                        while remaining > 0 {
+                            let n = socket.read(&mut buffer).await.unwrap();
+                            assert!(n > 0);
+                            remaining -= n;
+                        }
+                    }
+                    std::future::pending::<()>().await;
+                });
+                let state = VolumeState::new(
+                    transfer_state(0).retry.clone(),
+                    Arc::new(
+                        crate::client::DatabricksHttpClient::with_default_retry(Default::default())
+                            .unwrap()
+                            .storage_client(Some(Duration::from_millis(150))),
+                    ),
+                    Default::default(),
+                );
+                let local = if stream {
+                    Path::new("__input_stream__")
+                } else {
+                    &dest
+                };
+                let error = tokio::time::timeout(
+                    Duration::from_secs(3),
+                    state.complete(
+                        async { Ok(instruction("PUT", &url, local)) },
+                        &options(dir.path()),
+                        stream.then_some(payload),
+                    ),
+                )
+                .await
+                .expect("PUT idle watchdog")
+                .unwrap_err();
+                assert_eq!(
+                    error.error_code.as_deref(),
+                    Some("VOLUME_STORAGE_NETWORK_ERROR")
+                );
+                assert!(error.message.contains("timed out"));
+                peer.abort();
+            }
+        }
     }
 
     #[tokio::test]
@@ -1365,11 +1486,7 @@ mod tests {
             std::fs::write(&dest, b"old").unwrap();
             let batch = instruction("GET", &url, &dest);
             let result = transfer_state(retries)
-                .complete(
-                    async { Ok((batch.clone(), Client::new())) },
-                    &options(dir.path()),
-                    None,
-                )
+                .complete(async { Ok(batch.clone()) }, &options(dir.path()), None)
                 .await;
             if retries == 0 {
                 assert_eq!(result.unwrap_err().code, crate::ErrorCode::NetworkError);
@@ -1495,11 +1612,7 @@ mod tests {
             );
             let state = transfer_state(1);
             let error = state
-                .complete(
-                    async { Ok((batch.clone(), Client::new())) },
-                    &options(dir.path()),
-                    None,
-                )
+                .complete(async { Ok(batch.clone()) }, &options(dir.path()), None)
                 .await
                 .unwrap_err();
             assert_eq!(error.code, code);
@@ -1513,11 +1626,7 @@ mod tests {
             assert!(!error.message.contains("hidden"));
             assert_eq!(
                 state
-                    .complete(
-                        async { Ok((batch.clone(), Client::new())) },
-                        &options(dir.path()),
-                        None
-                    )
+                    .complete(async { Ok(batch.clone()) }, &options(dir.path()), None)
                     .await
                     .unwrap_err()
                     .local_error
@@ -1559,18 +1668,68 @@ mod tests {
         assert!(!mapped.message.contains("hidden"), "{mapped}");
     }
 
-    #[test]
-    fn malformed_instruction_is_rejected() {
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "operation",
-            DataType::Utf8,
-            true,
-        )]));
-        let batch =
-            RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(vec!["PUT"]))]).unwrap();
+    #[tokio::test]
+    async fn redirected_stream_put_replays_full_bytes() {
+        let server = MockServer::start().await;
+        let payload = vec![b'x'; 512 * 1024 + 1];
+        Mock::given(method("PUT"))
+            .and(path("/original"))
+            .and(body_bytes(payload.clone()))
+            .respond_with(ResponseTemplate::new(307).insert_header("location", "/target"))
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/target"))
+            .and(body_bytes(payload.clone()))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
         assert_eq!(
-            Instruction::decode(&batch).err().unwrap().code,
-            crate::ErrorCode::InvalidArgument
+            transfer_state(0)
+                .complete(
+                    async {
+                        Ok(instruction(
+                            "PUT",
+                            &format!("{}/original", server.uri()),
+                            Path::new("__input_stream__"),
+                        ))
+                    },
+                    &VolumeOptions::default(),
+                    Some(payload),
+                )
+                .await
+                .unwrap(),
+            VolumeCompletion::Completed
         );
+    }
+
+    #[tokio::test]
+    async fn get_decodes_gzip_content_encoding() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-encoding", "gzip")
+                    .set_body_bytes(vec![
+                        31, 139, 8, 0, 0, 0, 0, 0, 2, 3, 75, 73, 77, 206, 79, 73, 77, 97, 72, 170,
+                        44, 73, 45, 6, 0, 196, 224, 211, 9, 13, 0, 0, 0,
+                    ]),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("download");
+        transfer_state(0)
+            .complete(
+                async { Ok(instruction("GET", &server.uri(), &dest)) },
+                &options(dir.path()),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(dest).unwrap(), b"decoded\x00bytes");
     }
 }

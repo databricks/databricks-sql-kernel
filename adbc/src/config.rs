@@ -386,7 +386,11 @@ impl DatabaseConfig {
             "adbc.databricks.http_request_timeout" => {
                 self.http.request_timeout = duration_seconds(value, key)?
             }
-            "SocketTimeout" => self.http.request_timeout = duration(value, key, false)?,
+            "SocketTimeout" => {
+                let timeout = duration(value, key, false)?;
+                self.http.request_timeout = timeout;
+                self.http.storage_read_timeout = Some(timeout);
+            }
             _ if key.starts_with(HTTP_PREFIX) => self.set_http(key, value)?,
             _ if key.starts_with(PROXY_PREFIX) => self.set_proxy(key, value)?,
             _ if key.starts_with(TLS_PREFIX) => self.set_tls(key, value)?,
@@ -1695,6 +1699,7 @@ mod tests {
     #[test]
     fn http_pool_and_custom_headers_reach_kernel_config() {
         let mut config = DatabaseConfig::default();
+        set(&mut config, "SocketTimeout", 4500_i64);
         set(&mut config, HOST, "https://example.databricks.com");
         set(&mut config, HTTP_PATH, "/sql/1.0/warehouses/warehouse-id");
         set(&mut config, ACCESS_TOKEN, "sentinel-token");
@@ -1712,6 +1717,10 @@ mod tests {
 
         let resolved = config.resolve().unwrap();
         assert_eq!(resolved.http.pool_max_idle_per_host, 37);
+        assert_eq!(
+            resolved.http.storage_read_timeout,
+            Some(Duration::from_millis(4500))
+        );
         assert_eq!(
             resolved.user_agent_entry.as_deref(),
             Some("partner+product")

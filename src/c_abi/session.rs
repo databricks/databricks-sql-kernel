@@ -155,6 +155,7 @@ pub struct KernelSessionConfig {
     /// Total request timeout (populated by `..._set_request_timeout`). `None`
     /// keeps [`HttpConfig::default`]'s 120-second timeout.
     request_timeout: Option<Duration>,
+    storage_read_timeout: Option<Duration>,
     /// Maximum idle connections retained per host. `None` keeps the kernel
     /// default; populated by `..._set_max_connections`.
     max_connections: Option<usize>,
@@ -289,6 +290,7 @@ pub unsafe extern "C" fn kernel_session_config_new(
         custom_headers: Vec::new(),
         sea_response_compression_enabled: false,
         request_timeout: None,
+        storage_read_timeout: None,
         max_connections: None,
         retry: None,
         // Default to ignoring transactions, matching IgnoreTransactions=1.
@@ -629,7 +631,7 @@ pub unsafe extern "C" fn kernel_session_config_set_sea_response_compression_enab
 /// Configure the total timeout for one HTTP request, from connection start
 /// through response-body completion. A separate 30-second connection timeout
 /// also applies, so connection establishment is bounded by the shorter limit.
-/// Does not bound Volume storage requests or configure their inactivity limit.
+/// Volume storage inactivity is configured by `kernel_session_config_set_storage_read_timeout`.
 /// `request_timeout_ms == 0` clears an earlier override and keeps the kernel
 /// default (120 seconds); a positive value overrides it.
 ///
@@ -643,6 +645,23 @@ pub unsafe extern "C" fn kernel_session_config_set_request_timeout(
     set_on_config(config, |c| {
         c.request_timeout =
             (request_timeout_ms != 0).then(|| Duration::from_millis(request_timeout_ms));
+        Ok(())
+    })
+}
+
+/// Configure the Volume storage idle timeout; zero disables it.
+/// Bounds reads, upload progress and PUT response waits. Redirected stream PUT
+/// resends have no idle bound.
+///
+/// # Safety
+/// `config` must be a live config handle.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_session_config_set_storage_read_timeout(
+    config: *mut KernelSessionConfig,
+    timeout_ms: u64,
+) -> KernelStatusCode {
+    set_on_config(config, |c| {
+        c.storage_read_timeout = (timeout_ms != 0).then(|| Duration::from_millis(timeout_ms));
         Ok(())
     })
 }
@@ -1515,10 +1534,12 @@ fn merge_http_config(
     request_timeout: Option<Duration>,
     max_connections: Option<usize>,
     retry: Option<RetrySpec>,
+    storage_read_timeout: Option<Duration>,
 ) -> HttpConfig {
     let mut http = HttpConfig {
         custom_headers,
         sea_response_compression_enabled,
+        storage_read_timeout,
         ..HttpConfig::default()
     };
     if let Some(t) = request_timeout {
@@ -1653,6 +1674,7 @@ fn build_session(config: KernelSessionConfig) -> Result<Session, KernelStatusCod
         custom_headers,
         sea_response_compression_enabled,
         request_timeout,
+        storage_read_timeout,
         max_connections,
         retry,
         ignore_transactions,
@@ -1719,6 +1741,7 @@ fn build_session(config: KernelSessionConfig) -> Result<Session, KernelStatusCod
             if !custom_headers.is_empty()
                 || sea_response_compression_enabled
                 || request_timeout.is_some()
+                || storage_read_timeout.is_some()
                 || max_connections.is_some()
                 || retry.is_some()
             {
@@ -1728,6 +1751,7 @@ fn build_session(config: KernelSessionConfig) -> Result<Session, KernelStatusCod
                     request_timeout,
                     max_connections,
                     retry,
+                    storage_read_timeout,
                 ));
             }
 
@@ -2644,6 +2668,19 @@ mod tests {
                 KernelStatusCode::Success
             );
             assert!(config.as_ref().unwrap().request_timeout.is_none());
+            kernel_session_config_set_storage_read_timeout(config, 4_500);
+            assert_eq!(
+                merge_http_config(
+                    Vec::new(),
+                    false,
+                    None,
+                    None,
+                    None,
+                    config.as_ref().unwrap().storage_read_timeout
+                )
+                .storage_read_timeout,
+                Some(Duration::from_millis(4_500))
+            );
             kernel_session_config_free(config);
         }
     }
@@ -3335,6 +3372,7 @@ mod tests {
                 max_retries: 9,
                 overall_timeout: Some(Duration::from_millis(120_000)),
             }),
+            None,
         );
         assert_eq!(http.retry_min_wait, Duration::from_millis(500));
         assert_eq!(http.retry_max_wait, Duration::from_millis(30_000));
@@ -3359,6 +3397,7 @@ mod tests {
                 max_retries: 2,
                 overall_timeout: None,
             }),
+            None,
         );
         assert_eq!(
             http.overall_timeout, default_budget,
@@ -3385,6 +3424,7 @@ mod tests {
                 max_retries: 4,
                 overall_timeout: None,
             }),
+            None,
         );
         assert!(retry_only.custom_headers.is_empty());
         assert_eq!(retry_only.retry_min_wait, Duration::from_millis(250));
@@ -3395,6 +3435,7 @@ mod tests {
         let headers_only = merge_http_config(
             vec![("X-Test".to_string(), "1".to_string())],
             false,
+            None,
             None,
             None,
             None,
@@ -3418,6 +3459,7 @@ mod tests {
             Some(Duration::from_millis(4_500)),
             None,
             None,
+            None,
         );
         assert_eq!(http.request_timeout, Duration::from_millis(4_500));
         assert_eq!(http.retry_min_wait, default.retry_min_wait);
@@ -3427,7 +3469,7 @@ mod tests {
     #[test]
     fn merge_http_config_maps_max_connections_and_preserves_other_defaults() {
         let default = HttpConfig::default();
-        let http = merge_http_config(Vec::new(), false, None, Some(23), None);
+        let http = merge_http_config(Vec::new(), false, None, Some(23), None, None);
         assert_eq!(http.pool_max_idle_per_host, 23);
         assert_eq!(http.request_timeout, default.request_timeout);
         assert_eq!(http.retry_max_retries, default.retry_max_retries);

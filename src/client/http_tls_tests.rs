@@ -357,7 +357,7 @@ async fn storage_redirect_rejects_https_to_http_on_the_same_port() {
 }
 
 #[tokio::test]
-async fn storage_connection_timeout_preserves_unconfigured_limits() {
+async fn storage_idle_timeout_also_bounds_connection_setup() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let (shutdown, mut stopped) = oneshot::channel();

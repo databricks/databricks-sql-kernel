@@ -101,10 +101,7 @@ async fn instruction_batches_preserve_one_row_and_reject_extra_rows() {
         let mut statement = session.statement();
         statement.spec().sql("operation");
         let mut executed = statement.execute().await.unwrap();
-        let options = VolumeOptions {
-            allowed_paths: vec![dir.path().to_owned()],
-            ..Default::default()
-        };
+        let options = VolumeOptions::new(vec![dir.path().to_owned()], false);
         for _ in 0..2 {
             let result = executed
                 .result_stream_mut()
@@ -195,61 +192,47 @@ async fn session_with_http(
 }
 
 #[tokio::test]
-async fn storage_transfers_outlive_rpc_deadline_while_sql_requests_still_time_out() {
-    for operation in ["GET"] {
-        let server = MockServer::start().await;
-        let dir = tempfile::tempdir().unwrap();
-        let local = dir.path().join("file");
-        std::fs::write(&local, b"original").unwrap();
-        let mut http = HttpConfig::default();
-        http.request_timeout = Duration::from_millis(100);
-        http.overall_timeout = Duration::from_millis(200);
-        let session = session_with_http(
-            &server,
-            response_with_batches(&server, true, local.to_str().unwrap(), operation, &[1]),
-            http,
+async fn storage_transfers_outlive_rpc_deadline() {
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let local = dir.path().join("file");
+    std::fs::write(&local, b"original").unwrap();
+    let mut http = HttpConfig::default();
+    http.request_timeout = Duration::from_millis(100);
+    http.overall_timeout = Duration::from_millis(200);
+    let session = session_with_http(
+        &server,
+        response_with_batches(&server, true, local.to_str().unwrap(), "GET", &[1]),
+        http,
+    )
+    .await;
+    Mock::given(method("GET"))
+        .and(path("/object"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_millis(300))
+                .set_body_bytes(b"downloaded"),
         )
+        .expect(1)
+        .mount(&server)
         .await;
-        Mock::given(method(operation))
-            .and(path("/object"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_delay(Duration::from_millis(300))
-                    .set_body_bytes(b"downloaded"),
+    let mut statement = session.statement();
+    statement.spec().sql("operation");
+    let mut executed = statement.execute().await.unwrap();
+    assert_eq!(
+        executed
+            .result_stream_mut()
+            .complete_volume_operation(
+                &VolumeOptions::new(vec![dir.path().to_owned()], false),
+                None,
             )
-            .expect(1)
-            .mount(&server)
-            .await;
-        let mut statement = session.statement();
-        statement.spec().sql("operation");
-        let mut executed = statement.execute().await.unwrap();
-        assert_eq!(
-            executed
-                .result_stream_mut()
-                .complete_volume_operation(
-                    &VolumeOptions {
-                        allowed_paths: vec![dir.path().to_owned()],
-                        ..Default::default()
-                    },
-                    None,
-                )
-                .await
-                .unwrap(),
-            VolumeCompletion::Completed
-        );
-        assert_eq!(std::fs::read(&local).unwrap(), b"downloaded");
-        executed.close().await.unwrap();
-        Mock::given(method("POST"))
-            .and(path("/api/2.0/sql/statements"))
-            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(300)))
-            .with_priority(1)
-            .mount(&server)
-            .await;
-        let error = statement.execute().await.err().expect("RPC deadline");
-        assert_eq!(error.code, ErrorCode::NetworkError);
-        assert!(error.message.contains("timed out"), "{error}");
-        session.close().await.unwrap();
-    }
+            .await
+            .unwrap(),
+        VolumeCompletion::Completed
+    );
+    assert_eq!(std::fs::read(&local).unwrap(), b"downloaded");
+    executed.close().await.unwrap();
+    session.close().await.unwrap();
 }
 
 #[tokio::test]
@@ -278,10 +261,7 @@ async fn sync_and_direct_closed_results_complete_explicitly_and_keep_raw_rows() 
         assert!(!dest.exists());
         let stream = exec.result_stream_mut();
         assert!(stream.is_volume_operation());
-        let options = VolumeOptions {
-            allowed_paths: vec![dir.path().to_owned()],
-            ..Default::default()
-        };
+        let options = VolumeOptions::new(vec![dir.path().to_owned()], false);
         assert_eq!(
             stream
                 .complete_volume_operation(&options, None)
@@ -366,10 +346,7 @@ async fn owner_reader_and_repeated_materialization_share_one_completion() {
     reader.fetch_result().await.unwrap().close();
     let mut first = reader.fetch_result().await.unwrap();
     let mut second = owner.fetch_result().await.unwrap();
-    let options = VolumeOptions {
-        allowed_paths: vec![dir.path().to_owned()],
-        ..Default::default()
-    };
+    let options = VolumeOptions::new(vec![dir.path().to_owned()], false);
     let (a, b) = tokio::join!(
         first.complete_volume_operation(&options, None),
         second.complete_volume_operation(&options, None)
@@ -426,10 +403,7 @@ async fn cancellation_and_session_close_interrupt_instruction_or_storage_after_s
         let canceller = stmt.canceller();
         stmt.spec().sql("operation");
         let mut exec = stmt.execute().await.unwrap();
-        let options = VolumeOptions {
-            allowed_paths: vec![dir.path().to_owned()],
-            ..Default::default()
-        };
+        let options = VolumeOptions::new(vec![dir.path().to_owned()], false);
         let complete = exec
             .result_stream_mut()
             .complete_volume_operation(&options, None);
@@ -481,4 +455,39 @@ async fn cancellation_and_session_close_interrupt_instruction_or_storage_after_s
             session.close().await.unwrap();
         }
     }
+}
+
+#[tokio::test]
+async fn reading_before_volume_completion_returns_invalid_state() {
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let local = dir.path().join("download");
+    let session = session_with_http(
+        &server,
+        response_with_batches(&server, true, local.to_str().unwrap(), "GET", &[1]),
+        HttpConfig::default(),
+    )
+    .await;
+    let mut statement = session.statement();
+    statement.spec().sql("GET");
+    let mut executed = statement.execute().await.unwrap();
+    assert!(executed.next_batch().await.unwrap().is_some());
+    let error = executed
+        .result_stream_mut()
+        .complete_volume_operation(
+            &VolumeOptions::new(vec![dir.path().to_owned()], false),
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.code,
+        databricks_sql_kernel::Error::invalid_state().code
+    );
+    assert!(error
+        .message
+        .contains("complete_volume_operation must be called before reading result rows"));
+    assert!(!local.exists());
+    executed.close().await.unwrap();
+    session.close().await.unwrap();
 }

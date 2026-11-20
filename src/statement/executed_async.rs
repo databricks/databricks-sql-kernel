@@ -954,7 +954,7 @@ impl ExecutedAsyncStatement {
                     .is_some_and(|m| m.is_volume_operation);
                 let mut stream = ResultStream::from_reader(result.reader).await?;
                 if let Some(volume) = &self.volume {
-                    stream.attach_volume(marked, Arc::clone(volume), self.session.storage_client());
+                    stream.attach_volume(marked, Arc::clone(volume));
                 }
                 stream.attach_telemetry(self.statement_telemetry.clone());
                 // SEA carries no row count on the async status either; for a

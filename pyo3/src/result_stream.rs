@@ -72,6 +72,26 @@ impl From<databricks_sql_kernel::VolumeCompletion> for VolumeCompletion {
     }
 }
 
+pub(crate) fn complete_volume(
+    py: Python<'_>,
+    runtime: &Arc<KernelRuntime>,
+    stream: &mut KResultStream,
+    allowed_paths: Vec<String>,
+    remove_not_found_is_success: bool,
+    input_bytes: Option<Vec<u8>>,
+) -> PyResult<VolumeCompletion> {
+    let options = databricks_sql_kernel::VolumeOptions::new(
+        allowed_paths.into_iter().map(Into::into).collect(),
+        remove_not_found_is_success,
+    );
+    Ok(run_kernel_interruptible!(
+        py,
+        runtime,
+        stream.complete_volume_operation(&options, input_bytes)
+    )?
+    .into())
+}
+
 #[pymethods]
 impl ResultStream {
     #[getter]
@@ -80,7 +100,7 @@ impl ResultStream {
         Ok(inner.stream.is_volume_operation())
     }
 
-    #[pyo3(signature = (allowed_paths, remove_not_found_is_success=false, input_bytes=None))]
+    #[pyo3(signature = (allowed_paths, remove_not_found_is_success, input_bytes=None))]
     fn complete_volume_operation(
         &mut self,
         py: Python<'_>,
@@ -89,18 +109,14 @@ impl ResultStream {
         input_bytes: Option<Vec<u8>>,
     ) -> PyResult<crate::result_stream::VolumeCompletion> {
         let inner = alive_mut!(self, "ResultStream");
-        let runtime = inner.runtime.clone();
-        let options = databricks_sql_kernel::VolumeOptions {
-            allowed_paths: allowed_paths.into_iter().map(Into::into).collect(),
-            remove_not_found_is_success,
-        };
-        let stream = &mut inner.stream;
-        let outcome = run_kernel_interruptible!(
+        complete_volume(
             py,
-            &runtime,
-            stream.complete_volume_operation(&options, input_bytes)
-        )?;
-        Ok(outcome.into())
+            &inner.runtime,
+            &mut inner.stream,
+            allowed_paths,
+            remove_not_found_is_success,
+            input_bytes,
+        )
     }
 
     /// Result schema as a `pyarrow.Schema`. Available even after `close()`.

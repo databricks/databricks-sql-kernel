@@ -68,13 +68,10 @@ and security vulnerabilities should be reported according to
 
 ## Volume file operations
 
-Call `ResultStream::complete_volume_operation` with `VolumeOptions` to complete
-server-marked PUT, GET and REMOVE instructions before reading their rows. Omit
-completion for raw results. File paths must satisfy the configured lexical and
-resolved roots. Stream PUT returns `NeedsInputStream` until owned bytes are supplied.
-Completion caches its outcome, including errors; owner/session close cancels pending
-work. See [`VolumeOptions`](https://docs.rs/databricks-sql-kernel/latest/databricks_sql_kernel/struct.VolumeOptions.html)
-for local file and transfer behavior.
+Call `ResultStream::complete_volume_operation` with `VolumeOptions` before reading
+server-marked PUT, GET and REMOVE rows; omit completion for raw results.
+See [`VolumeOptions`](https://docs.rs/databricks-sql-kernel/latest/databricks_sql_kernel/struct.VolumeOptions.html)
+for authorization, completion and transfer behavior.
 
 ## License
 

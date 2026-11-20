@@ -164,17 +164,13 @@ impl SessionInner {
     pub(crate) fn new_volume_state(&self) -> Arc<crate::volume::VolumeState> {
         crate::volume::VolumeState::new(
             self.storage_retry.clone(),
-            self.config.http.storage_read_timeout,
+            Arc::clone(&self.storage_client),
             self.volume_cancellation.child_token(),
         )
     }
 
     fn cancel_volume_operations(&self) {
         self.volume_cancellation.cancel();
-    }
-
-    pub(crate) fn storage_client(&self) -> Arc<crate::client::http::StorageClient> {
-        Arc::clone(&self.storage_client)
     }
 
     /// Crate-internal accessor for the session's transport. Used by

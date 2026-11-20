@@ -388,7 +388,9 @@ pub struct DatabricksHttpClient {
     retry_configs: HashMap<RequestCategory, RetryConfig>,
 }
 
+#[derive(Default)]
 pub(crate) struct StorageClient {
+    pub(crate) read_timeout: Option<Duration>,
     config: HttpClientConfig,
     client: tokio::sync::OnceCell<Client>,
 }
@@ -513,6 +515,7 @@ impl DatabricksHttpClient {
         let client = Self::build_reqwest_client(
             &config,
             reqwest::redirect::Policy::default(),
+            // `read_timeout` is historical: reqwest applies it as a total SQL deadline.
             Some(config.read_timeout),
             true,
         )?;
@@ -776,12 +779,13 @@ impl DatabricksHttpClient {
     }
 
     /// Storage transfers can outlive SQL RPCs, so retain connection settings without their deadline.
-    pub(crate) fn storage_client(&self, connect_timeout: Option<Duration>) -> StorageClient {
+    pub(crate) fn storage_client(&self, storage_read_timeout: Option<Duration>) -> StorageClient {
         let mut config = self.config.clone();
-        if let Some(timeout) = connect_timeout {
+        if let Some(timeout) = storage_read_timeout {
             config.connect_timeout = config.connect_timeout.min(timeout);
         }
         StorageClient {
+            read_timeout: storage_read_timeout,
             config,
             client: tokio::sync::OnceCell::new(),
         }
@@ -1620,7 +1624,8 @@ lGrv15pBcePj
 
         let mut config = HttpClientConfig::default();
         config.tls.trusted_certificate_path = Some(tmp.path().to_string_lossy().to_string());
-        assert!(DatabricksHttpClient::new(config, default_retry_configs()).is_ok());
+        let client = DatabricksHttpClient::new(config, default_retry_configs());
+        assert!(client.is_ok());
     }
 
     #[test]

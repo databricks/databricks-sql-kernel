@@ -758,9 +758,8 @@ pub struct HttpConfig {
     /// Does not bound Volume storage requests; use `storage_read_timeout` for inactivity.
     pub request_timeout: Duration,
 
-    /// Inactivity limit for Volume GET/REMOVE response headers and each response-body read.
-    /// Separate from the SQL request deadline so progressing transfers can finish.
-    /// Also caps connection establishment; PUT response headers have no deadline.
+    /// Volume idle limit for reads, upload progress and PUT response-header waits.
+    /// Also caps connection setup; redirected stream PUT resends have no idle bound.
     pub storage_read_timeout: Option<Duration>,
 
     /// Maximum total time across retries for a single logical RPC.

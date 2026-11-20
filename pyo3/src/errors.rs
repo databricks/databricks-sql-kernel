@@ -70,7 +70,10 @@ fn attach_attrs(
     display_message: Option<&str>,
     diagnostic_info: Option<&str>,
     error_details_json: Option<&str>,
+    local: Option<&databricks_sql_kernel::kernel_error::LocalFileError>,
 ) -> PyResult<()> {
+    bound.setattr("local_os_error", local.and_then(|e| e.raw_os_error))?;
+    bound.setattr("local_path", local.map(|e| e.path.as_str()))?;
     bound.setattr("code", code)?;
     bound.setattr("message", message)?;
     bound.setattr("sql_state", sql_state)?;
@@ -138,6 +141,7 @@ pub(crate) fn to_py_err(py: Python<'_>, err: KError) -> PyErr {
         err.display_message.as_deref(),
         err.diagnostic_info.as_deref(),
         err.error_details_json.as_deref(),
+        err.local_error.as_deref(),
     ) {
         // Attribute attachment is best-effort. If something goes wrong
         // (extremely unlikely for plain string/int setattrs — but
@@ -153,16 +157,6 @@ pub(crate) fn to_py_err(py: Python<'_>, err: KError) -> PyErr {
         ));
         chained.set_cause(py, Some(setattr_err));
         return chained;
-    }
-    let local = err.local_error.as_ref();
-    if let Err(error) = (|| -> PyResult<()> {
-        bound.setattr("local_os_error", local.and_then(|e| e.raw_os_error))?;
-        bound.setattr("local_error_kind", local.map(|e| format!("{:?}", e.kind)))?;
-        bound.setattr("local_path", local.map(|e| e.path.as_str()))?;
-        Ok(())
-    })() {
-        py_err.set_cause(py, Some(error));
-        return py_err;
     }
     py_err
 }
@@ -188,6 +182,7 @@ pub(crate) fn closed_err(handle_name: &str) -> PyErr {
             None,
             None,
             false,
+            None,
             None,
             None,
             None,

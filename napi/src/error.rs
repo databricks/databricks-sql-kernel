@@ -82,14 +82,8 @@ pub(crate) const ERROR_SENTINEL: &str = "__databricks_error__:";
 /// and `cause` are intentionally omitted from the v1 envelope — see
 /// the module-level doc for rationale.
 ///
-/// **Wire-shape superset of pyo3 for Thrift parity:** the envelope
-/// also carries `displayMessage` / `diagnosticInfo` / `errorDetailsJson`
-/// — the three SEA extended-status fields that ride on the wire across
-/// terminal-error states. These mirror the same-named fields on the
-/// NodeJS Thrift driver's `TGetOperationStatusResp`, so JS callers
-/// migrating from Thrift to the SEA-backed binding see the same field
-/// set on a failed statement. The pyo3 binding does NOT (yet) attach
-/// these — pyo3's `attach_attrs` stays at the original 8 fields.
+/// Both bindings carry extended status; NAPI encodes camelCase JSON and PyO3
+/// attaches snake_case exception attributes.
 ///
 /// The whole JSON-envelope-on-`reason` scheme is interim. The follow-up
 /// PR that lands the first `#[napi]` entry points (PR #25) is expected
@@ -326,29 +320,8 @@ mod tests {
         );
     }
 
-    /// Parity guard: the napi envelope must carry the same kernel
-    /// `Error` field set that pyo3's typed `KernelError` exposes via
-    /// `setattr`. The two bindings diverge on *wire mechanism* (typed
-    /// exception attrs vs JSON envelope) and on *naming convention*
-    /// (snake_case attrs in pyo3 vs camelCase JSON keys in napi).
-    ///
-    /// **Thrift-parity superset.** The napi envelope is a strict
-    /// superset of pyo3's field set: it adds `displayMessage` /
-    /// `diagnosticInfo` / `errorDetailsJson` so JS consumers see the
-    /// same fields the NodeJS Thrift driver's `TGetOperationStatusResp`
-    /// exposes on terminal-error states. The pyo3 binding may grow
-    /// these later via a separate `attach_attrs` extension; the two
-    /// bindings stay in sync on the *pyo3-side 8 fields*, and napi
-    /// extends from there for its host-language's contract.
-    ///
-    /// pyo3 attaches via `attach_attrs(...)` in `pyo3/src/errors.rs:67`:
-    /// `code, message, sql_state, error_code, vendor_code, http_status,
-    /// retryable, query_id`. Both bindings intentionally omit `location`
-    /// (kernel-internal `file:line` for `Internal` errors) and `cause`
-    /// (recursive — needs an explicit schema decision).
-    ///
-    /// Reviewer-flagged at PR #27 / error.rs:76 — see comment text
-    /// `pyo3 attaches kernel error fields as Python attributes…`.
+    /// Both bindings expose structured kernel fields; NAPI uses camelCase JSON
+    /// and PyO3 uses snake_case exception attributes.
     #[test]
     fn envelope_field_set_matches_pyo3_setattr_contract() {
         // Build a kernel error with every optional field populated so

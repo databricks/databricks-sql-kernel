@@ -41,8 +41,8 @@
 //!   Aborted, Unimplemented, …) lands in a follow-on PR. External
 //!   `match` arms get a forced `_ =>` fallback — they keep compiling
 //!   when the enum grows.
-//! - `Error` **is not** `#[non_exhaustive]`: wrappers use struct patterns
-//!   with `..` for logging and host-language exception mapping.
+//! - `Error` supports struct patterns with `..`; constructors and setters avoid
+//!   coupling callers to its full field list.
 
 #![allow(dead_code)]
 
@@ -444,6 +444,12 @@ impl Error {
     /// (e.g. `STATEMENT_NOT_FOUND`, `WAREHOUSE_STOPPED`).
     pub fn with_error_code(mut self, error_code: impl Into<String>) -> Self {
         self.error_code = Some(error_code.into());
+        self
+    }
+
+    /// Attach the original local filesystem error for binding-specific mapping.
+    pub fn with_local_error(mut self, local_error: LocalFileError) -> Self {
+        self.local_error = Some(Box::new(local_error));
         self
     }
 

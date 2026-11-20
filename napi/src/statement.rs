@@ -207,12 +207,12 @@ impl Statement {
     pub async fn complete_volume_operation(
         &self,
         allowed_paths: Vec<String>,
-        remove_not_found_is_success: Option<bool>,
+        remove_not_found_is_success: bool,
     ) -> napi::Result<crate::result::VolumeCompletion> {
-        let options = VolumeOptions {
-            allowed_paths: allowed_paths.into_iter().map(Into::into).collect(),
-            remove_not_found_is_success: remove_not_found_is_success.unwrap_or(false),
-        };
+        let options = VolumeOptions::new(
+            allowed_paths.into_iter().map(Into::into).collect(),
+            remove_not_found_is_success,
+        );
         let inner = Arc::clone(&self.inner);
         guarded(async move {
             let mut guard = inner.lock().await;
@@ -706,7 +706,7 @@ mod tests {
                 assert!(result.is_volume_operation());
                 assert_eq!(
                     result
-                        .complete_volume_operation(vec![], None)
+                        .complete_volume_operation(vec![], false)
                         .await
                         .unwrap(),
                     crate::result::VolumeCompletion::Completed
@@ -720,7 +720,7 @@ mod tests {
                 assert!(result.is_volume_operation());
                 assert_eq!(
                     result
-                        .complete_volume_operation(vec![], None)
+                        .complete_volume_operation(vec![], false)
                         .await
                         .unwrap(),
                     crate::result::VolumeCompletion::Completed
@@ -762,7 +762,7 @@ mod tests {
         parent.spec().sql("operation");
         let executed = parent.execute().await.unwrap();
         let result = Statement::from_executed(parent, executed);
-        let completion = result.complete_volume_operation(vec![], None);
+        let completion = result.complete_volume_operation(vec![], false);
         tokio::pin!(completion);
         tokio::select! {
             finished = &mut completion => panic!("completion finished before close: {finished:?}"),

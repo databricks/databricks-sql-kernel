@@ -501,10 +501,10 @@ impl Statement {
                         Status::InvalidArguments,
                     )
                 })?;
-                self.volume_options = Some(kernel::VolumeOptions {
-                    allowed_paths: roots.into_iter().map(Into::into).collect(),
-                    remove_not_found_is_success: false,
-                });
+                self.volume_options = Some(kernel::VolumeOptions::new(
+                    roots.into_iter().map(Into::into).collect(),
+                    true,
+                ));
                 Ok(())
             }
             ENABLE_DIRECT_RESULTS_OPTION => {
@@ -1600,7 +1600,7 @@ mod tests {
                 .await;
             Mock::given(method("DELETE"))
                 .and(path("/object"))
-                .respond_with(ResponseTemplate::new(200))
+                .respond_with(ResponseTemplate::new(404))
                 .with_priority(1)
                 .expect(7)
                 .mount(&server)

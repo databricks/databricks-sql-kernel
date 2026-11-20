@@ -230,28 +230,6 @@ pub(crate) fn store_invalid_arg(msg: &str) -> KernelStatusCode {
 mod tests {
     use super::*;
 
-    #[test]
-    fn local_error_getters_preserve_error_until_clear() {
-        let mut error = Error::not_found().message("missing local file");
-        error.local_error = Some(Box::new(crate::kernel_error::LocalFileError {
-            raw_os_error: Some(2),
-            kind: std::io::ErrorKind::NotFound,
-            path: "local-file".into(),
-        }));
-        store_error(error);
-        assert_eq!(kernel_get_last_error_local_os_error(), 2);
-        assert_eq!(
-            unsafe { std::ffi::CStr::from_ptr(kernel_get_last_error_local_path()) }
-                .to_str()
-                .unwrap(),
-            "local-file"
-        );
-        with_last_error(|error| assert!(error.is_some()));
-        clear_error();
-        assert_eq!(kernel_get_last_error_local_os_error(), 0);
-        assert!(kernel_get_last_error_local_path().is_null());
-    }
-
     /// Helper: read the thread-local error into a `KernelError` and run
     /// `f` with the borrowed C strings still alive.
     fn with_last_error<R>(f: impl FnOnce(Option<KernelError>) -> R) -> R {
@@ -304,11 +282,15 @@ mod tests {
 
     #[test]
     fn store_error_folds_error_code_slug_into_message() {
-        store_error(
-            Error::sql_error()
-                .message("statement gone")
-                .with_error_code("STATEMENT_NOT_FOUND"),
-        );
+        let mut error = Error::sql_error()
+            .message("statement gone")
+            .with_error_code("STATEMENT_NOT_FOUND");
+        error.local_error = Some(Box::new(crate::kernel_error::LocalFileError {
+            raw_os_error: Some(2),
+            kind: std::io::ErrorKind::NotFound,
+            path: "local-file".into(),
+        }));
+        store_error(error);
         with_last_error(|e| {
             let e = e.expect("error present");
             let msg = unsafe { std::ffi::CStr::from_ptr(e.message) }
@@ -323,8 +305,18 @@ mod tests {
                 "STATEMENT_NOT_FOUND"
             );
         });
+        assert_eq!(kernel_get_last_error_local_os_error(), 2);
+        assert_eq!(
+            unsafe { std::ffi::CStr::from_ptr(kernel_get_last_error_local_path()) }
+                .to_str()
+                .unwrap(),
+            "local-file"
+        );
+        with_last_error(|error| assert!(error.is_some()));
         clear_error();
         assert!(kernel_get_last_error_code().is_null());
+        assert_eq!(kernel_get_last_error_local_os_error(), 0);
+        assert!(kernel_get_last_error_local_path().is_null());
     }
 
     #[test]

@@ -8,7 +8,7 @@ The binding itself lives under `src/`; its public TypeScript surface is
 declared in `index.d.ts`.
 
 `Statement` and `AsyncResultHandle` expose `isVolumeOperation` and
-`completeVolumeOperation(allowedPaths, removeNotFoundIsSuccess?)`. Completion
+`completeVolumeOperation(allowedPaths, removeNotFoundIsSuccess)`. Completion
 returns `not_volume`, `needs_input_stream` or `completed` and preserves the
 instruction rows. The caller opts into transfer by supplying allowed local
 roots; both lexical paths and resolved symlink targets must stay inside them.

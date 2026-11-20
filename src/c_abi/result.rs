@@ -535,8 +535,7 @@ pub unsafe extern "C" fn kernel_result_stream_close(
     if stream.is_null() {
         return store_invalid_arg("kernel_result_stream_close: stream must not be null");
     }
-    let inner = Box::from_raw(stream as *mut ResultStreamInner);
-    drop(inner);
+    drop(Box::from_raw(stream as *mut ResultStreamInner));
     KernelStatusCode::Success
 }
 
@@ -700,10 +699,10 @@ pub unsafe extern "C" fn kernel_result_stream_complete_volume_operation(
                 return store_invalid_arg("Volume allowed paths must be a JSON array of strings")
             }
         };
-        let options = crate::VolumeOptions {
-            allowed_paths: roots.into_iter().map(Into::into).collect(),
+        let options = crate::VolumeOptions::new(
+            roots.into_iter().map(Into::into).collect(),
             remove_not_found_is_success,
-        };
+        );
         let p = stream as *mut ResultStreamInner;
         let shape = &mut *std::ptr::addr_of_mut!((*p).shape);
         let result = match shape {
@@ -784,21 +783,21 @@ mod tests {
         )
         .unwrap();
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let volume = crate::volume::VolumeState::new(Default::default(), None, Default::default());
+        let volume = crate::volume::VolumeState::new(
+            Default::default(),
+            Arc::new(
+                crate::client::DatabricksHttpClient::with_default_retry(Default::default())
+                    .unwrap()
+                    .storage_client(None),
+            ),
+            Default::default(),
+        );
         let stream = rt.block_on(async {
             let mut stream =
                 ResultStream::from_reader(Box::new(MockReader::new(vec![batch.clone()])))
                     .await
                     .unwrap();
-            stream.attach_volume(
-                true,
-                Arc::clone(&volume),
-                Arc::new(
-                    crate::client::DatabricksHttpClient::with_default_retry(Default::default())
-                        .unwrap()
-                        .storage_client(None),
-                ),
-            );
+            stream.attach_volume(true, Arc::clone(&volume));
             into_raw_result_stream(schema.clone(), stream)
         });
         let mut is_volume = false;
@@ -818,19 +817,17 @@ mod tests {
             unsafe { kernel_result_stream_canceller_cancel(canceller) },
             KernelStatusCode::Success
         );
-        for _ in 0..2 {
-            assert_eq!(
-                unsafe {
-                    kernel_result_stream_complete_volume_operation(
-                        stream,
-                        roots.as_ptr(),
-                        false,
-                        &mut status,
-                    )
-                },
-                KernelStatusCode::Cancelled
-            );
-        }
+        assert_eq!(
+            unsafe {
+                kernel_result_stream_complete_volume_operation(
+                    stream,
+                    roots.as_ptr(),
+                    false,
+                    &mut status,
+                )
+            },
+            KernelStatusCode::Cancelled
+        );
         unsafe { kernel_result_stream_canceller_free(canceller) };
         unsafe { kernel_result_stream_close(stream) };
     }

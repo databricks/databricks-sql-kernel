@@ -12,8 +12,8 @@ changes go in their respective binding's NEXT_CHANGELOG.
 ### Added
 
 - Explicit, execution-scoped completion of server-marked Volume PUT/GET/REMOVE
-  instructions, with allowed-root checks, resumable owned-byte PUT input, safe GET
-  replacement and cached completion outcomes. Resolved symlink targets must remain
+  instructions, with allowed-root checks, resumable owned-byte PUT input, in-place GET
+  publication and cached completion outcomes. Resolved symlink targets must remain
   within the configured roots.
 
 ### Changed

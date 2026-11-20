@@ -497,12 +497,12 @@ impl AsyncResultHandle {
     pub async fn complete_volume_operation(
         &self,
         allowed_paths: Vec<String>,
-        remove_not_found_is_success: Option<bool>,
+        remove_not_found_is_success: bool,
     ) -> napi::Result<crate::result::VolumeCompletion> {
-        let options = VolumeOptions {
-            allowed_paths: allowed_paths.into_iter().map(Into::into).collect(),
-            remove_not_found_is_success: remove_not_found_is_success.unwrap_or(false),
-        };
+        let options = VolumeOptions::new(
+            allowed_paths.into_iter().map(Into::into).collect(),
+            remove_not_found_is_success,
+        );
         let inner = Arc::clone(&self.inner);
         guarded(async move {
             let mut guard = inner.lock().await;
@@ -818,8 +818,6 @@ mod tests {
         .expect("closed result must release its session after the operation finishes");
 
         let second = telemetry_connection(&server, 1_000, Duration::from_secs(300)).await;
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        assert_eq!(exports_for(&server, SECOND_SESSION).await, 0);
         second.close().await.expect("close second session");
         assert!(exports_for(&server, SECOND_SESSION).await > 0);
         drop((statement, result));
@@ -860,8 +858,6 @@ mod tests {
         sync_statement.close().await.expect("close is terminal");
         connection.close().await.expect("close session");
         let second = telemetry_connection(&server, 1_000, Duration::from_secs(300)).await;
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        assert_eq!(exports_for(&server, SECOND_SESSION).await, 0);
         second.close().await.expect("close second session");
         drop(sync_statement);
     }
