@@ -40,13 +40,25 @@ struct TransportKey {
 
 impl From<&HttpClientConfig> for TransportKey {
     fn from(config: &HttpClientConfig) -> Self {
+        // New settings must be classified as transport or per-request state.
+        let HttpClientConfig {
+            connect_timeout,
+            read_timeout,
+            max_connections_per_host,
+            user_agent,
+            tls,
+            proxy,
+            org_id: _,
+            custom_headers: _,
+            sea_response_compression_enabled: _,
+        } = config;
         Self {
-            connect_timeout: config.connect_timeout,
-            read_timeout: config.read_timeout,
-            max_connections_per_host: config.max_connections_per_host,
-            user_agent: config.user_agent.clone(),
-            tls: config.tls.clone(),
-            proxy: config.proxy.clone(),
+            connect_timeout: *connect_timeout,
+            read_timeout: *read_timeout,
+            max_connections_per_host: *max_connections_per_host,
+            user_agent: user_agent.clone(),
+            tls: tls.clone(),
+            proxy: proxy.clone(),
         }
     }
 }
@@ -429,19 +441,33 @@ mod tests {
                 ..key("host")
             });
         }
-        let mut per_request = original.clone();
-        per_request.org_id = Some("other-org".into());
-        per_request
-            .custom_headers
-            .push(("x-test".into(), "value".into()));
-        per_request.sea_response_compression_enabled = true;
-        assert!(TransportKey::from(&per_request) == TransportKey::from(&original));
-        assert!(pool
-            .take(&PoolKey {
-                config: (&per_request).into(),
-                ..key("host")
-            })
-            .is_some());
+    }
+
+    #[tokio::test]
+    async fn per_request_settings_each_reuse_the_same_transport() {
+        let pool = Arc::new(ClientPool::default());
+        drop(pool.checkout(key("host"), || Ok(Client::new())).unwrap());
+        for variant in 0..3 {
+            let mut per_request = HttpClientConfig::default();
+            match variant {
+                0 => per_request.org_id = Some("other-org".into()),
+                1 => per_request
+                    .custom_headers
+                    .push(("x-test".into(), "value".into())),
+                2 => per_request.sea_response_compression_enabled = true,
+                _ => unreachable!(),
+            }
+            drop(
+                pool.checkout(
+                    PoolKey {
+                        config: (&per_request).into(),
+                        ..key("host")
+                    },
+                    || panic!("per-request setting partitioned the transport"),
+                )
+                .unwrap(),
+            );
+        }
     }
 
     #[tokio::test(start_paused = true)]
