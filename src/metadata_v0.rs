@@ -495,16 +495,28 @@ struct TablesCloseGuard {
     statement_id: String,
 }
 
-impl Drop for TablesCloseGuard {
-    fn drop(&mut self) {
+impl TablesCloseGuard {
+    fn start_close(&mut self) -> Option<tokio::task::JoinHandle<()>> {
         let statement_id = std::mem::take(&mut self.statement_id);
         if statement_id.is_empty() {
-            return;
+            return None;
         }
         let transport = Arc::clone(self.session.transport());
-        self.session.runtime_handle().spawn(async move {
-            transport.close_statement(&statement_id).await.ok();
-        });
+        let span = self.session.log_span().clone();
+        Some(
+            self.session.runtime_handle().spawn(
+                async move {
+                    transport.close_statement(&statement_id).await.ok();
+                }
+                .instrument(span),
+            ),
+        )
+    }
+}
+
+impl Drop for TablesCloseGuard {
+    fn drop(&mut self) {
+        drop(self.start_close());
     }
 }
 
@@ -886,9 +898,9 @@ impl Metadata {
         Self::finish_metadata_call(telemetry, result)
     }
 
-    /// Resolve wildcard catalogs while speculating a literal-catalog query.
-    /// Reuse that successful result only for one byte-identical catalog match;
-    /// otherwise use the bounded per-catalog fan-out. Concatenate and re-sort
+    /// Resolve wildcard catalogs while speculating a narrow literal scope.
+    /// Reuse its result for the byte-identical matched catalog, if present;
+    /// use bounded fan-out for the other catalogs. Concatenate and re-sort
     /// the reshaped rows into JDBC order without a whole-workspace table scan.
     async fn list_tables_matching_catalogs(
         &self,
@@ -930,21 +942,21 @@ impl Metadata {
             Ok::<_, Error>((names, enumerated))
         };
         let speculative = async {
-            if !SqlCommandBuilder::pattern_has_wildcards(pattern) {
+            if !SqlCommandBuilder::pattern_has_wildcards(pattern) || literal.contains(['%', '*']) {
                 return None;
             }
-            self.try_fetch_tables_for_catalog(
-                literal.clone(),
-                schema_str.clone(),
-                table_str.clone(),
-                types_owned.clone(),
+            Some(
+                self.try_fetch_tables_for_catalog(
+                    literal.clone(),
+                    schema_str.clone(),
+                    table_str.clone(),
+                    types_owned.clone(),
+                )
+                .await,
             )
-            .await
-            .ok()
         };
         let (lookup, speculative) = futures::join!(lookup, speculative);
-        let (names, enumerated) = lookup?;
-        let mut speculative = speculative.filter(|_| names.len() == 1 && names[0] == literal);
+        let (mut names, enumerated) = lookup?;
         // One correlatable line tying the fan-out back to its cause: how
         // many catalogs a wildcard `list_tables` matched (and will query),
         // vs how many exist. Lets on-call spot fan-out amplification (a
@@ -972,14 +984,22 @@ impl Metadata {
         // catalogs.
         const MAX_INFLIGHT: usize = 8;
 
+        let mut all_batches: Vec<arrow_array::RecordBatch> = Vec::new();
+        if let Some(index) = names.iter().position(|name| name == &literal) {
+            match speculative {
+                Some(Ok(batches)) => {
+                    names.remove(index);
+                    all_batches = batches;
+                }
+                Some(Err(error)) if !thrift_shape::is_object_not_found(&error) => {
+                    return Err(error);
+                }
+                _ => {}
+            }
+        }
         let mut inflight = FuturesUnordered::new();
         let mut remaining = names.into_iter();
-        let mut all_batches: Vec<arrow_array::RecordBatch> = Vec::new();
         for name in remaining.by_ref().take(MAX_INFLIGHT) {
-            if let Some(batches) = speculative.take() {
-                all_batches.extend(batches);
-                continue;
-            }
             inflight.push(self.fetch_tables_for_catalog(
                 name,
                 schema_str.clone(),
@@ -1067,8 +1087,8 @@ impl Metadata {
         // out early: the fan-out opens one statement per catalog and
         // `ExecuteResult` has no Drop-based close, so a mid-stream read
         // error must still close this statement or it leaks server-side.
-        // TablesCloseGuard also reaps it if this future is dropped mid-read
-        // or during the explicit close below.
+        // TablesCloseGuard also reaps it if this future is dropped mid-read;
+        // an already-started close finishes independently of its awaiter.
         //
         // `close_id` returns an empty id when the server already reported
         // `status.state == Closed` (statement reaped server-side); skip the
@@ -1106,13 +1126,9 @@ impl Metadata {
         .await;
         // Best-effort close on every exit (success or error), unless the
         // statement was already closed server-side.
-        if let Some(guard) = &mut close_guard {
-            self.session
-                .transport()
-                .close_statement(&guard.statement_id)
-                .await
-                .ok();
-            guard.statement_id.clear();
+        let close_task = close_guard.as_mut().and_then(TablesCloseGuard::start_close);
+        if let Some(close_task) = close_task {
+            close_task.await.ok();
         }
         read
     }
