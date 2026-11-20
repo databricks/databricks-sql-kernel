@@ -16,6 +16,7 @@ changes go in their respective binding's NEXT_CHANGELOG.
 
 ### Changed
 
+- Sessions with matching HTTP settings on the same Tokio runtime reuse the HTTP connection pool. Pools are bounded and expire after 90 seconds without a new session; authentication and session state remain independent.
 - Rust ADBC requests identify themselves as `RustADBCDatabricksDriver/<version>`
   with an optional partner entry from `adbc.databricks.user_agent_entry`
   (`adbc.spark.user_agent_entry` is a compatibility alias). `User-Agent` in

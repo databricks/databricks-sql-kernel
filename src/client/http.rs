@@ -113,7 +113,7 @@ fn http_error(status: u16, body: &str, context: impl std::fmt::Display) -> Error
 /// When `url` is set, the driver uses the specified proxy for all requests,
 /// overriding `HTTP_PROXY`/`HTTPS_PROXY` environment variables. When `url`
 /// is `None`, reqwest's default behavior applies (reads env vars automatically).
-#[derive(Clone, Default)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct ProxyConfig {
     /// Proxy URL (e.g., "http://proxy.corp.example.com:8080").
     /// When set, overrides HTTP_PROXY/HTTPS_PROXY environment variables.
@@ -145,7 +145,7 @@ impl std::fmt::Debug for ProxyConfig {
 /// All fields default to the most secure settings (`None` = use defaults).
 /// Relaxing any of these options should only be done in development/testing
 /// environments.
-#[derive(Clone, Default)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct TlsConfig {
     /// Enable TLS for connections. When `false`, allows plain HTTP.
     /// Default: true (TLS enabled).
@@ -265,7 +265,7 @@ impl TlsConfig {
 }
 
 /// Configuration for the HTTP client.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HttpClientConfig {
     /// Whether authenticated SEA requests may negotiate HTTP response compression.
     pub sea_response_compression_enabled: bool,
@@ -395,8 +395,24 @@ impl DatabricksHttpClient {
     /// calling `execute()`. Use `execute_without_auth()` for requests that
     /// don't need authentication (e.g., OAuth token endpoint calls).
     pub fn new(
+        config: HttpClientConfig,
+        retry_configs: HashMap<RequestCategory, RetryConfig>,
+    ) -> Result<Self> {
+        Self::new_with_pool(config, retry_configs, None)
+    }
+
+    pub(crate) fn for_session(
+        host: &str,
+        config: HttpClientConfig,
+        retry_configs: HashMap<RequestCategory, RetryConfig>,
+    ) -> Result<Self> {
+        Self::new_with_pool(config, retry_configs, Some(host))
+    }
+
+    fn new_with_pool(
         mut config: HttpClientConfig,
         retry_configs: HashMap<RequestCategory, RetryConfig>,
+        pool_host: Option<&str>,
     ) -> Result<Self> {
         // Fold any caller-supplied `User-Agent` custom header into the
         // effective UA, and remove it from `custom_headers` so it isn't
@@ -479,7 +495,8 @@ impl DatabricksHttpClient {
         }
 
         // Follow redirects for normal traffic (reqwest's default policy).
-        let client = Self::build_reqwest_client(&config, reqwest::redirect::Policy::default())?;
+        let client =
+            Self::build_reqwest_client(&config, reqwest::redirect::Policy::default(), pool_host)?;
 
         // Surface which TLS backend was compiled in so oncall debugging
         // a handshake / unknown-CA report can tell at a glance whether
@@ -514,6 +531,7 @@ impl DatabricksHttpClient {
     fn build_reqwest_client(
         config: &HttpClientConfig,
         redirect: reqwest::redirect::Policy,
+        pool_host: Option<&str>,
     ) -> Result<Client> {
         let mut builder = Client::builder()
             .connect_timeout(config.connect_timeout)
@@ -700,9 +718,15 @@ impl DatabricksHttpClient {
             debug!("HTTP client using default proxy behavior (env vars)");
         }
 
-        builder.build().map_err(|e| {
-            Error::invalid_argument().message(format!("Failed to create HTTP client: {e}"))
-        })
+        let build = || {
+            builder.build().map_err(|e| {
+                Error::invalid_argument().message(format!("Failed to create HTTP client: {e}"))
+            })
+        };
+        match pool_host {
+            Some(host) => super::pool::shared_client(host, config, build),
+            None => build(),
+        }
     }
 
     /// Creates a new HTTP client with default retry configs for all request categories.
@@ -805,7 +829,8 @@ impl DatabricksHttpClient {
     /// `azure_tenant_id` (which skips discovery entirely). A single hop is
     /// sufficient for discovery, so no retry is attempted here.
     pub async fn first_redirect_location(&self, url: &str) -> Result<Option<String>> {
-        let client = Self::build_reqwest_client(&self.config, reqwest::redirect::Policy::none())?;
+        let client =
+            Self::build_reqwest_client(&self.config, reqwest::redirect::Policy::none(), None)?;
         let response = client.get(url).send().await.map_err(|e| {
             Error::network_error().message(format!("Redirect-probe request to {url} failed: {e}"))
         })?;
