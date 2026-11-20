@@ -243,9 +243,11 @@ mod tests {
             .unwrap();
         let check = |changed: PoolKey| assert!(pool.get(&changed).is_none());
         check(key("other-host"));
-        let mut changed = key("host");
-        changed.proxy_env[0] = Some("http://other-proxy".into());
-        check(changed);
+        for index in 0..PROXY_ENV.len() {
+            let mut changed = key("host");
+            changed.proxy_env[index] = Some("http://other-proxy".into());
+            check(changed);
+        }
         let mut changed = key("host");
         changed.root_file = Some(("root.pem".into(), [1; 32]));
         check(changed);
@@ -380,5 +382,127 @@ mod tests {
         cleanup.abort();
         assert!(cleanup.await.unwrap_err().is_cancelled());
         assert!(weak.upgrade().is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cleanup_retains_recent_clients() {
+        let pool = Arc::new(ClientPool::default());
+        pool.get_or_build(key("host"), || Ok(Client::new()))
+            .unwrap();
+        let weak = Arc::downgrade(&pool);
+        let cleanup = tokio::spawn(expire_idle_clients(Handle::current().id(), pool));
+        tokio::task::yield_now().await;
+        tokio::time::advance(SWEEP_INTERVAL).await;
+        tokio::task::yield_now().await;
+        assert!(!cleanup.is_finished());
+        assert!(weak.upgrade().is_some());
+        tokio::time::advance(IDLE_TIMEOUT).await;
+        cleanup.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cleanup_does_not_detach_a_cache_held_by_a_builder() {
+        let pool = Arc::new(ClientPool::default());
+        let cleanup = tokio::spawn(expire_idle_clients(Handle::current().id(), pool.clone()));
+        tokio::task::yield_now().await;
+        tokio::time::advance(SWEEP_INTERVAL).await;
+        tokio::task::yield_now().await;
+        assert!(!cleanup.is_finished());
+        pool.get_or_build(key("host"), || Ok(Client::new()))
+            .unwrap();
+        drop(pool);
+        tokio::time::advance(IDLE_TIMEOUT + SWEEP_INTERVAL).await;
+        cleanup.await.unwrap();
+    }
+
+    #[test]
+    fn dynamic_trust_and_disabled_pooling_bypass_reuse() {
+        let marker = "KERNEL_POOL_BYPASS_TEST";
+        let Some(mode) = std::env::var_os(marker) else {
+            for mode in ["normal", "directory", "unreadable"] {
+                let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+                child
+                    .args([
+                        "--exact",
+                        "client::pool::tests::dynamic_trust_and_disabled_pooling_bypass_reuse",
+                        "--nocapture",
+                    ])
+                    .env(marker, mode)
+                    .env_remove("SSL_CERT_FILE")
+                    .env_remove("SSL_CERT_DIR");
+                match mode {
+                    "directory" => {
+                        child.env("SSL_CERT_DIR", "/unreadable/certificate/directory");
+                    }
+                    "unreadable" => {
+                        child.env("SSL_CERT_FILE", "/unreadable/certificate/file");
+                    }
+                    _ => {}
+                }
+                assert!(
+                    child.status().unwrap().success(),
+                    "bypass test mode {mode} failed"
+                );
+            }
+            return;
+        };
+        let check = |config: HttpClientConfig, expected| {
+            let builds = AtomicUsize::new(0);
+            for _ in 0..2 {
+                shared_client("host", &config, || {
+                    builds.fetch_add(1, Ordering::SeqCst);
+                    Ok(Client::new())
+                })
+                .unwrap();
+            }
+            assert_eq!(builds.load(Ordering::SeqCst), expected);
+        };
+        check(HttpClientConfig::default(), 2);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            check(
+                HttpClientConfig::default(),
+                if mode == "normal" { 1 } else { 2 },
+            );
+            let disabled = HttpClientConfig {
+                max_connections_per_host: 0,
+                ..HttpClientConfig::default()
+            };
+            check(disabled, 2);
+            let mut dynamic = HttpClientConfig::default();
+            dynamic.tls.trusted_certificate_path = Some("root.pem".into());
+            check(dynamic, 2);
+        });
+    }
+
+    #[test]
+    fn runtime_registry_is_bounded_and_shutdown_releases_clients() {
+        let runtimes: Vec<_> = (0..=MAX_RUNTIMES)
+            .map(|_| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+            })
+            .collect();
+        let mut weak_pools = Vec::new();
+        for runtime in &runtimes[..MAX_RUNTIMES] {
+            let pool = runtime_pool(runtime.handle()).unwrap();
+            assert!(Arc::ptr_eq(&pool, &runtime_pool(runtime.handle()).unwrap()));
+            pool.get_or_build(key("host"), || Ok(Client::new()))
+                .unwrap();
+            weak_pools.push(Arc::downgrade(&pool));
+        }
+        assert!(runtime_pool(runtimes[MAX_RUNTIMES].handle()).is_none());
+        drop(runtimes);
+        assert!(weak_pools.iter().all(|pool| pool.upgrade().is_none()));
+        let replacement = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        assert!(runtime_pool(replacement.handle()).is_some());
     }
 }
