@@ -208,22 +208,29 @@ pub(crate) fn revocation_mode(
     (check == Some(true)).then(|| accept_undetermined == Some(true))
 }
 
+/// The reason a revocation request cannot be honoured on this build, or `None` when it can.
+/// Revocation is implemented only on Windows with `tls-rustls`. Pure, so every platform and
+/// backend combination is testable on any host.
+pub(crate) fn revocation_unsupported_message(windows: bool, rustls: bool) -> Option<&'static str> {
+    match (windows, rustls) {
+        (true, true) => None,
+        (true, false) => {
+            Some("TLS certificate revocation checking requires the tls-rustls backend")
+        }
+        (false, _) => Some("TLS certificate revocation checking is supported only on Windows"),
+    }
+}
+
 /// Rejects a revocation request that this platform or backend cannot honour, with
-/// `InvalidArgument`. Revocation is implemented only on Windows with `tls-rustls`.
-/// `allow_self_signed` turns revocation off, so it is not an error.
+/// `InvalidArgument`. `allow_self_signed` turns revocation off, so it is not an error.
 pub(crate) fn check_revocation_support(tls: &TlsConfig, revocation: Option<bool>) -> Result<()> {
     if revocation.is_none() || tls.allow_self_signed == Some(true) {
         return Ok(());
     }
-    if cfg!(all(windows, feature = "tls-rustls")) {
-        return Ok(());
+    match revocation_unsupported_message(cfg!(windows), cfg!(feature = "tls-rustls")) {
+        Some(message) => Err(Error::invalid_argument().message(message)),
+        None => Ok(()),
     }
-    let message = if cfg!(windows) {
-        "TLS certificate revocation checking requires the tls-rustls backend"
-    } else {
-        "TLS certificate revocation checking is supported only on Windows"
-    };
-    Err(Error::invalid_argument().message(message))
 }
 
 impl std::fmt::Debug for TlsConfig {
@@ -1141,6 +1148,28 @@ impl DatabricksHttpClient {
 #[cfg(test)]
 #[path = "http_tls_tests.rs"]
 mod tls_tests;
+
+#[cfg(test)]
+mod revocation_support_tests {
+    use super::revocation_unsupported_message;
+
+    #[test]
+    fn revocation_message_covers_every_platform_and_backend() {
+        assert_eq!(revocation_unsupported_message(true, true), None);
+        assert_eq!(
+            revocation_unsupported_message(true, false),
+            Some("TLS certificate revocation checking requires the tls-rustls backend")
+        );
+        assert_eq!(
+            revocation_unsupported_message(false, true),
+            Some("TLS certificate revocation checking is supported only on Windows")
+        );
+        assert_eq!(
+            revocation_unsupported_message(false, false),
+            Some("TLS certificate revocation checking is supported only on Windows")
+        );
+    }
+}
 
 #[cfg(test)]
 mod tests {
