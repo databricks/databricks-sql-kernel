@@ -24,6 +24,13 @@
 //! The decision reads the chain-level revocation bits only. The trust bits, including the
 //! root's, are ignored.
 //!
+//! The check is synchronous, because rustls' verifier is. It runs inside the handshake poll
+//! and blocks until CryptoAPI returns. On a multi-thread runtime, `block_in_place` lets the
+//! worker's other tasks run elsewhere, but the calling task cannot be cancelled until
+//! CryptoAPI returns. A caller's connect or operation timeout can therefore be exceeded by
+//! up to the revocation budget. This applies only with revocation on. On a `current_thread`
+//! runtime the whole runtime waits, because `block_in_place` is not used there.
+//!
 //! This module is compiled only on Windows with `tls-rustls`. Elsewhere, revocation is
 //! rejected at session open.
 
@@ -47,11 +54,23 @@ use windows_sys::Win32::Security::Cryptography::{
     X509_ASN_ENCODING,
 };
 
+#[cfg(test)]
+use windows_sys::Win32::Foundation::GetLastError;
+// The four bits already imported above (OFFLINE_REVOCATION, PARTIAL_CHAIN, REVOKED,
+// REVOCATION_STATUS_UNKNOWN) are not repeated here.
+#[cfg(test)]
+use windows_sys::Win32::Security::Cryptography::{
+    CERT_TRUST_IS_CYCLIC, CERT_TRUST_IS_NOT_SIGNATURE_VALID, CERT_TRUST_IS_NOT_TIME_VALID,
+    CERT_TRUST_IS_NOT_VALID_FOR_USAGE, CERT_TRUST_IS_UNTRUSTED_ROOT,
+    CERT_TRUST_NO_ISSUANCE_CHAIN_POLICY,
+};
+
 use super::http::TlsConfig;
 use crate::kernel_error::{Error, Result};
 
 /// The budget for CRL and OCSP retrieval for one chain. CryptoAPI applies it to all of the
-/// chain's fetches together (`CERT_CHAIN_REVOCATION_ACCUMULATIVE_TIMEOUT`).
+/// chain's revocation fetches together (`CERT_CHAIN_REVOCATION_ACCUMULATIVE_TIMEOUT`). It does
+/// not bound AIA or other chain-building fetches, which use the per-URL timeout only.
 const REVOCATION_TIMEOUT: Duration = Duration::from_secs(10);
 /// The chain flags: check every certificate except the root.
 const CHAIN_FLAGS: u32 =
@@ -143,6 +162,69 @@ impl ChainContext {
     }
 }
 
+#[cfg(test)]
+impl ChainContext {
+    /// Test-only: the chain's shape and trust bits, by name, for diagnosing a failing run.
+    fn describe(&self) -> String {
+        // SAFETY: the chain is live for the call. Every read is of a field CryptoAPI sets, and
+        // each pointer is valid for the count that bounds it (`cChain`, `cElement`).
+        unsafe {
+            let chain = &*self.0;
+            let mut out = format!(
+                "cChain={} error=[{}] info=0x{:x}",
+                chain.cChain,
+                trust_names(chain.TrustStatus.dwErrorStatus),
+                chain.TrustStatus.dwInfoStatus
+            );
+            for i in 0..chain.cChain as usize {
+                let simple = &**chain.rgpChain.add(i);
+                out += &format!(
+                    " | simple[{i}] cElement={} error=[{}]",
+                    simple.cElement,
+                    trust_names(simple.TrustStatus.dwErrorStatus)
+                );
+                for j in 0..simple.cElement as usize {
+                    let element = &**simple.rgpElement.add(j);
+                    out += &format!(
+                        " | element[{j}] error=[{}] info=0x{:x} revocation_info={}",
+                        trust_names(element.TrustStatus.dwErrorStatus),
+                        element.TrustStatus.dwInfoStatus,
+                        !element.pRevocationInfo.is_null()
+                    );
+                }
+            }
+            out
+        }
+    }
+}
+
+/// Test-only: the names of the trust error bits set in `bits`.
+#[cfg(test)]
+fn trust_names(bits: u32) -> String {
+    const NAMES: &[(u32, &str)] = &[
+        (CERT_TRUST_IS_NOT_TIME_VALID, "NOT_TIME_VALID"),
+        (CERT_TRUST_IS_REVOKED, "REVOKED"),
+        (CERT_TRUST_IS_NOT_SIGNATURE_VALID, "NOT_SIGNATURE_VALID"),
+        (CERT_TRUST_IS_NOT_VALID_FOR_USAGE, "NOT_VALID_FOR_USAGE"),
+        (CERT_TRUST_IS_UNTRUSTED_ROOT, "UNTRUSTED_ROOT"),
+        (CERT_TRUST_REVOCATION_STATUS_UNKNOWN, "REVOCATION_STATUS_UNKNOWN"),
+        (CERT_TRUST_IS_CYCLIC, "CYCLIC"),
+        (CERT_TRUST_IS_PARTIAL_CHAIN, "PARTIAL_CHAIN"),
+        (CERT_TRUST_IS_OFFLINE_REVOCATION, "OFFLINE_REVOCATION"),
+        (CERT_TRUST_NO_ISSUANCE_CHAIN_POLICY, "NO_ISSUANCE_CHAIN_POLICY"),
+    ];
+    let names: Vec<&str> = NAMES
+        .iter()
+        .filter(|(bit, _)| bits & bit != 0)
+        .map(|(_, name)| *name)
+        .collect();
+    if names.is_empty() {
+        "none".to_owned()
+    } else {
+        names.join(",")
+    }
+}
+
 impl Drop for ChainContext {
     fn drop(&mut self) {
         // SAFETY: the chain came from `CertGetCertificateChain` and is freed once.
@@ -169,6 +251,7 @@ fn cryptoapi_status(leaf: &[u8], intermediates: &[&[u8]], custom_cas: &[&[u8]]) 
     };
     let para = CERT_CHAIN_PARA {
         cbSize: std::mem::size_of::<CERT_CHAIN_PARA>() as u32,
+        // Per-URL timeout for chain-building fetches (AIA). It is not a total.
         dwUrlRetrievalTimeout: REVOCATION_TIMEOUT.as_millis() as u32,
         ..Default::default()
     };
@@ -188,9 +271,18 @@ fn cryptoapi_status(leaf: &[u8], intermediates: &[&[u8]], custom_cas: &[&[u8]]) 
         )
     };
     if built == 0 || chain.is_null() {
+        // SAFETY: GetLastError reads the calling thread's last error and has no other effect.
+        #[cfg(test)]
+        eprintln!(
+            "revocation diagnostics: CertGetCertificateChain failed, GetLastError={}",
+            unsafe { GetLastError() }
+        );
         return Status::Undetermined;
     }
-    ChainContext(chain).status()
+    let chain = ChainContext(chain);
+    #[cfg(test)]
+    eprintln!("revocation diagnostics: {}", chain.describe());
+    chain.status()
 }
 
 /// Runs a blocking wait. On a multi-thread runtime, block_in_place moves the worker's

@@ -398,6 +398,11 @@ impl CrlServer {
         self.requests.lock().unwrap().len()
     }
 
+    /// The request paths received so far, in order, for diagnosing a failing run.
+    fn paths(&self) -> Vec<String> {
+        self.requests.lock().unwrap().clone()
+    }
+
     fn handle(&self, mut stream: TcpStream) {
         let Some(head) = read_head(&mut stream) else {
             return;
@@ -475,6 +480,7 @@ async fn check(scenario: &Scenario, accept: bool, want: Outcome) {
     let fx = fixture(scenario.leaf, scenario.intermediate, "127.0.0.1");
     let label = format!("{} (accept_undetermined={accept})", scenario.name);
     let result = get(revocation_config(&fx.pki.root_pem), Some(accept), fx.addr).await;
+    eprintln!("{label}: result={result:?} crl_requests={:?}", fx.crl.paths());
     match (want, &result) {
         (Outcome::Pass, Ok(())) => {}
         (Outcome::Revoked, Err(err)) => assert!(err.contains("revoked"), "{label}: {err}"),
