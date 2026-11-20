@@ -230,7 +230,8 @@ enum CircuitBreakerState {
 
 /// Process-global registry of per-host circuit breakers.
 ///
-/// The `breakers` map is keyed by `(host, config)` and holds one entry per
+/// The `breakers` map is keyed by `(cache key, config)`, where the cache key is the host and the
+/// effective revocation mode from `telemetry_cache_key`, and holds one entry per
 /// distinct host a process talks to. Entries are never evicted, so the map
 /// grows monotonically for the process lifetime. This is intentional and
 /// bounded in practice: a kernel process connects to a small, stable set of
@@ -545,6 +546,32 @@ mod tests {
         // The genuine probe then succeeds and recovery closes the circuit.
         probe.record_success();
         assert_eq!(breaker.state_for_test(), CircuitBreakerState::Closed);
+    }
+
+    #[test]
+    fn different_revocation_modes_get_different_breakers() {
+        // Sessions to one host with different revocation modes share no breaker, as they share
+        // no telemetry client.
+        use crate::telemetry::runtime::telemetry_cache_key;
+
+        let host = unique_host("revocation-modes");
+        let config = CircuitBreakerConfig::from_telemetry_config(&TelemetryConfig {
+            enabled: Some(true),
+            ..TelemetryConfig::default()
+        })
+        .expect("circuit breaker config");
+        let off =
+            CircuitBreakerManager::global().get_or_create(&telemetry_cache_key(host, None), config);
+        let strict = CircuitBreakerManager::global()
+            .get_or_create(&telemetry_cache_key(host, Some(false)), config);
+        let tolerant = CircuitBreakerManager::global()
+            .get_or_create(&telemetry_cache_key(host, Some(true)), config);
+        assert!(!Arc::ptr_eq(&off, &strict));
+        assert!(!Arc::ptr_eq(&strict, &tolerant));
+        // The same key still shares a breaker.
+        let again = CircuitBreakerManager::global()
+            .get_or_create(&telemetry_cache_key(host, Some(false)), config);
+        assert!(Arc::ptr_eq(&strict, &again));
     }
 
     #[tokio::test]

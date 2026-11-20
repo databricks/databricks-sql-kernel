@@ -47,6 +47,7 @@ impl TelemetryRuntime {
         config: &TelemetryConfig,
         connection: &ConnectionConfig,
         auth: &AuthConfig,
+        tls: &crate::config::TlsConfig,
         system_configuration: Option<DriverSystemConfiguration>,
         http_client: Arc<DatabricksHttpClient>,
         session_id: String,
@@ -63,7 +64,7 @@ impl TelemetryRuntime {
                 .and_then(|org_id| org_id.parse::<i64>().ok())
                 .unwrap_or_default(),
             system_configuration: build_system_configuration(system_configuration),
-            connection_params: build_connection_params(connection, auth),
+            connection_params: build_connection_params(connection, auth, tls),
             auth_type: auth_type(auth),
         });
         let cache_key = telemetry_cache_key(&connection.host, http_client.revocation());
@@ -326,6 +327,9 @@ fn exporter_for_config(
     connection: &ConnectionConfig,
     http_client: Arc<DatabricksHttpClient>,
 ) -> (Arc<dyn TelemetryExporter>, bool) {
+    // The circuit breaker follows the client cache key, so sessions with different revocation
+    // modes to one host get separate breakers.
+    let breaker_key = telemetry_cache_key(&connection.host, http_client.revocation());
     #[cfg(test)]
     {
         if let Some(exporter) = config.exporter.clone() {
@@ -333,16 +337,13 @@ fn exporter_for_config(
             // parallel tests commonly reuse the same mock host with different
             // capturing exporters, and cache reuse would route events to the
             // exporter from whichever test created the host client first.
-            return (
-                maybe_wrap_exporter(&connection.host, config, exporter),
-                true,
-            );
+            return (maybe_wrap_exporter(&breaker_key, config, exporter), true);
         }
     }
 
     (
         maybe_wrap_exporter(
-            &connection.host,
+            &breaker_key,
             config,
             Arc::new(DatabricksTelemetryExporter::new(
                 &connection.host,
@@ -357,6 +358,10 @@ fn exporter_for_config(
 /// The per-host telemetry client cache key. A cached client holds the HTTP client of the
 /// session that created it, so the revocation mode is part of the key: sessions to one host
 /// with different revocation settings must not share a client.
+///
+/// Limit: the key covers the host and the effective revocation mode only. Sessions to one host
+/// with different custom CA, self-signed, mTLS or proxy settings still share a telemetry client,
+/// as they did before revocation was added. Per-session isolation is a follow-up.
 pub(super) fn telemetry_cache_key(host: &str, revocation: Option<bool>) -> String {
     let mode = match revocation {
         None => "off",
@@ -413,11 +418,16 @@ fn merge_system_configuration(
     }
 }
 
+/// Connection parameters for telemetry. The revocation fields carry the session's configured
+/// values, as JDBC reports them, and are unset when the session did not set them.
 fn build_connection_params(
     connection: &ConnectionConfig,
     auth: &AuthConfig,
+    tls: &crate::config::TlsConfig,
 ) -> DriverConnectionParameters {
     DriverConnectionParameters {
+        check_certificate_revocation: tls.check_certificate_revocation,
+        accept_undetermined_certificate_revocation: tls.accept_undetermined_certificate_revocation,
         http_path: Some(format!("/sql/1.0/warehouses/{}", connection.warehouse_id)),
         mode: Some(DriverMode::Sea),
         host_info: Some(HostDetails {
@@ -484,6 +494,32 @@ fn duration_millis(duration: Duration) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connection_params_report_the_configured_revocation_values() {
+        let connection = ConnectionConfig::new("https://example.cloud.databricks.com", "wh");
+        let auth = AuthConfig::Pat {
+            token: "dapi-test".into(),
+            identity_federation_client_id: None,
+        };
+
+        let set = crate::config::TlsConfig {
+            check_certificate_revocation: Some(true),
+            accept_undetermined_certificate_revocation: Some(false),
+            ..Default::default()
+        };
+        let params = build_connection_params(&connection, &auth, &set);
+        assert_eq!(params.check_certificate_revocation, Some(true));
+        assert_eq!(
+            params.accept_undetermined_certificate_revocation,
+            Some(false)
+        );
+
+        let unset = crate::config::TlsConfig::default();
+        let params = build_connection_params(&connection, &auth, &unset);
+        assert_eq!(params.check_certificate_revocation, None);
+        assert_eq!(params.accept_undetermined_certificate_revocation, None);
+    }
 
     #[test]
     fn pat_auth_has_no_driver_auth_flow() {

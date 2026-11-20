@@ -460,6 +460,7 @@ impl Session {
             &telemetry_config,
             &config.connection,
             &config.auth,
+            &config.tls,
             config.driver_system_configuration.clone(),
             http_client,
             session_info.session_id.clone(),
