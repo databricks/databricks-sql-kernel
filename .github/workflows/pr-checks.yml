@@ -238,3 +238,35 @@ jobs:
 
       - name: Test client behavior (tls-rustls)
         run: "cargo test -p databricks-sql-kernel --no-default-features --features tls-rustls --lib client::"
+
+  windows-revocation:
+    # The Windows-only revocation module (`client::tls_revocation`) and its tests compile
+    # only on Windows, so the Linux jobs above never build or run them. Same runner label
+    # and toolchain setup as the Windows job in `release-debuginfo.yml`.
+    name: Windows revocation (tls-rustls)
+    runs-on:
+      group: databricks-protected-runner-group
+      labels: [windows-server-latest]
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: ./.github/actions/setup-jfrog
+        with:
+          cargo: "true"
+
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          toolchain: stable
+          components: clippy
+
+      - name: Set up MSVC environment
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
+        with:
+          arch: x64
+
+      - name: cargo clippy (tls-rustls, Windows)
+        run: cargo clippy -p databricks-sql-kernel --no-default-features --features tls-rustls --all-targets -- -D warnings
+
+      - name: Test Windows revocation (tls-rustls)
+        run: cargo test -p databricks-sql-kernel --no-default-features --features tls-rustls --lib client::tls_revocation
