@@ -376,7 +376,7 @@ impl Session {
         // 2. Auth provider — async because OAuth flows hit the OIDC
         //    discovery endpoint.
         let auth_provider: Arc<dyn AuthProvider> =
-            build_auth_provider(&config.auth, &host, http_client.clone()).await?;
+            build_auth_provider(&config.auth, &host, &http_client).await?;
         http_client.set_auth_provider(auth_provider);
         // Authenticate before the feature-flag prefetch, which swallows its
         // errors: otherwise a failed token request is sent again by
@@ -390,11 +390,6 @@ impl Session {
         //    from a Weak (a strong Arc would leak the pair), install it.
         let defaults = config.defaults.clone().unwrap_or_default();
         let transport_config = TransportConfig {
-            // Thread the connection-level CloudFetch toggle onto the
-            // transport so every ExecuteStatement picks the right SEA
-            // disposition (INLINE_OR_EXTERNAL_LINKS vs INLINE). This is
-            // how cloud-fetch is disabled on SEA — see TransportConfig
-            // and issue #196; there is no CAN_CLOUD_DOWNLOAD session conf.
             cloudfetch_enabled: config.result.cloudfetch_enabled,
             ..TransportConfig::default()
         };
@@ -422,10 +417,8 @@ impl Session {
             "creating session"
         );
 
-        // CloudFetch-disable is expressed per-statement via the SEA
-        // `disposition` (threaded onto `TransportConfig` above), not via a
-        // session conf. The kernel synthesises no geospatial session-conf
-        // entry; caller-supplied server-bound entries pass through unchanged.
+        // The kernel synthesises no geospatial session-conf entry;
+        // caller-supplied server-bound entries pass through unchanged.
         // Resolve connector-service flags after authentication and immediately
         // before CreateSession. The resolver populates the process-wide
         // workspace cache; the session retains no private snapshot.
@@ -1253,9 +1246,11 @@ fn build_retry_configs_for_session(
 /// Matched case-insensitively. If a host sets two spellings of the same key
 /// differing only in case, the lexicographically-last spelling wins
 /// deterministically and all variants are stripped.
+/// An explicit typed CloudFetch disable takes precedence over the mixed bag.
 fn apply_client_result_overrides(config: &mut SessionConfig) {
     use crate::config::ClientConfKey;
 
+    let cloudfetch_disabled = !config.result.cloudfetch_enabled;
     // Recognised client keys currently present in session_conf. A key is
     // "recognised" iff it parses to a ClientConfKey (case-insensitive).
     let mut present: Vec<String> = config
@@ -1286,6 +1281,12 @@ fn apply_client_result_overrides(config: &mut SessionConfig) {
                 "ignoring invalid client-side result knob in session_conf; keeping current value",
             );
         }
+    }
+    if cloudfetch_disabled && config.result.cloudfetch_enabled {
+        crate::klog::warn!(
+            "Ignoring cloudfetch_enabled=true in session configuration because the client option disables CloudFetch"
+        );
+        config.result.cloudfetch_enabled = false;
     }
 }
 
@@ -1382,18 +1383,18 @@ fn resolve_u2m_bundle(
 async fn build_auth_provider(
     auth: &AuthConfig,
     host: &str,
-    http_client: Arc<DatabricksHttpClient>,
+    http_client: &Arc<DatabricksHttpClient>,
 ) -> Result<Arc<dyn AuthProvider>> {
     // Build the base provider for the configured auth flow, then wrap it with
     // mandatory OIDC token exchange (BYOT federation). The wrapper is a no-op
     // for non-JWT and same-host-issuer tokens, so it is safe to apply
     // unconditionally across PAT / M2M / U2M. See `auth::oauth::federation`.
-    let base = build_base_auth_provider(auth, host, http_client.clone()).await?;
+    let base = build_base_auth_provider(auth, host, http_client).await?;
     let provider = FederationProvider::new(
         base,
         host,
         auth.identity_federation_client_id().map(str::to_owned),
-        &http_client,
+        http_client,
     )
     .await?;
     Ok(Arc::new(provider))
@@ -1404,7 +1405,7 @@ async fn build_auth_provider(
 async fn build_base_auth_provider(
     auth: &AuthConfig,
     host: &str,
-    http_client: Arc<DatabricksHttpClient>,
+    http_client: &Arc<DatabricksHttpClient>,
 ) -> Result<Arc<dyn AuthProvider>> {
     match auth {
         AuthConfig::Pat { token, .. } => {
@@ -1507,7 +1508,7 @@ async fn build_base_auth_provider(
             }
             let tenant = match azure_tenant_id {
                 Some(t) if !t.is_empty() => t.clone(),
-                _ => azure::discover_tenant(host, &http_client).await?,
+                _ => azure::discover_tenant(host, http_client).await?,
             };
             let provider = AzureServicePrincipalProvider::new(
                 host,
@@ -2045,6 +2046,23 @@ mod retry_config_tests {
             cfg.result.cloudfetch_max_chunks_in_memory,
             crate::config::CLOUDFETCH_MAX_CHUNKS_CEILING,
         );
+    }
+
+    #[test]
+    fn typed_cloudfetch_disable_takes_precedence_over_session_conf() {
+        for key in ["cloudfetch_enabled", "CLOUDFETCH_ENABLED"] {
+            let mut cfg = config_with_session_conf(HashMap::from([
+                (key.to_string(), "true".to_string()),
+                ("TIMEZONE".to_string(), "UTC".to_string()),
+            ]));
+            cfg.result.cloudfetch_enabled = false;
+            apply_client_result_overrides(&mut cfg);
+            assert!(!cfg.result.cloudfetch_enabled);
+            assert_eq!(
+                cfg.session_conf,
+                HashMap::from([("TIMEZONE".to_string(), "UTC".to_string())])
+            );
+        }
     }
 
     /// All six client-side result knobs are recognised in session_conf,
@@ -3072,8 +3090,8 @@ mod is_open_tests {
         );
         assert_eq!(
             detail["n_operation_status_calls"].as_i64(),
-            Some(2),
-            "only owning status and await polls contribute to execution telemetry"
+            Some(1),
+            "only the owning status request contributes; await consumes its response"
         );
         assert!(
             detail["operation_status_latency_millis"]

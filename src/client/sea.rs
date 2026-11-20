@@ -102,7 +102,7 @@ struct ExecutionRequest {
 ///
 /// Used by the shared decoder [`SeaRestTransport::terminal_outcome`]
 /// so the sync polling loop and the async one-shot
-/// [`Transport::fetch_completed_result`] path produce identical
+/// [`Transport::completed_result`] materialisation produce identical
 /// outcomes (and identical errors) for `FAILED` / `CANCELLED` responses.
 enum StatementOutcome {
     /// Terminal success — `Succeeded` OR `Closed` (with or without inline
@@ -499,7 +499,7 @@ impl SeaRestTransport {
     /// Decode a single SEA `ExecuteResponse` into a terminal outcome.
     ///
     /// Shared by synchronous execution after it observes a raw terminal state and
-    /// [`Transport::fetch_completed_result`] (async one-shot fetch), so both paths
+    /// [`Transport::completed_result`] (async materialisation), so both paths
     /// produce identical errors for `FAILED` / `CANCELLED`.
     /// `CLOSED` (with or without result data) is a terminal success — JDBC
     /// parity; an empty `CLOSED` materialises an empty result downstream.
@@ -658,30 +658,6 @@ impl SeaRestTransport {
     ) -> Result<ExecuteResponse> {
         let url = format!("{}/statements", self.base_url());
 
-        // Select the result disposition per statement from the
-        // connection-level CloudFetch setting, mirroring the reference
-        // JDBC driver's SEA path (`DatabricksSdkClient.getRequest`:
-        // `cloudFetch ? INLINE_OR_EXTERNAL_LINKS : INLINE`). This is the
-        // authoritative mechanism for disabling cloud-fetch on SEA —
-        // there is NO `CAN_CLOUD_DOWNLOAD` session conf (the server
-        // rejects it at ExecuteStatement with `CONFIG_NOT_AVAILABLE`,
-        // issue #196).
-        //
-        // `INLINE`: the server serves every result inline (Arrow bytes in
-        // the response `attachment`), regardless of size. `format` stays
-        // `ARROW_STREAM` — the kernel's inline reader consumes Arrow IPC
-        // from the attachment (the SEA inline-Arrow path), so unlike JDBC
-        // we keep Arrow rather than switching to `JSON_ARRAY`.
-        //
-        // `INLINE_OR_EXTERNAL_LINKS` (the CloudFetch-enabled default): not
-        // a public API disposition but enables returning all chunk links
-        // in a single response (requires the JDBC user agent). Once
-        // EXTERNAL_LINKS supports multi-link responses, switch back to it.
-        let disposition = if self.config.cloudfetch_enabled {
-            "INLINE_OR_EXTERNAL_LINKS"
-        } else {
-            "INLINE"
-        };
         let (warehouse_id, session_id) = match self.session_route.get() {
             Some(SessionRoute::Standard { .. }) | None => (
                 Some(self.warehouse_id.clone()),
@@ -696,7 +672,7 @@ impl SeaRestTransport {
             session_version: self.current_session_version(),
             catalog: params.catalog.clone(),
             schema: params.schema.clone(),
-            disposition: disposition.to_string(),
+            disposition: "INLINE_OR_EXTERNAL_LINKS".to_string(),
             format: "ARROW_STREAM".to_string(),
             wait_timeout: params.wait_timeout.clone(),
             on_wait_timeout: params.on_wait_timeout.clone(),
@@ -1156,9 +1132,14 @@ impl Transport for SeaRestTransport {
         &self,
         catalog: Option<&str>,
         schema: Option<&str>,
-        session_config: HashMap<String, String>,
+        mut session_config: HashMap<String, String>,
     ) -> Result<SessionInfo> {
         let url = self.warehouse_sessions_url();
+
+        if !self.config.cloudfetch_enabled {
+            session_config.retain(|key, _| !key.eq_ignore_ascii_case("can_cloud_download"));
+            session_config.insert("can_cloud_download".to_string(), "false".to_string());
+        }
 
         let request_body = CreateSessionRequest {
             warehouse_id: None,
@@ -1389,14 +1370,11 @@ impl Transport for SeaRestTransport {
         }
     }
 
-    async fn fetch_completed_result(
+    async fn completed_result(
         &self,
-        statement_id: &str,
+        response: ExecuteResponse,
         session_attribution: SessionAttribution,
     ) -> Result<Option<ExecuteResult>> {
-        let response = self
-            .get_statement_status(statement_id, session_attribution)
-            .await?;
         match Self::terminal_outcome(response) {
             StatementOutcome::Done(r) => {
                 let reader_factory = self.reader_factory()?;
@@ -1537,18 +1515,12 @@ impl Transport for SeaRestTransport {
             ))
         })?;
 
-        // Inline-Arrow path: bytes must be present in `attachment`.
-        // If the server returned an external_links response on what
-        // we expected to be the inline path, surface a clear error
-        // (probably the `disposition = INLINE` on the execute request
-        // didn't take effect server-side).
         let bytes = chunks_response.attachment.ok_or_else(|| {
             Error::data_loss().message(format!(
                 "Inline chunk {} response missing `attachment` field — \
-                 server may have ignored the INLINE disposition and \
-                 returned a CloudFetch response. Body: {}",
-                chunk_index,
-                String::from_utf8_lossy(&body)
+                 server did not return inline Arrow data and \
+                 returned a CloudFetch response",
+                chunk_index
             ))
         })?;
 

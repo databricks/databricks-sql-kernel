@@ -40,7 +40,7 @@ use oauth2::{
     AuthUrl, ClientId, ClientSecret, HttpRequest, HttpResponse, RequestTokenError, Scope,
     TokenResponse, TokenUrl,
 };
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use tokio::runtime::Handle as RuntimeHandle;
 
 /// OAuth provider for M2M (Machine-to-Machine) authentication.
@@ -73,7 +73,7 @@ use tokio::runtime::Handle as RuntimeHandle;
 ///     "https://my-workspace.cloud.databricks.com",
 ///     "my-client-id",
 ///     "my-client-secret",
-///     http_client,
+///     &http_client,
 /// ).await?;
 ///
 /// // Get auth header (will trigger initial token fetch)
@@ -92,8 +92,9 @@ pub struct ClientCredentialsProvider {
     auth_endpoint: String,
     /// Thread-safe token store managing the token lifecycle
     token_store: TokenStore,
-    /// HTTP client for token endpoint requests
-    http_client: Arc<DatabricksHttpClient>,
+    /// HTTP client for token endpoint requests. Weak; see
+    /// [`super::upgrade_http_client`].
+    http_client: Weak<DatabricksHttpClient>,
     /// OAuth scopes to request (typically "all-apis"). Empty when `resource`
     /// is set (a v1.0 `resource=` grant).
     scopes: Vec<String>,
@@ -125,7 +126,8 @@ impl ClientCredentialsProvider {
     /// * `host` - Databricks workspace URL (e.g., "https://my-workspace.cloud.databricks.com")
     /// * `client_id` - OAuth client ID for the service principal
     /// * `client_secret` - OAuth client secret for the service principal
-    /// * `http_client` - Shared HTTP client for token endpoint requests
+    /// * `http_client` - Shared HTTP client for token endpoint requests. The
+    ///   caller must keep it alive; the provider holds only a weak reference.
     ///
     /// # Returns
     ///
@@ -145,7 +147,7 @@ impl ClientCredentialsProvider {
     ///     "https://my-workspace.cloud.databricks.com",
     ///     "client-id",
     ///     "client-secret",
-    ///     http_client,
+    ///     &http_client,
     /// ).await?;
     /// # Ok(())
     /// # }
@@ -154,7 +156,7 @@ impl ClientCredentialsProvider {
         host: &str,
         client_id: &str,
         client_secret: &str,
-        http_client: Arc<DatabricksHttpClient>,
+        http_client: &Arc<DatabricksHttpClient>,
     ) -> Result<Self> {
         Self::new_with_scopes(
             host,
@@ -174,7 +176,7 @@ impl ClientCredentialsProvider {
         host: &str,
         client_id: &str,
         client_secret: &str,
-        http_client: Arc<DatabricksHttpClient>,
+        http_client: &Arc<DatabricksHttpClient>,
         scopes: Vec<String>,
     ) -> Result<Self> {
         Self::new_with_full_config(host, client_id, client_secret, http_client, scopes, None).await
@@ -190,7 +192,8 @@ impl ClientCredentialsProvider {
     /// * `host` - Databricks workspace URL
     /// * `client_id` - OAuth client ID for the service principal
     /// * `client_secret` - OAuth client secret for the service principal
-    /// * `http_client` - Shared HTTP client for token endpoint requests
+    /// * `http_client` - Shared HTTP client for token endpoint requests. The
+    ///   caller must keep it alive; the provider holds only a weak reference.
     /// * `scopes` - OAuth scopes to request
     /// * `token_endpoint_override` - Optional token endpoint URL override
     ///
@@ -203,7 +206,7 @@ impl ClientCredentialsProvider {
         host: &str,
         client_id: &str,
         client_secret: &str,
-        http_client: Arc<DatabricksHttpClient>,
+        http_client: &Arc<DatabricksHttpClient>,
         scopes: Vec<String>,
         token_endpoint_override: Option<String>,
     ) -> Result<Self> {
@@ -218,7 +221,7 @@ impl ClientCredentialsProvider {
         let (token_endpoint, auth_endpoint) = match token_endpoint_override {
             Some(token_endpoint) => (token_endpoint.clone(), token_endpoint),
             None => {
-                let endpoints = OidcEndpoints::discover(host, &http_client).await?;
+                let endpoints = OidcEndpoints::discover(host, http_client).await?;
                 (endpoints.token_endpoint, endpoints.authorization_endpoint)
             }
         };
@@ -229,7 +232,7 @@ impl ClientCredentialsProvider {
             token_endpoint,
             auth_endpoint,
             token_store: TokenStore::new(),
-            http_client,
+            http_client: Arc::downgrade(http_client),
             scopes,
             resource: None,
             // `new_with_full_config` is `async`, so we're guaranteed
@@ -254,7 +257,7 @@ impl ClientCredentialsProvider {
     pub async fn new_with_resource_v1(
         client_id: &str,
         client_secret: &str,
-        http_client: Arc<DatabricksHttpClient>,
+        http_client: &Arc<DatabricksHttpClient>,
         resource: String,
         token_endpoint: String,
     ) -> Result<Self> {
@@ -264,7 +267,7 @@ impl ClientCredentialsProvider {
             auth_endpoint: token_endpoint.clone(),
             token_endpoint,
             token_store: TokenStore::new(),
-            http_client,
+            http_client: Arc::downgrade(http_client),
             scopes: Vec::new(),
             resource: Some(resource),
             runtime_handle: RuntimeHandle::current(),
@@ -302,6 +305,7 @@ impl AuthProvider for ClientCredentialsProvider {
         // Get or refresh token via TokenStore
         let runtime_handle = self.runtime_handle.clone();
         let token = self.token_store.get_or_refresh(move || {
+            let http_client = super::upgrade_http_client(&http_client)?;
             // Execute the async token fetch via the kernel's
             // captured runtime handle. `block_on_in_runtime`
             // dispatches on `Handle::try_current()`: it uses
@@ -540,7 +544,7 @@ mod tests {
     /// M2M provider pointed straight at `{server}/oidc/v1/token`, skipping discovery.
     async fn provider_at(
         mock_server: &MockServer,
-        http_client: Arc<DatabricksHttpClient>,
+        http_client: &Arc<DatabricksHttpClient>,
     ) -> ClientCredentialsProvider {
         ClientCredentialsProvider::new_with_full_config(
             &mock_server.uri(),
@@ -607,7 +611,7 @@ mod tests {
             &mock_server.uri(),
             "test-client-id",
             "test-client-secret",
-            http_client,
+            &http_client,
         )
         .await
         .expect("Failed to create provider");
@@ -653,7 +657,7 @@ mod tests {
         let provider = ClientCredentialsProvider::new_with_resource_v1(
             "sp-client-id",
             "sp-client-secret",
-            http_client,
+            &http_client,
             "https://management.core.windows.net/".to_string(),
             format!("{}/tenant-abc/oauth2/token", mock_server.uri()),
         )
@@ -721,7 +725,7 @@ mod tests {
             &mock_server.uri(),
             "test-client-id",
             "test-client-secret",
-            http_client,
+            &http_client,
         )
         .await
         .expect("Failed to create provider");
@@ -773,7 +777,7 @@ mod tests {
             &mock_server.uri(),
             "test-client-id",
             "test-client-secret",
-            http_client,
+            &http_client,
         )
         .await;
 
@@ -815,7 +819,7 @@ mod tests {
             &mock_server.uri(),
             "test-client-id",
             "test-client-secret",
-            http_client,
+            &http_client,
         )
         .await;
 
@@ -861,7 +865,7 @@ mod tests {
                 &mock_server.uri(),
                 "test-client-id",
                 "test-client-secret",
-                http_client,
+                &http_client,
             )
             .await
             .expect("Failed to create provider"),
@@ -937,7 +941,7 @@ mod tests {
             &mock_server.uri(),
             "test-client-id",
             "test-client-secret",
-            http_client,
+            &http_client,
             vec!["custom-scope-1".to_string(), "custom-scope-2".to_string()],
         )
         .await
@@ -995,7 +999,7 @@ mod tests {
             &mock_server.uri(),
             "azure-client-id",
             "azure-client-secret",
-            http_client,
+            &http_client,
             vec!["2ff814a6-3304-4ab8-85cb-cd0e6f879c1d/.default".to_string()],
             Some(token_endpoint),
         )
@@ -1032,7 +1036,8 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let provider = provider_at(&mock_server, fast_retry_http_client(3)).await;
+        let http_client = fast_retry_http_client(3);
+        let provider = provider_at(&mock_server, &http_client).await;
 
         assert_eq!(
             provider
@@ -1056,7 +1061,8 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let provider = provider_at(&mock_server, fast_retry_http_client(3)).await;
+        let http_client = fast_retry_http_client(3);
+        let provider = provider_at(&mock_server, &http_client).await;
 
         let err = provider
             .get_auth_header()
@@ -1076,7 +1082,8 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let provider = provider_at(&mock_server, fast_retry_http_client(2)).await;
+        let http_client = fast_retry_http_client(2);
+        let provider = provider_at(&mock_server, &http_client).await;
 
         let err = provider
             .get_auth_header()
@@ -1097,7 +1104,8 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let provider = provider_at(&mock_server, fast_retry_http_client(2)).await;
+        let http_client = fast_retry_http_client(2);
+        let provider = provider_at(&mock_server, &http_client).await;
 
         let err = provider
             .get_auth_header()
@@ -1129,10 +1137,11 @@ mod tests {
             .mount(&mock_server)
             .await;
 
+        let http_client = fast_retry_http_client(3);
         let provider = ClientCredentialsProvider::new_with_resource_v1(
             "sp-client-id",
             "sp-client-secret",
-            fast_retry_http_client(3),
+            &http_client,
             "https://management.core.windows.net/".to_string(),
             format!("{}/tenant-abc/oauth2/token", mock_server.uri()),
         )
@@ -1146,5 +1155,62 @@ mod tests {
             "Bearer mgmt-access-token"
         );
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// Never contacted: the tests below reach no token request.
+    const UNUSED_TOKEN_URL: &str = "https://ws.cloud.databricks.com/oidc/v1/token";
+
+    /// The HTTP client owns its auth provider, so a provider holding the client
+    /// strongly would leak both, plus the provider's tokio runtime handle.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn provider_does_not_retain_http_client() {
+        let http_client = fast_retry_http_client(0);
+        let weak_http_client = Arc::downgrade(&http_client);
+        let provider = Arc::new(
+            ClientCredentialsProvider::new_with_full_config(
+                "https://ws.cloud.databricks.com",
+                "test-client-id",
+                "test-client-secret",
+                &http_client,
+                vec!["all-apis".to_string()],
+                Some(UNUSED_TOKEN_URL.to_string()),
+            )
+            .await
+            .expect("provider"),
+        );
+        let weak_provider = Arc::downgrade(&provider);
+        http_client.set_auth_provider(provider);
+
+        drop(http_client);
+
+        assert!(weak_http_client.upgrade().is_none());
+        assert!(weak_provider.upgrade().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn token_fetch_fails_cleanly_once_http_client_is_dropped() {
+        let http_client = fast_retry_http_client(0);
+        let provider = ClientCredentialsProvider::new_with_full_config(
+            "https://ws.cloud.databricks.com",
+            "test-client-id",
+            "test-client-secret",
+            &http_client,
+            vec!["all-apis".to_string()],
+            Some(UNUSED_TOKEN_URL.to_string()),
+        )
+        .await
+        .expect("provider");
+
+        drop(http_client);
+
+        let err = provider
+            .get_auth_header()
+            .expect_err("no HTTP client to fetch a token with");
+        assert_eq!(err.code, Error::invalid_state().code);
+        assert!(
+            err.message.contains("no longer available"),
+            "{}",
+            err.message
+        );
     }
 }

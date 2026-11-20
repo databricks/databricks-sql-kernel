@@ -59,6 +59,17 @@ impl ExecutedAsyncStatement {
         &self.statement_id
     }
 
+    /// Cached modified-row count from the latest observed status, if available.
+    /// Raises `KernelError` after parent-statement invalidation.
+    #[getter]
+    fn num_modified_rows(&self, py: Python<'_>) -> PyResult<Option<i64>> {
+        let inner = alive!(self, "ExecutedAsyncStatement");
+        inner
+            .exec
+            .try_num_modified_rows()
+            .map_err(|error| to_py_err(py, error))
+    }
+
     /// Create an independent read-only handle retaining this statement's session routing.
     /// The owning handle controls cancellation, cleanup and execution telemetry.
     fn reader(&self, py: Python<'_>) -> PyResult<AsyncStatementReader> {
@@ -160,6 +171,15 @@ impl AsyncStatementReader {
     #[getter]
     fn statement_id(&self) -> &str {
         self.inner.statement_id()
+    }
+
+    /// Cached modified-row count from the latest status this reader observed.
+    /// Raises `KernelError` after parent-statement invalidation or owner release.
+    #[getter]
+    fn num_modified_rows(&self, py: Python<'_>) -> PyResult<Option<i64>> {
+        self.inner
+            .num_modified_rows()
+            .map_err(|error| to_py_err(py, error))
     }
 
     /// Read server status as `(state, failure)`.

@@ -50,7 +50,7 @@ use oauth2::{
     AuthUrl, AuthorizationCode, ClientId, CsrfToken, PkceCodeChallenge, RedirectUrl, RefreshToken,
     Scope, TokenResponse, TokenUrl,
 };
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 use tokio::runtime::Handle as RuntimeHandle;
 
@@ -113,7 +113,7 @@ fn save_to_cache(
 /// let provider = AuthorizationCodeProvider::new(
 ///     "https://my-workspace.cloud.databricks.com",
 ///     "my-client-id",
-///     http_client,
+///     &http_client,
 /// ).await?;
 ///
 /// // Get auth header (may launch browser on first call if no cached token)
@@ -132,8 +132,9 @@ pub struct AuthorizationCodeProvider {
     auth_endpoint: String,
     /// Thread-safe token store managing the token lifecycle
     token_store: TokenStore,
-    /// HTTP client for token endpoint requests
-    http_client: Arc<DatabricksHttpClient>,
+    /// HTTP client for token endpoint requests. Weak; see
+    /// [`super::upgrade_http_client`].
+    http_client: Weak<DatabricksHttpClient>,
     /// OAuth scopes to request (typically "all-apis offline_access")
     scopes: Vec<String>,
     /// Candidate callback-server ports, tried in order (first free binds).
@@ -172,7 +173,8 @@ impl AuthorizationCodeProvider {
     ///
     /// * `host` - Databricks workspace URL (e.g., "https://my-workspace.cloud.databricks.com")
     /// * `client_id` - OAuth client ID for the application
-    /// * `http_client` - Shared HTTP client for token endpoint requests
+    /// * `http_client` - Shared HTTP client for token endpoint requests. The
+    ///   caller must keep it alive; the provider holds only a weak reference.
     ///
     /// # Returns
     ///
@@ -191,7 +193,7 @@ impl AuthorizationCodeProvider {
     /// let provider = AuthorizationCodeProvider::new(
     ///     "https://my-workspace.cloud.databricks.com",
     ///     "client-id",
-    ///     http_client,
+    ///     &http_client,
     /// ).await?;
     /// # Ok(())
     /// # }
@@ -199,7 +201,7 @@ impl AuthorizationCodeProvider {
     pub async fn new(
         host: &str,
         client_id: &str,
-        http_client: Arc<DatabricksHttpClient>,
+        http_client: &Arc<DatabricksHttpClient>,
     ) -> Result<Self> {
         // Scopes must match the app registered for `DEFAULT_CALLBACK_PORT`
         // (8030 → `databricks-sql-connector`, whose redirect URI is registered
@@ -229,7 +231,7 @@ impl AuthorizationCodeProvider {
     pub async fn new_with_config(
         host: &str,
         client_id: &str,
-        http_client: Arc<DatabricksHttpClient>,
+        http_client: &Arc<DatabricksHttpClient>,
         scopes: Vec<String>,
         callback_port: u16,
         callback_timeout: Duration,
@@ -261,7 +263,7 @@ impl AuthorizationCodeProvider {
     pub async fn new_with_full_config(
         host: &str,
         client_id: &str,
-        http_client: Arc<DatabricksHttpClient>,
+        http_client: &Arc<DatabricksHttpClient>,
         scopes: Vec<String>,
         callback_ports: Vec<u16>,
         callback_timeout: Duration,
@@ -269,7 +271,7 @@ impl AuthorizationCodeProvider {
         cache_passphrase: Option<String>,
     ) -> Result<Self> {
         // Discover OIDC endpoints (unless token_endpoint is overridden, we still need auth endpoint)
-        let endpoints = OidcEndpoints::discover(host, &http_client).await?;
+        let endpoints = OidcEndpoints::discover(host, http_client).await?;
 
         // Use override if provided, otherwise use discovered endpoint
         let token_endpoint = token_endpoint_override.unwrap_or(endpoints.token_endpoint);
@@ -306,7 +308,7 @@ impl AuthorizationCodeProvider {
             token_endpoint,
             auth_endpoint: endpoints.authorization_endpoint,
             token_store,
-            http_client,
+            http_client: Arc::downgrade(http_client),
             scopes,
             callback_ports,
             callback_timeout,
@@ -368,6 +370,7 @@ impl AuthProvider for AuthorizationCodeProvider {
         // Get or refresh token via TokenStore
         let runtime_handle = self.runtime_handle.clone();
         let token = self.token_store.get_or_refresh(move || {
+            let http_client = super::upgrade_http_client(&http_client)?;
             // Execute async token fetch/refresh via the kernel's
             // captured runtime handle. `block_on_in_runtime`
             // dispatches on `Handle::try_current()`: `block_in_place`
@@ -657,7 +660,7 @@ mod tests {
         let provider = AuthorizationCodeProvider::new_with_full_config(
             &mock_server.uri(),
             "test-client-id",
-            http_client,
+            &http_client,
             vec!["all-apis".to_string(), "offline_access".to_string()],
             vec![8020],
             Duration::from_secs(120),
@@ -710,7 +713,7 @@ mod tests {
         let provider = AuthorizationCodeProvider::new_with_full_config(
             &mock_server.uri(),
             "test-client-id",
-            http_client,
+            &http_client,
             vec!["all-apis".to_string(), "offline_access".to_string()],
             vec![8020],
             Duration::from_secs(120),
@@ -779,7 +782,7 @@ mod tests {
         let mut provider = AuthorizationCodeProvider::new_with_full_config(
             &mock_server.uri(),
             "test-client-id",
-            http_client,
+            &http_client,
             vec!["all-apis".to_string(), "offline_access".to_string()],
             vec![0],                // Use port 0 to avoid conflicts
             Duration::from_secs(5), // Short timeout for test
@@ -802,5 +805,39 @@ mod tests {
             result.is_err(),
             "Should fail when falling back to browser flow in unit test"
         );
+    }
+
+    /// The HTTP client owns its auth provider, so a provider holding the client
+    /// strongly would leak both, plus the provider's tokio runtime handle.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn provider_does_not_retain_http_client() {
+        let mock_server = MockServer::start().await;
+        mock_oidc_discovery(&mock_server).await;
+        let http_client = Arc::new(
+            DatabricksHttpClient::with_default_retry(HttpClientConfig::default())
+                .expect("Failed to create HTTP client"),
+        );
+        let weak_http_client = Arc::downgrade(&http_client);
+        let provider = Arc::new(
+            AuthorizationCodeProvider::new_with_full_config(
+                &mock_server.uri(),
+                "test-client-id",
+                &http_client,
+                vec!["sql".to_string(), "offline_access".to_string()],
+                vec![0],
+                Duration::from_secs(5),
+                None,
+                None,
+            )
+            .await
+            .expect("provider"),
+        );
+        let weak_provider = Arc::downgrade(&provider);
+        http_client.set_auth_provider(provider);
+
+        drop(http_client);
+
+        assert!(weak_http_client.upgrade().is_none());
+        assert!(weak_provider.upgrade().is_none());
     }
 }

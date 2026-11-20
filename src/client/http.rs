@@ -24,7 +24,8 @@
 
 use crate::auth::AuthProvider;
 use crate::client::retry::{
-    calculate_backoff, RequestCategory, RequestType, RetryConfig, RetryStrategy,
+    calculate_backoff, is_certificate_verification_failure, RequestCategory, RequestType,
+    RetryConfig, RetryStrategy,
 };
 use crate::kernel_error::{Error, Result};
 use crate::klog::{debug, warn};
@@ -828,7 +829,6 @@ impl DatabricksHttpClient {
         let start_time = Instant::now();
 
         let mut attempts: u32 = 0;
-        let mut last_error: Option<String> = None;
 
         // Clone the request parts we need for retries
         let method = request.method().clone();
@@ -933,7 +933,11 @@ impl DatabricksHttpClient {
 
             debug!(
                 "{:?}: {} {} (attempt {}/{})",
-                request_type, method, url, attempts, max_attempts
+                request_type,
+                method,
+                url.as_str().split('?').next().unwrap_or_default(),
+                attempts,
+                max_attempts
             );
 
             match self.client.execute(request).await {
@@ -988,7 +992,6 @@ impl DatabricksHttpClient {
                             ));
                         }
 
-                        last_error = Some(format!("HTTP {}", status.as_u16()));
                         warn!(
                             "{:?}: HTTP {} (attempt {}/{}), waiting {:.1}s before retry",
                             request_type,
@@ -1016,7 +1019,16 @@ impl DatabricksHttpClient {
                         format_args!("HTTP {}", status.as_u16()),
                     ));
                 }
-                Err(e) => {
+                Err(mut e) => {
+                    // reqwest's Display prints the request URL; a presigned URL's query is its credential.
+                    if let Some(url) = e.url_mut() {
+                        url.set_query(None);
+                    }
+                    let mut causes = super::error_chain(&e)
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>();
+                    causes.dedup();
+                    let error_message = causes.join(": ");
                     if strategy.is_retryable_error(&e) && attempts < max_attempts {
                         let elapsed = start_time.elapsed();
                         let wait = calculate_backoff(config, attempts, None);
@@ -1032,17 +1044,16 @@ impl DatabricksHttpClient {
                                 "HTTP request failed — retry timeout exceeded after {} attempts ({:.1}s): {}",
                                 attempts,
                                 elapsed.as_secs_f64(),
-                                last_error.unwrap_or_else(|| e.to_string())
+                                error_message
                             )));
                         }
 
-                        last_error = Some(e.to_string());
                         warn!(
                             "{:?}: error (attempt {}/{}): {}, waiting {:.1}s before retry",
                             request_type,
                             attempts,
                             max_attempts,
-                            e,
+                            error_message,
                             wait.as_secs_f64()
                         );
                         sleep(wait).await;
@@ -1054,18 +1065,23 @@ impl DatabricksHttpClient {
                         request_type,
                         attempts,
                         start_time.elapsed().as_secs_f64(),
-                        e
+                        error_message
                     );
-                    return Err(Error::network_error().message(format!(
-                        "HTTP request failed after {} attempts: {}",
-                        attempts,
-                        last_error.unwrap_or_else(|| e.to_string())
-                    )));
+                    return Err(Error::network_error()
+                        .with_retryable(!is_certificate_verification_failure(&e))
+                        .message(format!(
+                            "HTTP request failed after {} attempts: {}",
+                            attempts, error_message
+                        )));
                 }
             }
         }
     }
 }
+
+#[cfg(test)]
+#[path = "http_tls_tests.rs"]
+mod tls_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1968,6 +1984,70 @@ lGrv15pBcePj
                 "server must observe the retry before its task is awaited"
             );
             server.await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn test_non_idempotent_read_timeout_preserves_retryable_flag() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/test"))
+                .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(300)))
+                .mount(&server)
+                .await;
+            let client = test_client_with_http_config(
+                fast_retry_config(2),
+                HttpClientConfig {
+                    read_timeout: Duration::from_millis(75),
+                    ..HttpClientConfig::default()
+                },
+            );
+            let request = client
+                .inner()
+                .post(format!("{}/test", server.uri()))
+                .build()
+                .unwrap();
+            let error = client
+                .execute(request, RequestType::ExecuteStatement)
+                .await
+                .expect_err("response must time out after the request is sent");
+
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
+            assert!(error.message.contains("after 1 attempts"), "{error}");
+            assert!(error.message.contains("timed out"), "{error}");
+            assert!(
+                error.retryable,
+                "preserve the existing network-error flag: {error}"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_redirect_failure_preserves_retryable_flag() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/test"))
+                .respond_with(
+                    ResponseTemplate::new(302)
+                        .insert_header("Location", format!("{}/test", server.uri())),
+                )
+                .mount(&server)
+                .await;
+            let client = test_client(&server, fast_retry_config(2));
+            let request = client
+                .inner()
+                .get(format!("{}/test", server.uri()))
+                .build()
+                .unwrap();
+            let error = client
+                .execute(request, RequestType::GetStatementStatus)
+                .await
+                .expect_err("redirect loop must fail");
+
+            assert!(error.message.contains("after 1 attempts"), "{error}");
+            assert!(error.message.contains("redirect"), "{error}");
+            assert!(
+                error.retryable,
+                "preserve the existing network-error flag: {error}"
+            );
         }
 
         #[tokio::test]

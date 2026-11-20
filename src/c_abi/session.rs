@@ -1378,15 +1378,14 @@ pub unsafe extern "C" fn kernel_session_config_set_u2m_token_cache_config(
 /// Recognised keys (matched case-insensitively), mapping to
 /// [`ResultConfig`]:
 /// - `cloudfetch_enabled` = `"true"` / `"false"` — `false` serves every
-///   result inline (SEA `disposition = INLINE`), mirroring JDBC's
-///   `EnableQueryResultDownload=0`.
+///   result through paged inline delivery without cloud-storage downloads.
 /// - `cloudfetch_link_prefetch_window` = positive integer — presigned URLs
 ///   prefetched ahead of the consumer.
 /// - `cloudfetch_max_chunks_in_memory` = positive integer — decompressed
 ///   CloudFetch chunks held at once (bounds peak RSS). Values above the
 ///   kernel ceiling (256) are **clamped** with a warning, not rejected.
 /// - `inline_max_chunks_in_memory` = positive integer — inline-Arrow
-///   prefetch window (used when `cloudfetch_enabled = false`).
+///   prefetch window for paged inline results.
 /// - `complex_types_as_json` = `"true"` / `"false"` — render `ARRAY` /
 ///   `MAP` / `STRUCT` / `VARIANT` / `GEOMETRY` / `GEOGRAPHY` as JSON text
 ///   (PySQL `_use_arrow_native_complex_types=False`, JDBC

@@ -89,8 +89,8 @@ impl ChunkDownloader {
         let start = Instant::now();
 
         debug!(
-            "Downloading chunk {} from {} ({} bytes expected, attempt_timeout {:?})",
-            link.chunk_index, link.url, link.byte_count, attempt_timeout
+            "Downloading chunk {} ({} bytes expected, attempt_timeout {:?})",
+            link.chunk_index, link.byte_count, attempt_timeout
         );
 
         // Build request with custom headers from the link

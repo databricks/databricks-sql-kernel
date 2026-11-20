@@ -90,6 +90,8 @@ pub enum TryNextBatch<'a> {
     End,
 }
 
+type Prefetched<T> = Option<std::result::Result<T, Box<Error>>>;
+
 // `ResultBatch::into_arrow()` was deliberately removed: the
 // `#[non_exhaustive]` envelope is the right escape hatch already.
 // Wrappers `match` directly on `ResultBatch::Arrow(rb)` and choose
@@ -464,14 +466,8 @@ pub struct ResultStream {
     /// until the next call to `next_batch` replaces it.
     current: Option<ResultBatch>,
 
-    /// A single batch pulled early by [`peek_first_batch`](Self::peek_first_batch)
-    /// and buffered for replay so the peek is **non-consuming**: the next
-    /// [`next_batch`](Self::next_batch) returns this batch instead of
-    /// re-entering the reader. Lets the statement layer read a DML
-    /// row-count result (which SEA delivers as the result set) without
-    /// stealing it from the caller's fetch — keeping result rows at parity
-    /// with the Thrift path. `None` once drained or when never peeked.
-    prefetched: Option<ResultBatch>,
+    /// A peek must preserve both data and read errors for the caller's fetch.
+    prefetched: Prefetched<ResultBatch>,
 
     /// Row cursor inside [`current`](Self::current). Reset to `0`
     /// every time `next_batch` populates a fresh batch.
@@ -718,7 +714,7 @@ impl ResultStream {
         // A batch buffered by `peek_first_batch` is replayed here first,
         // so a non-consuming peek doesn't steal it from the caller.
         if let Some(batch) = self.prefetched.take() {
-            self.set_current_batch(batch);
+            self.set_current_batch(batch.map_err(|error| *error)?);
             return Ok(self.current.as_ref());
         }
         if self.exhausted {
@@ -752,7 +748,7 @@ impl ResultStream {
     /// network or background-prefetch progress.
     pub fn try_next_batch(&mut self) -> Result<TryNextBatch<'_>> {
         if let Some(batch) = self.prefetched.take() {
-            self.set_current_batch(batch);
+            self.set_current_batch(batch.map_err(|error| *error)?);
             return Ok(TryNextBatch::Ready(
                 self.current.as_ref().expect("batch was just installed"),
             ));
@@ -790,9 +786,8 @@ impl ResultStream {
 
     /// Non-consuming peek at the **first** batch of the stream.
     ///
-    /// Pulls one batch from the reader exactly once and buffers it so a
-    /// subsequent [`next_batch`](Self::next_batch) still returns it — the
-    /// peek does not advance consumption. Returns `None` for an empty
+    /// Buffers the first batch or error so the caller's next read observes
+    /// the same outcome. Returns `None` for an empty
     /// stream. Only valid before any `next_batch`/`peek_first_batch` has
     /// run (it no-ops if a batch is already current or buffered), which is
     /// the only context it's used in: deriving a DML row-count off the
@@ -805,7 +800,7 @@ impl ResultStream {
                 .expect("ResultStream reader is present until into_owned_batches consumes it");
             match reader.next_batch().await {
                 Ok(Some(rb)) => {
-                    self.prefetched = Some(ResultBatch::Arrow(rb));
+                    self.prefetched = Some(Ok(ResultBatch::Arrow(rb)));
                     // Stamp first-batch (result-set-ready) latency at fetch
                     // time, not when the caller later consumes the prefetched
                     // batch via `next_batch`. `record_result_batch` is
@@ -814,7 +809,7 @@ impl ResultStream {
                     // `result_set_ready_latency_millis` reflecting when the
                     // result set became ready rather than the caller's
                     // think-time before the first `next_batch` pull.
-                    if let (Some(telemetry), Some(batch)) =
+                    if let (Some(telemetry), Some(Ok(batch))) =
                         (&self.telemetry, self.prefetched.as_ref())
                     {
                         telemetry.record_batch(batch);
@@ -823,11 +818,16 @@ impl ResultStream {
                 Ok(None) => self.exhausted = true,
                 Err(e) => {
                     self.finalize_telemetry(Some(&e));
+                    self.prefetched = Some(Err(Box::new(e.clone())));
                     return Err(e);
                 }
             }
         }
-        Ok(self.prefetched.as_ref())
+        match self.prefetched.as_ref() {
+            Some(Ok(batch)) => Ok(Some(batch)),
+            Some(Err(error)) => Err((**error).clone()),
+            None => Ok(None),
+        }
     }
 
     /// The batch most recently buffered by
@@ -919,7 +919,10 @@ impl ResultStream {
         // Preserve a peeked-but-not-yet-consumed first batch: it was
         // pulled from the reader, so it must be yielded ahead of the
         // reader's remaining batches or it would be silently dropped.
-        let prefetched = self.prefetched.take().map(|ResultBatch::Arrow(rb)| rb);
+        let prefetched = self
+            .prefetched
+            .take()
+            .map(|outcome| outcome.map(|ResultBatch::Arrow(rb)| rb));
         OwnedBatchIter {
             reader: self
                 .reader
@@ -954,10 +957,7 @@ impl Drop for ResultStream {
 /// reader's natural end-of-stream the same way.
 pub struct OwnedBatchIter {
     reader: Box<dyn ResultReader>,
-    /// A batch peeked off the stream before conversion (see
-    /// [`ResultStream::peek_first_batch`]); yielded before the reader's
-    /// own batches so it isn't lost.
-    prefetched: Option<RecordBatch>,
+    prefetched: Prefetched<RecordBatch>,
     telemetry: Option<ResultStreamTelemetry>,
     done: bool,
 }
@@ -969,11 +969,19 @@ impl Iterator for OwnedBatchIter {
         if self.done {
             return None;
         }
-        if let Some(batch) = self.prefetched.take() {
-            if let Some(telemetry) = &self.telemetry {
-                telemetry.record_result_batch();
-            }
-            return Some(Ok(batch));
+        if let Some(outcome) = self.prefetched.take() {
+            return match outcome {
+                Ok(batch) => {
+                    if let Some(telemetry) = &self.telemetry {
+                        telemetry.record_result_batch();
+                    }
+                    Some(Ok(batch))
+                }
+                Err(error) => {
+                    self.done = true;
+                    Some(Err(*error))
+                }
+            };
         }
         // Runtime-aware blocking poll: uses block_in_place + the
         // current Handle when there's a tokio runtime on this thread
@@ -1027,6 +1035,7 @@ impl Drop for OwnedBatchIter {
 mod tests {
     use super::*;
     use crate::kernel_error::ErrorCode;
+    use crate::reader::test_utils::ErrorThenEndReader;
     use crate::reader::InMemoryReader;
     use arrow_array::{
         ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Decimal256Array,
@@ -1046,6 +1055,16 @@ mod tests {
         ResultStream::from_reader(Box::new(reader))
             .await
             .expect("from_reader")
+    }
+
+    async fn stream_with_one_shot_error() -> ResultStream {
+        let schema = schema_for(vec![Field::new("a", DataType::Int32, false)]);
+        ResultStream::from_reader(Box::new(ErrorThenEndReader {
+            schema,
+            error_pending: true,
+        }))
+        .await
+        .expect("from_reader")
     }
 
     async fn advance_to_first_row(stream: &mut ResultStream) {
@@ -1347,6 +1366,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn next_batch_replays_peek_error() {
+        for nonblocking in [false, true] {
+            let mut stream = stream_with_one_shot_error().await;
+            assert!(stream.peek_first_batch().await.is_err());
+            let error = if nonblocking {
+                stream.try_next_batch().unwrap_err()
+            } else {
+                stream.next_batch().await.unwrap_err()
+            };
+            assert_eq!(error.message, "simulated one-shot read error");
+            assert!(stream.next_batch().await.unwrap().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn into_owned_batches_replays_peek_error() {
+        let mut stream = stream_with_one_shot_error().await;
+        assert!(stream.peek_first_batch().await.is_err());
+
+        let mut iter = stream.into_owned_batches();
+        assert_eq!(
+            iter.next().unwrap().unwrap_err().message,
+            "simulated one-shot read error"
+        );
+        assert!(iter.next().is_none());
+    }
+
+    #[tokio::test]
     async fn into_owned_batches_yields_then_terminates() {
         // Stream construction is async (schema pulled via async fn);
         // the iterator itself is sync and drives in-memory readers via
@@ -1356,7 +1403,8 @@ mod tests {
             .unwrap();
         let b2 = RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![3]))]).unwrap();
         let reader = InMemoryReader::new(b1.schema(), vec![b1.clone(), b2.clone()]);
-        let stream = ResultStream::from_reader(Box::new(reader)).await.unwrap();
+        let mut stream = ResultStream::from_reader(Box::new(reader)).await.unwrap();
+        assert!(stream.peek_first_batch().await.unwrap().is_some());
 
         let mut iter = stream.into_owned_batches();
         let first = iter.next().unwrap().unwrap();

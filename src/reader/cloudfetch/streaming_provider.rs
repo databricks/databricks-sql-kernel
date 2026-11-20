@@ -20,7 +20,7 @@
 //! - Memory management via chunk limits
 //! - Consumer API via RecordBatchReader trait
 
-use crate::kernel_error::{Error, Result};
+use crate::kernel_error::{Error, ErrorCode, Result};
 use crate::klog::{debug, error, info, warn};
 use crate::reader::cloudfetch::chunk_downloader::ChunkDownloader;
 use crate::reader::cloudfetch::link_fetcher::ChunkLinkFetcher;
@@ -31,10 +31,10 @@ use crate::types::cloudfetch::{
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use arrow_select::concat::concat_batches;
-use dashmap::DashMap;
+use dashmap::{mapref::entry::Entry, DashMap};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, TryLockError};
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
@@ -106,6 +106,10 @@ fn flush_pending(schema: &SchemaRef, pending: &mut Vec<RecordBatch>) -> Result<R
 /// - Parallel downloads with memory-bounded concurrency
 /// - Proper ordering of result batches
 /// - Error propagation and cancellation
+///
+/// Python callers can hold the GIL during `try_next_batch`, so contention on
+/// the batch buffer, chunk map or terminal error must yield `Pending` rather
+/// than wait for a worker that may acquire the GIL through a log callback.
 pub struct StreamingCloudFetchProvider {
     // Dependencies (injected)
     link_fetcher: Arc<dyn ChunkLinkFetcher>,
@@ -445,7 +449,12 @@ impl StreamingCloudFetchProvider {
         // Fetch initial batch of links (should be instant if cached by link fetcher)
         debug!("Initializing provider: fetching initial links");
 
-        match self.link_fetcher.fetch_links(0, 0).await {
+        let result = tokio::select! {
+            biased;
+            _ = self.cancel_token.cancelled() => return,
+            result = self.link_fetcher.fetch_links(0, 0) => result,
+        };
+        match result {
             Ok(result) => {
                 // Store fetched links
                 for link in result.links {
@@ -488,57 +497,43 @@ impl StreamingCloudFetchProvider {
     /// pre-merged during download (in background tasks), so each chunk
     /// typically yields a single large batch.
     pub async fn next_batch(&self) -> Result<Option<RecordBatch>> {
-        // Check for cancellation
-        if self.cancel_token.is_cancelled() {
-            return Err(Error::invalid_state().message("Operation cancelled"));
-        }
+        loop {
+            if self.cancel_token.is_cancelled() {
+                return Err(Error::invalid_state().message("Operation cancelled"));
+            }
 
-        // Drain batch buffer first
-        if let Some(batch) = self.take_buffered_batch() {
-            return Ok(Some(batch));
-        }
-
-        // Buffer empty - need next chunk
-        let chunk_index = self.current_chunk_index.load(Ordering::Acquire);
-
-        // Check if we've reached end of stream
-        if self.is_at_end(chunk_index) {
-            debug!("End of stream reached at chunk {}", chunk_index);
-            return Ok(None);
-        }
-
-        // Wait for the chunk to be downloaded
-        self.wait_for_chunk(chunk_index).await?;
-
-        // Get the chunk and move batches to buffer
-        if self.release_downloaded_chunk(chunk_index) {
-            // Schedule more downloads
-            self.schedule_downloads().await;
-
-            // Return first batch from buffer
             if let Some(batch) = self.take_buffered_batch() {
                 return Ok(Some(batch));
             }
-        }
 
-        // Check end of stream again
-        if self.end_of_stream.load(Ordering::Acquire) {
-            return Ok(None);
-        }
+            let chunk_index = self.current_chunk_index.load(Ordering::Acquire);
+            if self.is_at_end(chunk_index) {
+                debug!("End of stream reached at chunk {}", chunk_index);
+                return Ok(None);
+            }
 
-        // A terminal link-fetch failure that landed after the wait
-        // returned takes precedence over the generic "not found"
-        // message, so callers see the real cause deterministically.
-        if let Some(err) = self.terminal_error() {
-            return Err(err);
-        }
+            self.wait_for_chunk(chunk_index).await?;
+            if self.release_downloaded_chunk(chunk_index) {
+                self.schedule_downloads().await;
+                // An empty chunk can precede more data or a terminal error.
+                continue;
+            }
 
-        Err(Error::invalid_state().message(format!("Chunk {} not found after wait", chunk_index)))
+            if self.is_at_end(self.current_chunk_index.load(Ordering::Acquire)) {
+                return Ok(None);
+            }
+            if let Some(err) = self.terminal_error() {
+                return Err(err);
+            }
+
+            return Err(Error::invalid_state()
+                .message(format!("Chunk {} not found after wait", chunk_index)));
+        }
     }
 
     /// Return the next batch if it is already downloaded, without waiting for
-    /// chunk state to change. Download and link-fetch tasks continue on the
-    /// provider runtime while this returns `Pending` to the caller.
+    /// chunk state to change or for a contended provider-state lock. Download
+    /// and link-fetch tasks continue while this returns `Pending` to the caller.
     pub fn try_next_batch(self: &Arc<Self>) -> Result<crate::reader::TryNextBatch> {
         use crate::reader::TryNextBatch;
 
@@ -548,18 +543,33 @@ impl StreamingCloudFetchProvider {
                 break Err(Error::invalid_state().message("Operation cancelled"));
             }
 
-            if let Some(batch) = self.take_buffered_batch() {
+            let mut buffer = match self.current_batch_buffer.try_lock() {
+                Err(TryLockError::WouldBlock) => break Ok(TryNextBatch::Pending),
+                result => result.unwrap(),
+            };
+            if let Some(batch) = buffer.pop_front() {
+                drop(buffer);
+                let _ = self.schema.get_or_init(|| batch.schema());
                 break Ok(TryNextBatch::Ready(batch));
             }
 
             let chunk_index = self.current_chunk_index.load(Ordering::Acquire);
-            if self.is_at_end(chunk_index) {
-                break Ok(TryNextBatch::End);
-            }
-
-            let ready = if let Some(entry) = self.chunks.get(&chunk_index) {
-                match &entry.state {
-                    ChunkState::Downloaded => true,
+            match self.chunks.try_entry(chunk_index) {
+                None => break Ok(TryNextBatch::Pending),
+                Some(Entry::Vacant(_)) if self.end_of_stream.load(Ordering::Acquire) => {
+                    break Ok(TryNextBatch::End);
+                }
+                Some(Entry::Occupied(entry)) => match &entry.get().state {
+                    ChunkState::Downloaded => {
+                        // Both guards are acquired before removing data so a
+                        // contended probe leaves every batch available to retry.
+                        if let Some(batches) = entry.remove().batches {
+                            buffer.extend(batches);
+                        }
+                        self.advance_chunk();
+                        released = true;
+                        continue;
+                    }
                     ChunkState::DownloadFailed(error) => break Err(error.clone()),
                     ChunkState::ProcessingFailed(error) => {
                         break Err(Error::io().message(error.clone()))
@@ -567,28 +577,19 @@ impl StreamingCloudFetchProvider {
                     ChunkState::Cancelled => {
                         break Err(Error::invalid_state().message("Operation cancelled"))
                     }
-                    _ => false,
-                }
-            } else {
-                false
+                    _ => break Ok(TryNextBatch::Pending),
+                },
+                Some(Entry::Vacant(_)) => {}
+            }
+            drop(buffer);
+            let terminal_error = match self.terminal_error.try_lock() {
+                Err(TryLockError::WouldBlock) => break Ok(TryNextBatch::Pending),
+                result => result.unwrap(),
             };
-
-            if !ready {
-                if let Some(error) = self.terminal_error() {
-                    break Err(error);
-                }
-                break Ok(TryNextBatch::Pending);
+            if let Some(error) = terminal_error.as_ref() {
+                break Err(error.clone());
             }
-
-            // Only the single result consumer removes chunks. Once a chunk is
-            // Downloaded its entry is terminal, so the remove cannot race a
-            // downloader changing it back to an earlier state.
-            if !self.release_downloaded_chunk(chunk_index) {
-                break Ok(TryNextBatch::Pending);
-            }
-            released = true;
-            // Loop once to return the first batch, or advance across an empty
-            // downloaded chunk to Pending/End/the following ready chunk.
+            break Ok(TryNextBatch::Pending);
         };
 
         // Refill the rolling window once, after the loop settles, rather than
@@ -596,6 +597,12 @@ impl StreamingCloudFetchProvider {
         // schedule_downloads early-exits when the window is full and the current
         // batch (if any) is already buffered, so this must not block.
         if released {
+            debug!(
+                "Buffered downloaded chunks: chunks_in_memory={}/{}, consumer_at={}",
+                self.chunks_in_memory.load(Ordering::Acquire),
+                self.max_chunks_in_memory,
+                self.current_chunk_index.load(Ordering::Acquire),
+            );
             // Detached spawn (vs. the blocking path's inline await) means two
             // rapid try_next_batch calls can overlap this refill, and a mixed
             // try_next_batch + next_batch caller can run it alongside next_batch's
@@ -645,14 +652,19 @@ impl StreamingCloudFetchProvider {
         if let Some(batches) = entry.batches.take() {
             self.current_batch_buffer.lock().unwrap().extend(batches);
         }
-        let new_count = self.chunks_in_memory.fetch_sub(1, Ordering::Release) - 1;
-        let next_chunk = self.current_chunk_index.fetch_add(1, Ordering::Release) + 1;
-        self.metrics.record_chunk_iterated();
+        let (new_count, next_chunk) = self.advance_chunk();
         debug!(
             "Released chunk {}: chunks_in_memory={}/{}, consumer advancing to {}",
             chunk_index, new_count, self.max_chunks_in_memory, next_chunk
         );
         true
+    }
+
+    fn advance_chunk(&self) -> (usize, i64) {
+        let new_count = self.chunks_in_memory.fetch_sub(1, Ordering::Release) - 1;
+        let next_chunk = self.current_chunk_index.fetch_add(1, Ordering::Release) + 1;
+        self.metrics.record_chunk_iterated();
+        (new_count, next_chunk)
     }
 
     /// Record the first terminal link-fetch failure and wake every waiter.
@@ -665,18 +677,23 @@ impl StreamingCloudFetchProvider {
     /// blocked in `wait_for_chunk` is released, not just one — a
     /// terminal failure must not leave sibling waiters stuck.
     fn set_terminal_error(&self, error: Error) {
-        {
+        let first = {
             let mut slot = self.terminal_error.lock().unwrap();
             if slot.is_none() {
-                error!("CloudFetch provider entering terminal error state: {error}");
-                *slot = Some(error);
+                *slot = Some(error.clone());
+                true
+            } else {
+                false
             }
-            // else: keep the first error; drop this one.
-        }
+        };
         // Wake all current waiters so they observe the terminal state.
         // A waiter that registers *after* this checks `terminal_error`
         // on entry, so it never misses the signal.
         self.chunk_state_changed.notify_waiters();
+        // Host log callbacks can acquire locks held by result consumers.
+        if first {
+            error!("CloudFetch provider entering terminal error state: {error}");
+        }
     }
 
     /// Return a clone of the terminal link-fetch error, if one is set.
@@ -688,7 +705,12 @@ impl StreamingCloudFetchProvider {
     ///
     /// Returns whether the requested `start_index` is now available in the map.
     async fn fetch_and_store_links(&self, start_index: i64) -> bool {
-        match self.link_fetcher.fetch_links(start_index, 0).await {
+        let result = tokio::select! {
+            biased;
+            _ = self.cancel_token.cancelled() => return false,
+            result = self.link_fetcher.fetch_links(start_index, 0) => result,
+        };
+        match result {
             Ok(result) => {
                 for link in result.links {
                     let chunk_index = link.chunk_index;
@@ -820,6 +842,7 @@ impl StreamingCloudFetchProvider {
             // Increment counters
             let new_count = self.chunks_in_memory.fetch_add(1, Ordering::Release) + 1;
             self.next_download_index.fetch_add(1, Ordering::Release);
+            self.link_fetcher.note_scheduled(next_index);
 
             debug!(
                 "Scheduling download for chunk {}: chunks_in_memory={}/{}, consumer_at={}",
@@ -1114,6 +1137,10 @@ impl StreamingCloudFetchProvider {
                     return Ok(batches);
                 }
                 Err(e) => {
+                    // Refreshing a signed URL cannot repair certificate verification failures.
+                    if e.code == ErrorCode::NetworkError && !e.retryable {
+                        return Err(e);
+                    }
                     // Every completed download failure consumes the hard attempt
                     // budget, even when its link became stale while in flight.
                     attempts += 1;
@@ -1358,6 +1385,7 @@ impl StreamingCloudFetchProvider {
                         .as_ref()
                         .is_some_and(|prev| *prev != link.url);
                     if url_changed || !link.is_expired() {
+                        drop(entry);
                         debug!(
                             statement_id = %sid,
                             "Concurrent refresh delivered a {} link for chunk {}; \
@@ -1408,6 +1436,7 @@ impl StreamingCloudFetchProvider {
                     .as_ref()
                     .is_some_and(|prev| *prev != link.url);
                 if url_changed || !link.is_expired() {
+                    drop(entry);
                     debug!(
                         statement_id = %sid,
                         "Batched refresh for chunk {} skipped after claim — \
@@ -1724,6 +1753,8 @@ mod tests {
     struct MockLinkFetcher {
         links_by_index: HashMap<i64, CloudFetchLink>,
         total_chunks: i64,
+        scheduled: Mutex<Vec<i64>>,
+        fetch_gate: Option<Arc<Notify>>,
     }
 
     impl MockLinkFetcher {
@@ -1736,17 +1767,26 @@ mod tests {
             Self {
                 links_by_index,
                 total_chunks,
+                scheduled: Mutex::new(Vec::new()),
+                fetch_gate: None,
             }
         }
     }
 
     #[async_trait::async_trait]
     impl ChunkLinkFetcher for MockLinkFetcher {
+        fn note_scheduled(&self, chunk_index: i64) {
+            self.scheduled.lock().unwrap().push(chunk_index);
+        }
+
         async fn fetch_links(
             &self,
             start_chunk_index: i64,
             _start_row_offset: i64,
         ) -> Result<ChunkLinkFetchResult> {
+            if let Some(gate) = &self.fetch_gate {
+                gate.notified().await;
+            }
             if start_chunk_index >= self.total_chunks {
                 return Ok(ChunkLinkFetchResult::end_of_stream());
             }
@@ -1814,6 +1854,132 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn cancellation_interrupts_link_fetch_during_refill_and_initialization() {
+        for initial in [false, true] {
+            let mut fetcher = MockLinkFetcher::new(2);
+            fetcher.fetch_gate = Some(Arc::new(Notify::new()));
+            let chunks = Arc::new(DashMap::new());
+            let batch = RecordBatch::new_empty(Arc::new(Schema::empty()));
+            chunks.insert(
+                0,
+                ChunkEntry {
+                    link: Some(create_test_link(0)),
+                    state: ChunkState::Downloaded,
+                    batches: Some(vec![batch]),
+                    ..ChunkEntry::with_link(create_test_link(0))
+                },
+            );
+            let provider = StreamingCloudFetchProvider::for_test_with_chunks(
+                Arc::new(fetcher),
+                noop_downloader(),
+                chunks,
+                false,
+            );
+            provider.chunks_in_memory.store(1, Ordering::Release);
+            provider.next_download_index.store(1, Ordering::Release);
+            if initial {
+                let mut initialize = Box::pin(provider.initialize());
+                assert!(futures::poll!(initialize.as_mut()).is_pending());
+                provider.cancel();
+                tokio::time::timeout(NO_HANG, initialize).await.unwrap();
+            } else {
+                let mut read = Box::pin(provider.next_batch());
+                assert!(futures::poll!(read.as_mut()).is_pending());
+                assert_eq!(provider.current_chunk_index.load(Ordering::Acquire), 1);
+                provider.cancel();
+                assert!(tokio::time::timeout(NO_HANG, read)
+                    .await
+                    .unwrap()
+                    .unwrap_err()
+                    .message
+                    .contains("cancel"));
+            }
+            assert!(provider.terminal_error().is_none());
+            assert!(provider
+                .next_batch()
+                .await
+                .unwrap_err()
+                .message
+                .contains("cancel"));
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_downloads_notify_each_scheduled_chunk_in_order() {
+        use crate::client::retry::{build_retry_configs, RetryConfig};
+        use crate::client::{DatabricksHttpClient, HttpClientConfig};
+        use crate::types::sea::CompressionCodec;
+        use arrow_ipc::writer::StreamWriter;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let mut fetcher = MockLinkFetcher::new(8);
+        for i in 0..8 {
+            let batch = make_batch(&[i as i32]);
+            let mut bytes = Vec::new();
+            {
+                let mut writer = StreamWriter::try_new(&mut bytes, &batch.schema()).unwrap();
+                writer.write(&batch).unwrap();
+                writer.finish().unwrap();
+            }
+            let route = format!("/chunk-{i}");
+            Mock::given(method("GET"))
+                .and(path(&route))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
+                .expect(1)
+                .mount(&server)
+                .await;
+            fetcher.links_by_index.get_mut(&i).unwrap().url = format!("{}{route}", server.uri());
+        }
+        let fetcher = Arc::new(fetcher);
+        let client = DatabricksHttpClient::new(
+            HttpClientConfig::default(),
+            build_retry_configs(
+                &RetryConfig {
+                    max_retries: 0,
+                    ..RetryConfig::default()
+                },
+                &HashMap::new(),
+            ),
+        )
+        .unwrap();
+        let provider = StreamingCloudFetchProvider::new(
+            CloudFetchConfig {
+                max_chunks_in_memory: 2,
+                ..CloudFetchConfig::default()
+            },
+            fetcher.clone(),
+            Arc::new(ChunkDownloader::new(
+                Arc::new(client),
+                CompressionCodec::None,
+                0.1,
+            )),
+            Some(8),
+            tokio::runtime::Handle::current(),
+        );
+        let mut values = Vec::new();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while let Some(batch) = provider.next_batch().await.unwrap() {
+                let ids = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap();
+                values.extend_from_slice(ids.values());
+                assert!(provider.chunks_in_memory.load(Ordering::Acquire) <= 2);
+            }
+        })
+        .await
+        .expect("all eight chunks must drain with a two-chunk window");
+        assert_eq!(values, (0..8).collect::<Vec<i32>>());
+        assert_eq!(
+            *fetcher.scheduled.lock().unwrap(),
+            (0..8).collect::<Vec<i64>>()
+        );
+    }
+
     /// Regression (PECOBLR-4026): a panicking download task must surface as an
     /// error rather than being silently swallowed — a swallowed panic leaves the
     /// chunk stuck `Downloading` and wedges the stream forever. Verifies
@@ -1834,6 +2000,12 @@ mod tests {
 
     #[tokio::test]
     async fn persistent_download_failure_is_bounded_when_links_expire_in_flight() {
+        for status in [403, 500] {
+            assert_persistent_download_failure_is_bounded(status).await;
+        }
+    }
+
+    async fn assert_persistent_download_failure_is_bounded(status: u16) {
         use crate::client::retry::{build_retry_configs, RetryConfig};
         use crate::client::{DatabricksHttpClient, HttpClientConfig};
         use crate::types::cloudfetch::LINK_EXPIRY_BUFFER_SECS;
@@ -1848,7 +2020,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/chunk-0.arrow"))
-            .respond_with(ResponseTemplate::new(500).set_delay(RESPONSE_DELAY))
+            .respond_with(ResponseTemplate::new(status).set_delay(RESPONSE_DELAY))
             .mount(&server)
             .await;
 
@@ -1933,9 +2105,9 @@ mod tests {
         .await
         .expect("persistent failures must exhaust the download attempt budget");
 
-        let error = result.expect_err("persistent HTTP 500 must be terminal");
+        let error = result.expect_err("persistent HTTP failure must be terminal");
         assert!(
-            error.message.contains("HTTP 500"),
+            error.message.contains(&format!("HTTP {status}")),
             "unexpected error: {error}"
         );
         assert_eq!(
@@ -2498,54 +2670,164 @@ mod tests {
         ))
     }
 
-    /// `try_next_batch` must return `Pending` (without blocking) while the
-    /// head chunk is not yet `Downloaded`, then `Ready` once it flips, and
-    /// finally `End` after the last chunk is consumed. This exercises the
-    /// non-blocking chunk-state machine that diverges from `next_batch`.
     #[tokio::test]
-    async fn try_next_batch_pending_then_ready_then_end() {
+    async fn try_next_batch_preserves_chunk_order() {
         use crate::reader::TryNextBatch;
 
-        let chunks: Arc<DashMap<i64, ChunkEntry>> = Arc::new(DashMap::new());
-        // Chunk 0 present but still downloading — not ready to yield.
+        let chunks = Arc::new(DashMap::new());
         chunks.insert(
             0,
             entry_with_state(create_test_link(0), ChunkState::Downloading),
         );
-        let fetcher: Arc<dyn ChunkLinkFetcher> = Arc::new(MockLinkFetcher::new(1));
         let provider = StreamingCloudFetchProvider::for_test_with_chunks(
-            fetcher,
+            Arc::new(MockLinkFetcher::new(1)),
             unused_downloader(),
             Arc::clone(&chunks),
-            /* end_of_stream = */ true,
+            false,
         );
-        // One chunk resident: `release_downloaded_chunk` decrements this.
         provider.chunks_in_memory.store(1, Ordering::Release);
+        *provider.terminal_error.lock().unwrap() =
+            Some(Error::unavailable().message("chunk 1 link fetch failed"));
 
-        // Not downloaded yet → Pending, and it must NOT block.
-        assert!(
-            matches!(provider.try_next_batch().unwrap(), TryNextBatch::Pending),
-            "a not-yet-Downloaded head chunk must report Pending"
-        );
-
-        // Flip the chunk to Downloaded with real batches, as a download
-        // task would.
+        assert!(matches!(
+            provider.try_next_batch().unwrap(),
+            TryNextBatch::Pending
+        ));
         {
             let mut entry = chunks.get_mut(&0).unwrap();
             entry.state = ChunkState::Downloaded;
             entry.batches = Some(vec![make_batch(&[1, 2, 3])]);
         }
-
         match provider.try_next_batch().unwrap() {
-            TryNextBatch::Ready(batch) => assert_eq!(batch.num_rows(), 3),
-            _ => panic!("expected Ready after chunk flipped to Downloaded"),
+            TryNextBatch::Ready(batch) => assert_eq!(batch, make_batch(&[1, 2, 3])),
+            _ => panic!("earlier rows must be returned before the link error"),
+        }
+        let error = provider.try_next_batch().unwrap_err();
+        assert_eq!(error.code, ErrorCode::Unavailable);
+        assert_eq!(error.message, "chunk 1 link fetch failed");
+    }
+
+    #[tokio::test]
+    async fn try_next_batch_yields_on_lock_contention() {
+        use crate::reader::TryNextBatch;
+
+        fn assert_pending<G>(provider: &Arc<StreamingCloudFetchProvider>, guard: G) {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let provider = Arc::clone(provider);
+            let probe = std::thread::spawn(move || {
+                sender.send(provider.try_next_batch()).unwrap();
+            });
+            let outcome = receiver.recv_timeout(NO_HANG);
+            // Release before joining so a blocking regression fails by timeout.
+            drop(guard);
+            probe.join().unwrap();
+            assert!(matches!(
+                outcome.expect("probe waited for a held lock").unwrap(),
+                TryNextBatch::Pending
+            ));
         }
 
-        // Head chunk consumed; end_of_stream + no more chunks → End.
-        assert!(
-            matches!(provider.try_next_batch().unwrap(), TryNextBatch::End),
-            "after the only chunk is drained the stream must report End"
-        );
+        enum HeldLock {
+            Buffer,
+            ChunkRead,
+            ChunkWrite,
+            EmptyShard,
+            TerminalError,
+        }
+
+        for (held, empty_first) in [
+            (HeldLock::Buffer, false),
+            (HeldLock::ChunkRead, false),
+            (HeldLock::ChunkWrite, false),
+            (HeldLock::ChunkRead, true),
+            (HeldLock::EmptyShard, false),
+            (HeldLock::TerminalError, false),
+            (HeldLock::TerminalError, true),
+        ] {
+            let terminal = matches!(held, HeldLock::TerminalError);
+            let skipped = i64::from(empty_first && terminal);
+            let data_index = i64::from(empty_first);
+            let chunks = Arc::new(DashMap::new());
+            if data_index > 0 {
+                chunks.insert(
+                    0,
+                    entry_with_state(create_test_link(0), ChunkState::Downloaded),
+                );
+            }
+            if !matches!(held, HeldLock::EmptyShard | HeldLock::TerminalError) {
+                let mut entry =
+                    entry_with_state(create_test_link(data_index), ChunkState::Downloaded);
+                entry.batches = Some(vec![make_batch(&[1]), make_batch(&[2])]);
+                chunks.insert(data_index, entry);
+            }
+            let provider = StreamingCloudFetchProvider::for_test_with_chunks(
+                Arc::new(MockLinkFetcher::new(2)),
+                unused_downloader(),
+                Arc::clone(&chunks),
+                !terminal,
+            );
+            provider
+                .chunks_in_memory
+                .store(chunks.len(), Ordering::Release);
+            if terminal {
+                *provider.terminal_error.lock().unwrap() =
+                    Some(Error::unavailable().message("link fetch failed"));
+            }
+            if matches!(held, HeldLock::Buffer) {
+                provider
+                    .current_batch_buffer
+                    .lock()
+                    .unwrap()
+                    .push_back(make_batch(&[0]));
+            }
+
+            match held {
+                HeldLock::Buffer => {
+                    assert_pending(&provider, provider.current_batch_buffer.lock().unwrap())
+                }
+                HeldLock::ChunkRead => assert_pending(&provider, chunks.get(&0).unwrap()),
+                HeldLock::ChunkWrite => assert_pending(&provider, chunks.get_mut(&0).unwrap()),
+                HeldLock::EmptyShard => assert_pending(&provider, chunks.entry(0)),
+                HeldLock::TerminalError => {
+                    assert_pending(&provider, provider.terminal_error.lock().unwrap());
+                }
+            }
+            assert_eq!(
+                provider.current_chunk_index.load(Ordering::Acquire),
+                skipped
+            );
+            assert_eq!(
+                provider.chunks_in_memory.load(Ordering::Acquire),
+                chunks.len()
+            );
+            assert_eq!(
+                provider.metrics.snapshot().total_chunks_iterated,
+                Some(skipped as i32)
+            );
+            if terminal {
+                let error = provider
+                    .try_next_batch()
+                    .expect_err("terminal error must survive contention");
+                assert_eq!(error.code, ErrorCode::Unavailable);
+                assert_eq!(error.message, "link fetch failed");
+            } else {
+                let expected = match held {
+                    HeldLock::Buffer => vec![0, 1, 2],
+                    HeldLock::EmptyShard => vec![],
+                    _ => vec![1, 2],
+                };
+                for value in expected {
+                    assert_eq!(
+                        provider.next_batch().await.unwrap(),
+                        Some(make_batch(&[value]))
+                    );
+                }
+                assert!(matches!(
+                    provider.try_next_batch().unwrap(),
+                    TryNextBatch::End
+                ));
+            }
+        }
     }
 
     /// A `Downloaded` chunk that decoded to zero batches must be skipped
@@ -4084,7 +4366,6 @@ mod tests {
     async fn first_terminal_error_wins() {
         let fetcher = FailingLinkFetcher::new(4, 2, 0);
         let provider = provider_with_failing_fetcher(fetcher, Some(4));
-
         provider.set_terminal_error(Error::io().message("first error"));
         provider.set_terminal_error(Error::io().message("second error"));
 

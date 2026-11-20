@@ -348,11 +348,9 @@ impl ExecutedStatement {
         if inner.exhausted {
             return Ok(None);
         }
-        let runtime = inner.runtime.clone();
-        // `next_batch_exec` drives the ExecutedStatement so the kernel's
-        // auto-close-on-drain fires the server CloseStatement once the
-        // stream is exhausted (after all lazy CloudFetch link fetches).
-        let batch = run_sync_kernel!(py, fetch::next_batch_exec(&runtime, &mut inner.exec))?;
+        let batch = fetch::read_batch(py, fetch::own_batch(inner.exec.try_next_batch()), || {
+            fetch::next_batch_exec(&inner.runtime, &mut inner.exec)
+        })?;
         match batch {
             Some(b) => Ok(Some(b.to_pyarrow(py)?)),
             None => {
@@ -397,7 +395,12 @@ impl ExecutedStatement {
             return Ok(());
         };
         let runtime = inner.runtime.clone();
-        let res = run_kernel!(py, runtime, KExecutedStatement::close(&mut inner.exec));
+        // Exhaustion finalizes telemetry and schedules server cleanup.
+        let res = if inner.exhausted {
+            Ok(())
+        } else {
+            run_kernel!(py, runtime, KExecutedStatement::close(&mut inner.exec))
+        };
         // Drop the kernel handle regardless of close() outcome — the
         // kernel's Drop impl runs fire-and-forget cleanup if close()
         // failed mid-flight.
