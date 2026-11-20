@@ -107,6 +107,13 @@ The main database option families are:
 | Execution | `adbc.databricks.enable_direct_results` (default `true`); set `false` to use `wait_timeout=0s` and status polling |
 | Metadata | `adbc.databricks.metadata.escape_catalog_name` |
 
+Kernel sessions reuse idle HTTP clients by default. Idle sockets and TLS/proxy
+configuration can remain for about 105 seconds after the last HTTP wrapper drops
+while the runtime is driven (otherwise until the next cache access/shutdown),
+and a new session's system-trust snapshot can be up to 300 seconds old.
+The keep-alive-preserving opt-out, `HttpConfig::reuse_client_across_sessions`,
+is currently available only through the kernel Rust API; ADBC exposes no option.
+
 The optional user-agent entry is appended to the driver-owned identity as
 `RustADBCDatabricksDriver/<version> (<entry>)`. Set it through
 `adbc.databricks.user_agent_entry`; `User-Agent` is not accepted in the generic

@@ -130,10 +130,16 @@ until implemented) and `External` (a caller-supplied `TokenProvider`).
 | `request_timeout` | Per-request timeout (connect + body). | `120s` |
 | `overall_timeout` | Maximum total time across retries for one logical RPC. | `900s` |
 | `pool_max_idle_per_host` | Connection-pool size (max idle warm sockets per host). Raise for bursty concurrent workloads. | `100` |
+| `reuse_client_across_sessions` | Reuse compatible idle HTTP clients across sessions on one runtime; `false` preserves within-session keep-alive. Rust-only; Node.js, Python, C ABI and ADBC expose no corresponding option. | `true` |
 | `retry_min_wait` | Minimum backoff between retries; also the floor for a server `Retry-After` and the base of exponential backoff (`min_wait × 2^attempt`). | `1s` |
 | `retry_max_wait` | Maximum backoff between retries; caps both the exponential backoff and a server `Retry-After`. | `60s` |
 | `retry_max_retries` | Max retries **after** the first attempt — a request is tried at most `retry_max_retries + 1` times. | `5` (→ 6 total attempts) |
 | `custom_headers` | Extra headers on every request; an ordered `Vec<(String, String)>` (duplicates allowed). `Authorization` / `x-databricks-org-id` are silently dropped (reserved); a `User-Agent` is folded into the effective UA. | `[]` |
+
+With cross-session reuse enabled, idle sockets and TLS/proxy configuration can
+remain for about 105 seconds after the last HTTP wrapper drops while the runtime
+is driven; otherwise expiry runs on the next cache access or runtime shutdown.
+A new session's system-trust snapshot can be up to 300 seconds old.
 
 ## `ProxyConfig` — HTTP/HTTPS proxy (optional)
 
