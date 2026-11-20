@@ -1009,29 +1009,33 @@ impl Metadata {
         const MAX_INFLIGHT: usize = 8;
 
         let mut all_batches: Vec<arrow_array::RecordBatch> = Vec::new();
-        let mut inflight = FuturesUnordered::new();
-        if speculative.is_some() {
-            if let Some(index) = names.iter().position(|name| name == &literal) {
-                inflight.push(self.fetch_tables_for_catalog(
-                    names.remove(index),
-                    schema_str.clone(),
-                    table_str.clone(),
-                    types_owned.clone(),
-                    speculative.take(),
-                ));
-            }
-        }
+        let literal_speculation = names
+            .iter()
+            .position(|name| name == &literal)
+            .and_then(|index| speculative.take().map(|task| (names.remove(index), task)));
         // Release completed unused responses now; pending executes finish
         // and close on the session runtime without gating matched catalogs.
         drop(speculative);
+        let mut inflight = FuturesUnordered::new();
         let mut remaining = names.into_iter();
-        for name in remaining.by_ref().take(MAX_INFLIGHT - inflight.len()) {
+        let ordinary_slots = MAX_INFLIGHT - usize::from(literal_speculation.is_some());
+        for name in remaining.by_ref().take(ordinary_slots) {
             inflight.push(self.fetch_tables_for_catalog(
                 name,
                 schema_str.clone(),
                 table_str.clone(),
                 types_owned.clone(),
                 None,
+            ));
+        }
+        // Start other executes before draining an already-ready literal response.
+        if let Some((name, task)) = literal_speculation {
+            inflight.push(self.fetch_tables_for_catalog(
+                name,
+                schema_str.clone(),
+                table_str.clone(),
+                types_owned.clone(),
+                Some(task),
             ));
         }
         while let Some(result) = inflight.next().await {
