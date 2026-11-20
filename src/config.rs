@@ -1056,8 +1056,9 @@ pub struct TlsConfig {
     /// Windows caches the results. The check is synchronous and runs inside the TLS
     /// handshake, so it blocks the calling task until CryptoAPI returns, even on a
     /// multi-thread runtime. A connect or operation timeout on that task can be exceeded
-    /// by up to the revocation budget (about 10 s for CRL and OCSP retrieval in total;
-    /// AIA and other chain-building fetches are bounded per URL, not in total). On a
+    /// by up to the revocation budget (about 10 s for CRL and OCSP retrieval in total, shared
+    /// by the one or two chain builds of a handshake; AIA and other chain-building fetches are
+    /// bounded per URL, not in total). On a
     /// `current_thread` runtime the whole runtime waits. Session resumption is disabled
     /// while checking is on.
     pub check_certificate_revocation: Option<bool>,

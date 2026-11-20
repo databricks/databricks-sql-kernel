@@ -36,7 +36,7 @@
 
 use std::ptr::{null, null_mut};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::client::WebPkiServerVerifier;
@@ -69,9 +69,11 @@ use windows_sys::Win32::Security::Cryptography::{
 use super::http::TlsConfig;
 use crate::kernel_error::{Error, Result};
 
-/// The budget for CRL and OCSP retrieval for one chain. CryptoAPI applies it to all of the
-/// chain's revocation fetches together (`CERT_CHAIN_REVOCATION_ACCUMULATIVE_TIMEOUT`). It does
-/// not bound AIA or other chain-building fetches, which use the per-URL timeout only.
+/// The budget for CRL and OCSP retrieval for one handshake. CryptoAPI applies it to all of a
+/// chain's revocation fetches together (`CERT_CHAIN_REVOCATION_ACCUMULATIVE_TIMEOUT`). One
+/// handshake runs at most two chain builds, and the second gets only the time the first left, so
+/// the total stays within this budget. It does not bound AIA or other chain-building fetches,
+/// which use the per-URL timeout only.
 const REVOCATION_TIMEOUT: Duration = Duration::from_secs(10);
 /// The chain flags: check every certificate except the root.
 const CHAIN_FLAGS: u32 =
@@ -256,12 +258,27 @@ fn cryptoapi_status(leaf: &[u8], intermediates: &[&[u8]], custom_cas: &[&[u8]]) 
     let Some(leaf) = Context::new(leaf) else {
         return Status::Undetermined;
     };
-    let status = chain_status("default engine", &leaf, &store, null_mut());
+    let started = Instant::now();
+    let status = chain_status(
+        "default engine",
+        &leaf,
+        &store,
+        null_mut(),
+        REVOCATION_TIMEOUT,
+    );
     // With a custom CA, Windows does not trust its root. The default engine can then end the
     // chain at an untrusted root and report no revocation status, so the result is undetermined.
     // Build again with an engine whose exclusive root is the custom CAs, which makes the chain
     // complete for this check. Webpki still decides trust, and only the revocation bits are read.
+    // The second build gets only the budget the first left, so one handshake waits at most
+    // REVOCATION_TIMEOUT in total. If nothing is left, the first result stands.
     if status != Status::Undetermined || custom_cas.is_empty() {
+        return status;
+    }
+    let remaining = REVOCATION_TIMEOUT.saturating_sub(started.elapsed());
+    // Under 1 ms counts as none left: dwUrlRetrievalTimeout is in milliseconds, and 0 there
+    // means CryptoAPI's own default timeout, not "no time".
+    if remaining.as_millis() == 0 {
         return status;
     }
     let Some(roots) = Store::memory() else {
@@ -273,18 +290,26 @@ fn cryptoapi_status(leaf: &[u8], intermediates: &[&[u8]], custom_cas: &[&[u8]]) 
     let Some(engine) = ChainEngine::exclusive(&roots) else {
         return status;
     };
-    chain_status("exclusive-root engine", &leaf, &store, engine.0)
+    chain_status("exclusive-root engine", &leaf, &store, engine.0, remaining)
 }
 
 /// Builds the chain for `leaf` with `engine` (null is the default engine) and reads its
-/// revocation status. `label` names the engine in the test-only diagnostics.
-fn chain_status(label: &str, leaf: &Context, store: &Store, engine: HCERTCHAINENGINE) -> Status {
+/// revocation status. `budget` bounds the revocation fetches of this build. `label` names the
+/// engine in the test-only diagnostics.
+fn chain_status(
+    label: &str,
+    leaf: &Context,
+    store: &Store,
+    engine: HCERTCHAINENGINE,
+    budget: Duration,
+) -> Status {
     // Only the test-only diagnostics below read `label`.
     let _ = label;
     let para = CERT_CHAIN_PARA {
         cbSize: std::mem::size_of::<CERT_CHAIN_PARA>() as u32,
-        // Per-URL timeout for chain-building fetches (AIA). It is not a total.
-        dwUrlRetrievalTimeout: REVOCATION_TIMEOUT.as_millis() as u32,
+        // Per-URL timeout for chain-building fetches (AIA). With the accumulative flag, the
+        // revocation fetches share this budget in total.
+        dwUrlRetrievalTimeout: budget.as_millis() as u32,
         ..Default::default()
     };
     let mut chain: *mut CERT_CHAIN_CONTEXT = null_mut();

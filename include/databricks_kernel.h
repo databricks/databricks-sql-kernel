@@ -483,8 +483,9 @@ KernelStatusCode kernel_session_config_set_tls_client_certificate(
  * kernel's proxy configuration, and Windows caches the results. The check is
  * synchronous: it blocks the calling thread's TLS handshake until CryptoAPI
  * returns, so a connect or operation timeout can be exceeded by up to the
- * revocation budget (about 10 s for CRL and OCSP retrieval in total; AIA and
- * other chain-building fetches are bounded per URL, not in total). Session
+ * revocation budget (about 10 s for CRL and OCSP retrieval in total, shared by a
+ * handshake's one or two chain builds; AIA and other chain-building fetches are
+ * bounded per URL, not in total). Session
  * resumption is disabled while checking is on.
  *
  * Requesting it on any other platform, or on tls-native, makes opening a session
