@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Volume completion authority and lifecycle through public execution handles.
+//! Wiremock tests for Volume file transfers through Statement and ResultStream.
 
 use arrow_array::{RecordBatch, StringArray};
 use arrow_ipc::writer::StreamWriter;

@@ -467,7 +467,7 @@ pub struct ResultStream {
     /// until the next call to `next_batch` replaces it.
     current: Option<ResultBatch>,
 
-    /// Buffered outcomes retained for subsequent reads after inspection.
+    /// Batches and read errors already pulled from the reader but not yet returned to the caller.
     prefetched: Prefetched<ResultBatch>,
 
     /// Row cursor inside [`current`](Self::current). Reset to `0`
@@ -647,16 +647,19 @@ impl ResultStream {
         }
     }
 
-    /// Whether this execution has server-authorized Volume completion.
+    /// True when the server marked this result as a Volume PUT, GET or REMOVE.
     pub fn is_volume_operation(&self) -> bool {
         self.volume.is_some()
     }
 
-    /// Complete a server-marked Volume operation while retaining its instruction rows.
+    /// Runs the file transfer for a Volume PUT, GET or REMOVE result.
     ///
-    /// Ordinary results and read-only attachments have no transfer authority.
-    /// `NeedsInputStream` requests owned bytes for the server's stream sentinel;
-    /// supplying an empty buffer is a valid upload.
+    /// Call before reading rows; the rows stay readable afterwards. The outcome is
+    /// cached, so a repeat call does not transfer again. A GET downloads to a
+    /// temporary file and then copies it over the destination, so a failed
+    /// download leaves an existing file unchanged.
+    /// Results from [`Session::attach_async_statement`](crate::Session::attach_async_statement)
+    /// cannot run transfers and return `NotVolume`.
     pub async fn complete_volume_operation(
         &mut self,
         options: &crate::volume::VolumeOptions,
@@ -684,7 +687,7 @@ impl ResultStream {
                         }
                         self.prefetched.pop_front();
                     };
-                    // Later batches cannot authorize a partial transfer of a multi-row result.
+                    // Read to the end before transferring: a result with more than one row is rejected.
                     while !self.exhausted {
                         match self
                             .reader
@@ -801,8 +804,8 @@ impl ResultStream {
     /// performed on this path, so calling from a tokio runtime
     /// (napi-rs, PyO3 async) is safe.
     pub async fn next_batch(&mut self) -> Result<Option<&ResultBatch>> {
-        // Replay inspected batches first so DML counts and Volume validation
-        // do not consume callers' result rows.
+        // Return buffered batches first, so rows read ahead by a peek or by Volume
+        // completion still reach the caller.
         if let Some(batch) = self.prefetched.pop_front() {
             self.set_current_batch(batch.map_err(|error| *error)?);
             return Ok(self.current.as_ref());
@@ -874,11 +877,8 @@ impl ResultStream {
         }
     }
 
-    /// Non-consuming peek at the next buffered batch.
-    ///
-    /// Pulls a batch or error when none is current or buffered and the reader is not
-    /// exhausted. A subsequent [`next_batch`](Self::next_batch) still returns
-    /// the buffered outcome.
+    /// Before the first next_batch, returns the first batch without consuming it.
+    /// The following next_batch returns the same batch or error.
     pub(crate) async fn peek_first_batch(&mut self) -> Result<Option<&ResultBatch>> {
         if self.prefetched.is_empty() && self.current.is_none() && !self.exhausted {
             let reader = self
@@ -1003,7 +1003,7 @@ impl ResultStream {
     /// runtime at all. Errors are surfaced once; subsequent calls
     /// after an `Err` keep returning `None`.
     pub fn into_owned_batches(mut self) -> OwnedBatchIter {
-        // Inspected batches were pulled from the reader; yield them first to preserve row order.
+        // Buffered batches were read first, so yield them first to keep row order.
         let prefetched = std::mem::take(&mut self.prefetched)
             .into_iter()
             .map(|outcome| outcome.map(|ResultBatch::Arrow(rb)| rb))
@@ -1042,7 +1042,6 @@ impl Drop for ResultStream {
 /// reader's natural end-of-stream the same way.
 pub struct OwnedBatchIter {
     reader: Box<dyn ResultReader>,
-    /// Inspected batches must precede the reader's remaining rows.
     prefetched: Prefetched<RecordBatch>,
     telemetry: Option<ResultStreamTelemetry>,
     done: bool,

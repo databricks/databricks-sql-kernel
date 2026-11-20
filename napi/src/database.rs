@@ -453,11 +453,9 @@ pub struct ConnectionOptions {
     /// server) can now route a single connection through a proxy
     /// programmatically.
     pub proxy: Option<ProxyInput>,
-    /// SQL request deadline and Volume storage idle timeout, in milliseconds.
-    /// Storage idle time bounds reads, upload progress and the PUT response wait;
-    /// a redirected stream PUT resend has no idle bound.
-    /// Omitted: SQL uses the kernel default; storage uses 15 minutes.
-    /// Zero disables storage inactivity and keeps the SQL default.
+    /// Timeout in milliseconds. SQL requests: total time for one request (kernel
+    /// default when omitted or 0). Volume file transfers: time allowed without
+    /// progress (15 minutes when omitted, no limit when 0).
     pub socket_timeout_ms: Option<u32>,
 }
 

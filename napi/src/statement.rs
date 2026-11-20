@@ -202,7 +202,8 @@ impl Statement {
         self.is_volume_operation
     }
 
-    /// Complete a server-marked file transfer while retaining its instruction rows.
+    /// Runs the file transfer for a Volume PUT, GET or REMOVE result. Call before
+    /// fetching; the rows stay readable afterwards.
     #[napi]
     pub async fn complete_volume_operation(
         &self,

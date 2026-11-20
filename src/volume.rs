@@ -12,7 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Explicit completion of server-authorized Volume file transfers.
+//! File transfers for Volume PUT, GET and REMOVE statements.
+//!
+//! The server answers these statements with one row holding a presigned
+//! storage URL, request headers and a local path. This module makes that
+//! storage request when the caller asks.
 
 use crate::client::retry::{calculate_backoff, RequestType, RetryConfig, RetryStrategy};
 use crate::kernel_error::{Error, LocalFileError, Result};
@@ -28,30 +32,21 @@ use tokio_util::bytes::Bytes;
 use tokio_util::io::ReaderStream;
 use tokio_util::sync::CancellationToken;
 
-/// Local file authorization and driver-specific storage response policy.
-///
-/// Requested and resolved paths must be within allowed roots. Symlinks between
-/// authorized roots work; `..` collapses before symlink resolution. Path components
-/// must remain stable during file access.
-/// GET downloads into a temporary file, beside the destination when its directory
-/// allows it and in the system temporary directory otherwise, then copies it into
-/// the destination in place. Download failure or cancellation before publication
-/// preserves existing bytes; a failure during the copy can leave the destination
-/// partially written. Cancellation after publication starts does not interrupt it.
-/// GET decodes gzip Content-Encoding before writing the downloaded bytes.
-/// The storage idle timeout bounds GET reads, PUT upload progress and the wait for
-/// the PUT response. A stream PUT that storage redirects is sent again with its
-/// full body, and that resend has no idle bound. A cancelled PUT or REMOVE may
-/// already have changed storage.
+/// Caller settings for a Volume file transfer.
 #[non_exhaustive]
 #[derive(Debug, Clone, Default)]
 pub struct VolumeOptions {
+    /// Local directories a PUT may read from and a GET may write to. Both the
+    /// path named in the statement and the file it resolves to through
+    /// symlinks must be inside one of them. Empty allows no local file access.
+    /// The check runs before the file is opened, so nothing else may swap
+    /// files or links in these directories during a transfer.
     pub allowed_paths: Vec<PathBuf>,
+    /// Report success when REMOVE targets a file that does not exist.
     pub remove_not_found_is_success: bool,
 }
 
 impl VolumeOptions {
-    /// Configure local roots and the binding's missing-object REMOVE policy.
     pub fn new(allowed_paths: Vec<PathBuf>, remove_not_found_is_success: bool) -> Self {
         Self {
             allowed_paths,
@@ -60,12 +55,15 @@ impl VolumeOptions {
     }
 }
 
-/// Result of explicitly completing a server-marked Volume instruction.
+/// Outcome of `ResultStream::complete_volume_operation`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
 pub enum VolumeCompletion {
+    /// The result is not a Volume statement; nothing was done.
     NotVolume = 0,
+    /// The PUT uploads caller-supplied bytes; call again with `input_bytes`.
     NeedsInputStream = 1,
+    /// The transfer finished.
     Completed = 2,
 }
 
@@ -109,7 +107,7 @@ impl VolumeState {
         match self
             .completion
             .get_or_try_init(|| async {
-                // An abandoned initializer must not replay an already-dispatched transfer.
+                // If an earlier call was dropped mid-transfer, do not run the transfer again.
                 if self.started.swap(true, Ordering::AcqRel) || self.cancellation.is_cancelled() {
                     return Ok(Err(cancelled()));
                 }
@@ -209,12 +207,13 @@ impl VolumeState {
                 Ok(completion) => return Ok(completion),
                 Err(error) => error,
             };
+            // The retry clock starts at the first failure, so a long transfer does not
+            // use up the retry budget.
             let started = retry_started.get_or_insert_with(std::time::Instant::now);
             if !error.retryable || attempt >= self.retry.max_retries {
                 return Err(error.message(format!("after {} attempts", attempt + 1)));
             }
             let wait = calculate_backoff(&self.retry, attempt, retry_after.as_deref());
-            // Retry budgets govern recovery, not the duration of a healthy transfer.
             if started.elapsed().saturating_add(wait) >= self.retry.overall_timeout {
                 return Err(error.message(format!("after {} attempts", attempt + 1)));
             }
@@ -244,7 +243,7 @@ impl VolumeState {
                         std::fs::File::open(path).map_err(|e| local_error(e, &local_file))?;
                     let metadata = file.metadata().map_err(|e| local_error(e, &local_file))?;
                     if metadata.is_dir() {
-                        // Reading the opened directory retains the platform's filesystem cause.
+                        // A directory opens without error on Unix; reading it produces the OS error to report.
                         let error = std::io::Read::read(&mut file, &mut [0])
                             .err()
                             .unwrap_or_else(|| std::io::ErrorKind::IsADirectory.into());
@@ -321,7 +320,8 @@ impl VolumeState {
         )
         .await?;
         if let Some(bytes) = input.filter(|_| matches!(response.status().as_u16(), 307 | 308)) {
-            // Reusable bytes let reqwest apply its redirect and credential policy.
+            // reqwest cannot replay a streamed body on a redirect. Resend from memory
+            // so it can follow; this resend has no idle timeout.
             response = client
                 .put(&instruction.url)
                 .headers(instruction.headers.clone())

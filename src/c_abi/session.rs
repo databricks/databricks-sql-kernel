@@ -631,7 +631,7 @@ pub unsafe extern "C" fn kernel_session_config_set_sea_response_compression_enab
 /// Configure the total timeout for one HTTP request, from connection start
 /// through response-body completion. A separate 30-second connection timeout
 /// also applies, so connection establishment is bounded by the shorter limit.
-/// Volume storage inactivity is configured by `kernel_session_config_set_storage_read_timeout`.
+/// Does not apply to Volume file transfers; see the storage read timeout.
 /// `request_timeout_ms == 0` clears an earlier override and keeps the kernel
 /// default (120 seconds); a positive value overrides it.
 ///
@@ -649,9 +649,8 @@ pub unsafe extern "C" fn kernel_session_config_set_request_timeout(
     })
 }
 
-/// Configure the Volume storage idle timeout; zero disables it.
-/// Bounds reads, upload progress and PUT response waits. Redirected stream PUT
-/// resends have no idle bound.
+/// Idle limit for Volume file transfers: a transfer fails after this long
+/// without progress. Also caps connection setup. Zero sets no limit.
 ///
 /// # Safety
 /// `config` must be a live config handle.

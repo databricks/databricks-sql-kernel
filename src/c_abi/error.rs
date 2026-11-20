@@ -139,7 +139,8 @@ pub extern "C" fn kernel_get_last_error_local_os_error() -> i32 {
     LAST_ERROR.with(|last| last.borrow().local_os_error)
 }
 
-/// Borrowed structured error identifier, or null. Valid until the next error-clearing call.
+/// The error's string code, such as VOLUME_PATH_NOT_ALLOWED, or null.
+/// Valid until the next call that clears the error.
 #[no_mangle]
 pub extern "C" fn kernel_get_last_error_code() -> *const c_char {
     LAST_ERROR.with(|last| {

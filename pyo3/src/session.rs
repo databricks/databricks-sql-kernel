@@ -323,9 +323,9 @@ impl Session {
     /// 30-second connection timeout also applies, so connection establishment
     /// is bounded by the shorter limit. Unset or `0` keeps the kernel default
     /// (120 seconds).
-    /// For Volume transfers, a positive value bounds connection establishment,
-    /// GET/REMOVE header and body reads, PUT upload inactivity and the PUT
-    /// response-header wait. Redirected stream PUT resends have no idle bound.
+    /// For Volume file transfers a positive value is an idle limit instead:
+    /// a transfer fails after that long without progress.
+    /// Unset or `0` sets no Volume idle limit.
     ///
     /// `max_connections` sets the maximum idle connections retained per host.
     /// Unset keeps the kernel default (100); zero is rejected.

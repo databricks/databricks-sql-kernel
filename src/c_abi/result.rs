@@ -654,8 +654,8 @@ pub unsafe extern "C" fn kernel_result_stream_canceller_free(
     })
 }
 
-/// Read the Volume marker captured when this stream was created.
-/// Success does not establish whether the executed owner is valid.
+/// Same flag, read from the stream. Still succeeds after the executed statement
+/// is closed.
 /// # Safety
 /// `stream` must be live and `out` must be writable.
 #[no_mangle]
@@ -673,8 +673,12 @@ pub unsafe extern "C" fn kernel_result_stream_is_volume_operation(
     })
 }
 
-/// Complete a marked instruction while preserving its result rows.
-/// `allowed_paths_json` is a JSON array of strings. This API supplies no input bytes.
+/// Runs the file transfer for a Volume PUT, GET or REMOVE result. Call before
+/// fetching; the rows stay readable afterwards.
+/// `allowed_paths_json`: JSON array of local directories the transfer may use.
+/// `remove_not_found_is_success`: report success when the remote file is missing.
+/// Returns NeedsInputStream for a stream upload, which this API cannot perform.
+/// `kernel_result_stream_canceller_cancel` interrupts it from another thread.
 /// # Safety
 /// `stream` must be live with exclusive fetch access, `allowed_paths_json` must
 /// be NUL-terminated UTF-8, and `out_status` must be writable.

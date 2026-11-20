@@ -41,8 +41,12 @@
 //!   Aborted, Unimplemented, …) lands in a follow-on PR. External
 //!   `match` arms get a forced `_ =>` fallback — they keep compiling
 //!   when the enum grows.
-//! - `Error` supports struct patterns with `..`; constructors and setters avoid
-//!   coupling callers to its full field list.
+//! - `Error` **is not** `#[non_exhaustive]`: wrappers want to
+//!   pattern-match (`let Error { code, message, sql_state, .. }`) for
+//!   logging and host-language exception mapping. New fields go
+//!   through `Error::new(...).with_*(...)`, so adding a field is
+//!   non-breaking without the marker. Keeping the marker would block
+//!   useful pattern-matches for no real benefit.
 
 #![allow(dead_code)]
 
@@ -165,6 +169,9 @@ impl ErrorCode {
 /// chain `with_*` setters. **Pattern-matching is supported** —
 /// wrappers writing a comprehensive logger or host-language exception
 /// adapter can do `let Error { code, message, sql_state, .. } = err;`.
+/// New fields land through additive setters, so the type does not
+/// need `#[non_exhaustive]` (and the marker would block the
+/// pattern-matching wrappers actually want).
 #[derive(Debug, Clone)]
 pub struct Error {
     pub code: ErrorCode,
@@ -246,7 +253,7 @@ pub struct Error {
     pub local_error: Option<Box<LocalFileError>>,
 }
 
-/// Local filesystem error details retained across language boundaries.
+/// The OS error behind a failed local file operation.
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct LocalFileError {
@@ -462,7 +469,6 @@ impl Error {
         self
     }
 
-    /// Attach the original local filesystem error for binding-specific mapping.
     pub fn with_local_error(mut self, local_error: LocalFileError) -> Self {
         self.local_error = Some(Box::new(local_error));
         self

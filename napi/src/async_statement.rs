@@ -410,7 +410,8 @@ impl AsyncStatement {
                 .map_err(napi_err_from_kernel);
             // Release what holds the session, so JS references to closed
             // handles don't keep it (and the host's telemetry client) alive.
-            // Queue busy slots so close need not wait for an in-flight operation.
+            // A slot in use is cleared in the background, so close() does not wait
+            // for the running call.
             canceller
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -492,7 +493,8 @@ impl AsyncResultHandle {
         self.is_volume_operation
     }
 
-    /// Complete a server-marked file transfer while retaining its instruction rows.
+    /// Runs the file transfer for a Volume PUT, GET or REMOVE result. Call before
+    /// fetching; the rows stay readable afterwards.
     #[napi]
     pub async fn complete_volume_operation(
         &self,

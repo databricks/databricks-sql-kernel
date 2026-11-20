@@ -70,8 +70,8 @@ and security vulnerabilities should be reported according to
 
 Call `ResultStream::complete_volume_operation` with `VolumeOptions` before reading
 server-marked PUT, GET and REMOVE rows; omit completion for raw results.
-See [`VolumeOptions`](https://docs.rs/databricks-sql-kernel/latest/databricks_sql_kernel/struct.VolumeOptions.html)
-for authorization, completion and transfer behavior.
+See [`ResultStream::complete_volume_operation`](https://docs.rs/databricks-sql-kernel/latest/databricks_sql_kernel/struct.ResultStream.html#method.complete_volume_operation)
+for transfer behavior.
 
 ## License
 

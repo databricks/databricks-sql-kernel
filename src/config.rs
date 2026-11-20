@@ -755,11 +755,11 @@ pub struct HttpConfig {
     /// Total timeout for one HTTP request, from connection start through
     /// response-body completion. A separate 30-second connection timeout also
     /// applies, so connection establishment is bounded by the shorter limit.
-    /// Does not bound Volume storage requests; use `storage_read_timeout` for inactivity.
+    /// Does not apply to Volume file transfers; see the storage read timeout.
     pub request_timeout: Duration,
 
-    /// Volume idle limit for reads, upload progress and PUT response-header waits.
-    /// Also caps connection setup; redirected stream PUT resends have no idle bound.
+    /// Idle limit for Volume file transfers: a transfer fails after this long
+    /// without progress. Also caps connection setup. None sets no limit.
     pub storage_read_timeout: Option<Duration>,
 
     /// Maximum total time across retries for a single logical RPC.

@@ -1239,7 +1239,7 @@ unsafe fn with_statement(
     })
 }
 
-/// Read the server-authorized Volume marker before taking a result stream.
+/// Whether the statement is a Volume PUT, GET or REMOVE.
 /// # Safety
 /// `exec` must be live and `out` must be writable; no fetch may be in flight.
 #[no_mangle]
