@@ -273,4 +273,4 @@ jobs:
 
       - name: Test client behavior (tls-rustls, Windows)
         shell: pwsh
-        run: cargo test -p databricks-sql-kernel --no-default-features --features tls-rustls --lib client::
+        run: "cargo test -p databricks-sql-kernel --no-default-features --features tls-rustls --lib client::"
