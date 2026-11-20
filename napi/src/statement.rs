@@ -80,7 +80,7 @@ enum AnyInner {
 }
 
 impl BatchSource for AnyInner {
-    fn try_next_batch(
+    fn try_next_ready_batch(
         &mut self,
     ) -> databricks_sql_kernel::Result<databricks_sql_kernel::result_stream::TryNextBatch<'_>> {
         match self {

@@ -367,6 +367,113 @@ mod tests {
         }
     }
 
+    struct BatchThenOneShotErrorReader {
+        schema: Arc<Schema>,
+        batch: Option<RecordBatch>,
+        error_pending: bool,
+    }
+
+    #[async_trait]
+    impl ResultReader for BatchThenOneShotErrorReader {
+        async fn schema(&self) -> crate::Result<crate::result_stream::SchemaRef> {
+            Ok(self.schema.clone())
+        }
+
+        async fn next_batch(&mut self) -> crate::Result<Option<RecordBatch>> {
+            match self.try_next_batch()? {
+                crate::reader::TryNextBatch::Ready(batch) => Ok(Some(batch)),
+                crate::reader::TryNextBatch::End => Ok(None),
+                _ => unreachable!(),
+            }
+        }
+
+        fn try_next_batch(&mut self) -> crate::Result<crate::reader::TryNextBatch> {
+            if let Some(batch) = self.batch.take() {
+                return Ok(crate::reader::TryNextBatch::Ready(batch));
+            }
+            if std::mem::take(&mut self.error_pending) {
+                return Err(KernelError::internal().message("one-shot lookahead failure"));
+            }
+            Ok(crate::reader::TryNextBatch::End)
+        }
+
+        fn try_next_ready_batch(&mut self) -> crate::Result<crate::reader::TryNextBatch> {
+            self.try_next_batch()
+        }
+    }
+
+    #[tokio::test]
+    async fn lookahead_error_telemetry_matches_normal_fetch_and_early_close() {
+        for lookahead in [false, true] {
+            for deliver_error in [false, true] {
+                for delivery in [0, 1, 2] {
+                    let connection = Arc::new(CapturingConnectionTelemetry::default());
+                    let batch = RecordBatch::try_from_iter([(
+                        "n",
+                        Arc::new(arrow_array::Int32Array::from(vec![Some(13), None]))
+                            as arrow_array::ArrayRef,
+                    )])
+                    .unwrap();
+                    let mut stream =
+                        ResultStream::from_reader(Box::new(BatchThenOneShotErrorReader {
+                            schema: batch.schema(),
+                            batch: Some(batch),
+                            error_pending: true,
+                        }))
+                        .await
+                        .unwrap();
+                    stream.attach_telemetry(StatementTelemetry::new(
+                        connection.clone(),
+                        StatementType::Sql,
+                        OperationType::ExecuteStatement,
+                    ));
+                    assert!(stream.next_batch().await.unwrap().is_some());
+                    if lookahead {
+                        for _ in 0..2 {
+                            assert!(matches!(
+                                stream.try_next_ready_batch().unwrap(),
+                                crate::result_stream::TryNextBatch::Pending
+                            ));
+                        }
+                        assert!(stream.current().is_some());
+                    }
+                    assert!(connection.statement_events.lock().unwrap().is_empty());
+                    if deliver_error && delivery == 2 {
+                        let mut batches = stream.into_owned_batches();
+                        let error = batches.next().unwrap().unwrap_err();
+                        assert_eq!(error.code, ErrorCode::Internal);
+                        assert_eq!(error.message, "one-shot lookahead failure");
+                        assert!(batches.next().is_none());
+                        drop(batches);
+                    } else {
+                        if deliver_error {
+                            let error = if delivery == 1 {
+                                stream.try_next_batch().unwrap_err()
+                            } else {
+                                stream.next_batch().await.unwrap_err()
+                            };
+                            assert_eq!(error.code, ErrorCode::Internal);
+                            assert_eq!(error.message, "one-shot lookahead failure");
+                            assert!(stream.next_batch().await.unwrap().is_none());
+                        }
+                        stream.finish_telemetry();
+                        drop(stream);
+                    }
+                    let events = connection.statement_events.lock().unwrap();
+                    assert_eq!(events.len(), 1);
+                    assert_eq!(
+                        events[0].error_code,
+                        deliver_error.then_some(ErrorCode::Internal)
+                    );
+                    assert_eq!(
+                        events[0].context.consumption_latency.is_some(),
+                        deliver_error
+                    );
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn peek_first_batch_error_finalizes_statement_with_error_before_drop() {
         let connection = Arc::new(CapturingConnectionTelemetry::default());

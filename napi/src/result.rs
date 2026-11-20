@@ -67,19 +67,13 @@ fn encode_ipc_batches(schema: &SchemaRef, batches: &[RecordBatch]) -> napi::Resu
             KernelError::internal().message(format!("Arrow IPC writer {stage} failed: {e}")),
         )
     }
-    // Pre-size the buffer so a typical 500KB batch doesn't reallocate
-    // ~17 times growing from `Vec::new()`'s default capacity of 0.
-    // `get_array_memory_size` is the kernel-side memory footprint (close
-    // enough to the IPC-encoded size for capacity-hint purposes — IPC
-    // adds ~hundreds of bytes of framing per batch, not orders of
-    // magnitude). 4 KiB slack covers the schema-header on the
-    // schema-only path (`batch = None`) and the framing overhead on
-    // the schema+batch path.
+    // IPC-decoded arrays can share a much larger backing buffer. Reserve for
+    // the slices being encoded, with slack for schema and message framing.
     let estimated = batches
         .iter()
-        .map(RecordBatch::get_array_memory_size)
-        .sum::<usize>()
-        + 4096;
+        .map(sliced_batch_bytes)
+        .fold(4096usize, usize::saturating_add)
+        .min(4 * 1024 * 1024);
     let mut buf: Vec<u8> = Vec::with_capacity(estimated);
     {
         let mut writer =
@@ -92,21 +86,31 @@ fn encode_ipc_batches(schema: &SchemaRef, batches: &[RecordBatch]) -> napi::Resu
     Ok(buf)
 }
 
+fn sliced_batch_bytes(batch: &RecordBatch) -> usize {
+    batch
+        .columns()
+        .iter()
+        .try_fold(0usize, |bytes, array| {
+            bytes.checked_add(array.to_data().get_slice_memory_size().ok()?)
+        })
+        .unwrap_or(usize::MAX)
+}
+
 pub(crate) trait BatchSource: Send {
     fn next_batch(
         &mut self,
     ) -> impl std::future::Future<Output = databricks_sql_kernel::Result<Option<&ResultBatch>>> + Send;
 
-    fn try_next_batch(&mut self) -> databricks_sql_kernel::Result<TryNextBatch<'_>>;
+    fn try_next_ready_batch(&mut self) -> databricks_sql_kernel::Result<TryNextBatch<'_>>;
 }
 
 impl BatchSource for ResultStream {
     async fn next_batch(&mut self) -> databricks_sql_kernel::Result<Option<&ResultBatch>> {
-        self.next_batch().await
+        ResultStream::next_batch(self).await
     }
 
-    fn try_next_batch(&mut self) -> databricks_sql_kernel::Result<TryNextBatch<'_>> {
-        self.try_next_ready_batch()
+    fn try_next_ready_batch(&mut self) -> databricks_sql_kernel::Result<TryNextBatch<'_>> {
+        ResultStream::try_next_ready_batch(self)
     }
 }
 
@@ -143,17 +147,14 @@ impl<Source: BatchSource> IpcStream<Source> {
             }
         };
         let mut rows = first.num_rows();
-        let mut bytes = first.get_array_memory_size();
+        let mut bytes = sliced_batch_bytes(&first);
         let mut batches = vec![first];
         while rows < 16_384 && bytes < 4 * 1024 * 1024 && batches.len() < 16 {
-            let candidate = match self.source.try_next_batch() {
+            let candidate = match self.source.try_next_ready_batch() {
                 Ok(TryNextBatch::Ready(batch)) => clone_arrow_batch(batch, binding_name),
                 Ok(TryNextBatch::Pending | TryNextBatch::End) => break,
                 Err(error) => Err(napi_err_from_kernel(error)),
-                Ok(_) => Err(napi_err_from_kernel(
-                    KernelError::invalid_argument()
-                        .message("unsupported non-blocking result state"),
-                )),
+                Ok(_) => break,
             };
             let candidate = match candidate {
                 Ok(batch) => batch,
@@ -162,7 +163,7 @@ impl<Source: BatchSource> IpcStream<Source> {
                     break;
                 }
             };
-            let candidate_bytes = candidate.get_array_memory_size();
+            let candidate_bytes = sliced_batch_bytes(&candidate);
             if candidate.num_rows() > 16_384 - rows || candidate_bytes > 4 * 1024 * 1024 - bytes {
                 self.pending = Some(Ok(candidate));
                 break;
@@ -268,7 +269,7 @@ mod tests {
             }
         }
 
-        fn try_next_batch(&mut self) -> databricks_sql_kernel::Result<TryNextBatch<'_>> {
+        fn try_next_ready_batch(&mut self) -> databricks_sql_kernel::Result<TryNextBatch<'_>> {
             self.probes += 1;
             self.take()
         }
@@ -404,6 +405,35 @@ mod tests {
         );
         assert_eq!(stream.source.probes, 3);
         assert_eq!(next(&mut stream, &make_schema()).await, vec![batch]);
+    }
+
+    #[tokio::test]
+    async fn decoded_wide_slices_share_backing_memory_without_inflating_budget() {
+        use arrow_array::{ArrayRef, Int64Array};
+        let batch = RecordBatch::try_from_iter((0..34).map(|column| {
+            (
+                format!("column{column}"),
+                Arc::new(Int64Array::from_iter(
+                    (0..2840).map(|row| (row % 11 != 0).then_some(row + column)),
+                )) as ArrayRef,
+            )
+        }))
+        .unwrap();
+        let bytes = encode_ipc_batches(&batch.schema(), &[batch]).unwrap();
+        let decoded =
+            StreamReader::try_new(std::io::BufReader::new(std::io::Cursor::new(bytes)), None)
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap();
+        assert!(decoded.get_array_memory_size() > 4 * 1024 * 1024);
+        assert!(sliced_batch_bytes(&decoded) < 800_000);
+        let schema = decoded.schema();
+        let mut stream = IpcStream::new(Source::new(vec![decoded.clone(); 6]));
+        let bytes = stream.next(&schema, "test").await.unwrap().unwrap();
+        assert!(bytes.len() < 4 * 1024 * 1024);
+        assert_eq!(decode(bytes), vec![decoded.clone(); 5]);
+        assert_eq!(next(&mut stream, &schema).await, vec![decoded]);
     }
 
     #[tokio::test]

@@ -1231,6 +1231,12 @@ impl ResultReader for ThriftReshapingReader {
         }
     }
 
+    fn try_next_ready_batch(&mut self) -> Result<crate::reader::TryNextBatch> {
+        self.upstream
+            .try_next_ready_batch()?
+            .map_ready(|batch| self.reshape_batch(batch))
+    }
+
     fn try_next_batch(&mut self) -> Result<crate::reader::TryNextBatch> {
         self.upstream
             .try_next_batch()?

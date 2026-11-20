@@ -714,7 +714,11 @@ impl ResultStream {
         // A batch buffered by `peek_first_batch` is replayed here first,
         // so a non-consuming peek doesn't steal it from the caller.
         if let Some(batch) = self.prefetched.take() {
-            self.set_current_batch(batch.map_err(|error| *error)?);
+            let batch = batch.map_err(|error| {
+                self.finalize_telemetry(Some(&error));
+                *error
+            })?;
+            self.set_current_batch(batch);
             return Ok(self.current.as_ref());
         }
         if self.exhausted {
@@ -750,22 +754,30 @@ impl ResultStream {
         self.try_next_batch_inner(true)
     }
 
-    /// Non-blocking lookahead for bindings packing ready batches. End-of-stream
-    /// leaves the current batch and telemetry untouched until a normal fetch,
-    /// so returning a payload does not prematurely mark it fully consumed.
+    /// Non-blocking lookahead for bindings packing ready batches. Errors and
+    /// end-of-stream do not finalize telemetry or clear the current batch.
+    /// Call `next_batch` (or `try_next_batch`) to deliver a buffered error or
+    /// observe the end and finalize consumption. Readers may opt out of probing.
     pub fn try_next_ready_batch(&mut self) -> Result<TryNextBatch<'_>> {
         self.try_next_batch_inner(false)
     }
 
-    fn try_next_batch_inner(&mut self, finalize_end: bool) -> Result<TryNextBatch<'_>> {
+    fn try_next_batch_inner(&mut self, finalize: bool) -> Result<TryNextBatch<'_>> {
+        if !finalize && matches!(self.prefetched, Some(Err(_))) {
+            return Ok(TryNextBatch::Pending);
+        }
         if let Some(batch) = self.prefetched.take() {
-            self.set_current_batch(batch.map_err(|error| *error)?);
+            let batch = batch.map_err(|error| {
+                self.finalize_telemetry(Some(&error));
+                *error
+            })?;
+            self.set_current_batch(batch);
             return Ok(TryNextBatch::Ready(
                 self.current.as_ref().expect("batch was just installed"),
             ));
         }
         if self.exhausted {
-            if finalize_end {
+            if finalize {
                 self.finalize_telemetry(None);
             }
             return Ok(TryNextBatch::End);
@@ -775,7 +787,12 @@ impl ResultStream {
             .reader
             .as_mut()
             .expect("ResultStream reader is present until into_owned_batches consumes it");
-        match reader.try_next_batch() {
+        let next = if finalize {
+            reader.try_next_batch()
+        } else {
+            reader.try_next_ready_batch()
+        };
+        match next {
             Ok(crate::reader::TryNextBatch::Ready(batch)) => {
                 self.set_current_batch(ResultBatch::Arrow(batch));
                 Ok(TryNextBatch::Ready(
@@ -783,13 +800,17 @@ impl ResultStream {
                 ))
             }
             Ok(crate::reader::TryNextBatch::Pending) => Ok(TryNextBatch::Pending),
-            Ok(crate::reader::TryNextBatch::End) if !finalize_end => Ok(TryNextBatch::End),
+            Ok(crate::reader::TryNextBatch::End) if !finalize => Ok(TryNextBatch::End),
             Ok(crate::reader::TryNextBatch::End) => {
                 self.current = None;
                 self.current_row_idx = 0;
                 self.exhausted = true;
                 self.finalize_telemetry(None);
                 Ok(TryNextBatch::End)
+            }
+            Err(error) if !finalize => {
+                self.prefetched = Some(Err(Box::new(error)));
+                Ok(TryNextBatch::Pending)
             }
             Err(error) => {
                 self.finalize_telemetry(Some(&error));
@@ -993,6 +1014,9 @@ impl Iterator for OwnedBatchIter {
                 }
                 Err(error) => {
                     self.done = true;
+                    if let Some(telemetry) = &mut self.telemetry {
+                        telemetry.finish(self.reader.metrics(), Some(&error), true);
+                    }
                     Some(Err(*error))
                 }
             };
@@ -1422,6 +1446,43 @@ mod tests {
         assert!(!stream.telemetry.as_ref().unwrap().finalized);
         assert!(stream.next_batch().await.unwrap().is_none());
         assert!(stream.telemetry.as_ref().unwrap().finalized);
+    }
+
+    #[tokio::test]
+    async fn ready_lookahead_falls_back_for_non_polling_readers() {
+        struct NonPollingReader(std::vec::IntoIter<RecordBatch>, SchemaRef);
+
+        #[async_trait::async_trait]
+        impl crate::reader::ResultReader for NonPollingReader {
+            async fn schema(&self) -> Result<SchemaRef> {
+                Ok(self.1.clone())
+            }
+
+            async fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
+                Ok(self.0.next())
+            }
+        }
+
+        let batch =
+            RecordBatch::try_from_iter([("n", Arc::new(Int32Array::from(vec![13])) as ArrayRef)])
+                .unwrap();
+        let mut stream = ResultStream::from_reader(Box::new(NonPollingReader(
+            vec![batch.clone(), batch.clone()].into_iter(),
+            batch.schema(),
+        )))
+        .await
+        .unwrap();
+        for _ in 0..2 {
+            assert!(matches!(
+                stream.try_next_ready_batch().unwrap(),
+                TryNextBatch::Pending
+            ));
+            let Some(ResultBatch::Arrow(actual)) = stream.next_batch().await.unwrap() else {
+                panic!("blocking fetch must still return the next batch");
+            };
+            assert_eq!(actual, &batch);
+        }
+        assert!(stream.next_batch().await.unwrap().is_none());
     }
 
     #[tokio::test]

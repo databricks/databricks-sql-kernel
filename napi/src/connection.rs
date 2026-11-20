@@ -702,6 +702,169 @@ mod tests {
         assert_eq!(conn.session_id(), "session-survives-close");
     }
 
+    async fn packed_statement_observations(server: &MockServer) -> (usize, Vec<serde_json::Value>) {
+        let requests = server.received_requests().await.unwrap();
+        let closes = requests
+            .iter()
+            .filter(|request| {
+                request.method.as_str() == "DELETE"
+                    && request.url.path() == "/api/2.0/sql/statements/stmt-packed-eof"
+            })
+            .count();
+        let events = requests
+            .iter()
+            .filter(|request| request.url.path() == "/telemetry-ext")
+            .flat_map(|request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                body["protoLogs"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|log| {
+                        serde_json::from_str::<serde_json::Value>(log.as_str().unwrap()).unwrap()
+                    })
+                    .filter(|log| {
+                        log["entry"]["sql_driver_log"]["sql_statement_id"] == "stmt-packed-eof"
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        (closes, events)
+    }
+
+    #[tokio::test]
+    async fn packed_executed_path_defers_close_and_telemetry_until_consumed() {
+        use arrow_array::{ArrayRef, Int64Array, RecordBatch};
+        use arrow_ipc::{reader::StreamReader, writer::StreamWriter};
+        use databricks_sql_kernel::TelemetryConfig;
+        use std::time::Duration;
+
+        for early_close in [false, true] {
+            let server = MockServer::start().await;
+            let batch = RecordBatch::try_from_iter([(
+                "n",
+                Arc::new(Int64Array::from(vec![Some(13), None, Some(-7)])) as ArrayRef,
+            )])
+            .unwrap();
+            let mut ipc = Vec::new();
+            {
+                let mut writer = StreamWriter::try_new(&mut ipc, &batch.schema()).unwrap();
+                for _ in 0..3 {
+                    writer.write(&batch).unwrap();
+                }
+                writer.finish().unwrap();
+            }
+            Mock::given(method("POST"))
+                .and(path("/api/2.0/sql/warehouses/test_wh/sessions"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "session_id": "sess-packed-eof"
+                })))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/chunk"))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(ipc.clone()))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/api/2.0/sql/statements"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "statement_id": "stmt-packed-eof",
+                    "status": { "state": "SUCCEEDED" },
+                    "manifest": {
+                        "format": "ARROW_STREAM",
+                        "schema": { "column_count": 1, "columns": [{
+                            "name": "n", "type_name": "BIGINT", "type_text": "BIGINT", "position": 0
+                        }] },
+                        "total_chunk_count": 1, "total_row_count": 9,
+                        "total_byte_count": ipc.len(), "truncated": false
+                    },
+                    "result": { "external_links": [{
+                        "external_link": format!("{}/chunk", server.uri()),
+                        "expiration": "2099-01-01T00:00:00Z",
+                        "chunk_index": 0, "row_offset": 0, "row_count": 9,
+                        "byte_count": ipc.len()
+                    }] }
+                })))
+                .mount(&server)
+                .await;
+            for endpoint in [
+                "/api/2.0/sql/statements/stmt-packed-eof",
+                "/api/2.0/sql/sessions/sess-packed-eof",
+            ] {
+                Mock::given(method("DELETE"))
+                    .and(path(endpoint))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+            }
+            Mock::given(method("POST"))
+                .and(path("/telemetry-ext"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+                .mount(&server)
+                .await;
+            let mut telemetry = TelemetryConfig::default();
+            telemetry.set_enabled(true);
+            telemetry.batch_size = 1;
+            let session = Session::builder()
+                .http_path(server.uri(), "/sql/1.0/warehouses/test_wh")
+                .auth(AuthConfig::Pat {
+                    token: "test-token".into(),
+                    identity_federation_client_id: None,
+                })
+                .telemetry(telemetry)
+                .open()
+                .await
+                .unwrap();
+            let connection = Connection {
+                session_id: session.session_id().to_owned(),
+                inner: Arc::new(Mutex::new(Some(session))),
+            };
+            let statement = connection
+                .execute_statement("SELECT n".into(), None)
+                .await
+                .unwrap();
+            let payload = statement.fetch_next_batch().await.unwrap().unwrap();
+            let batches: Vec<_> = StreamReader::try_new(payload.ipc_bytes.as_ref(), None)
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert_eq!(batches.len(), 3);
+            assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 9);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let (closes, events) = packed_statement_observations(&server).await;
+            assert_eq!(closes, 0, "lookahead must not close before the null fetch");
+            assert!(
+                events.is_empty(),
+                "lookahead must not finalize statement telemetry"
+            );
+
+            if early_close {
+                statement.close().await.unwrap();
+            } else {
+                assert!(statement.fetch_next_batch().await.unwrap().is_none());
+            }
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let (closes, events) = packed_statement_observations(&server).await;
+                    if closes == 1 && events.len() == 1 {
+                        let latency = &events[0]["entry"]["sql_driver_log"]["sql_operation"]
+                            ["result_latency"]["result_set_consumption_latency_millis"];
+                        assert_eq!(latency.is_null(), early_close);
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("normal completion must close and export exactly one statement event");
+            statement.close().await.unwrap();
+            connection.close().await.unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn build_statement_forwards_raw_params_and_rejects_mixed_binding() {
         let server = MockServer::start().await;

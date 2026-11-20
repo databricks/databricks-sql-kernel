@@ -11,7 +11,7 @@ changes go in their respective binding's NEXT_CHANGELOG.
 
 ### Added
 
-- `ResultStream::try_next_ready_batch()` supports non-blocking lookahead without finalizing end-of-stream before a binding delivers its buffered payload.
+- `ResultStream::try_next_ready_batch()` supports optional non-blocking lookahead without finalizing errors or end-of-stream before the consumer receives them.
 
 - A native Rust ADBC 1.1 driver in `adbc/`, with an optional standard ADBC C
   ABI for driver-manager loading from other languages.
