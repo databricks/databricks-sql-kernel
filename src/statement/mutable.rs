@@ -993,10 +993,7 @@ impl StatementCanceller {
     /// concurrently with the `execute()` it targets — the two share
     /// only the id slot (behind a `Mutex`), no mutable statement state.
     pub async fn cancel(&self) -> Result<bool> {
-        self.volume
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .cancel();
+        self.cancel_volume_operation();
         let id = self.inflight_id.lock().ok().and_then(|g| g.clone());
         async {
             // Log both outcomes at the decision point so a host debugging a

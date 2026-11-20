@@ -277,13 +277,17 @@ fn deadline_policy(timeout: ExecutionTimeout) -> (Option<std::time::Instant>, bo
 }
 
 impl ExecutedAsyncStatement {
+    fn cancel_volume(&self) {
+        if let Some(volume) = &self.volume {
+            volume.cancel();
+        }
+    }
+
     /// Produce the stable client query-timeout error and schedule bounded,
     /// best-effort server cleanup when a deadline retained across
     /// caller-driven status polls expires.
     pub(crate) fn expire_client_query_timeout(&self) -> Error {
-        if let Some(volume) = &self.volume {
-            volume.cancel();
-        }
+        self.cancel_volume();
         self.owner_released.store(true, Ordering::Release);
         self.clear_pending_result();
         if !self.client_timeout_expired.swap(true, Ordering::AcqRel) {
@@ -1101,9 +1105,7 @@ impl ExecutedStatementHandle for ExecutedAsyncStatement {
                      submitted it",
                 ));
             }
-            if let Some(volume) = &self.volume {
-                volume.cancel();
-            }
+            self.cancel_volume();
             self.session
                 .transport()
                 .cancel_statement(&self.statement_id)
@@ -1134,9 +1136,7 @@ impl ExecutedAsyncStatement {
 
     async fn close_server_statement(&self) -> Result<()> {
         if self.owning {
-            if let Some(volume) = &self.volume {
-                volume.cancel();
-            }
+            self.cancel_volume();
             self.owner_released.store(true, Ordering::Release);
             self.clear_pending_result();
         }
@@ -1255,9 +1255,7 @@ impl AsyncStatementCanceller {
                      is owned by whoever submitted it",
                 ));
             }
-            if let Some(volume) = &self.volume {
-                volume.cancel();
-            }
+            self.cancel_volume_operation();
             self.session
                 .transport()
                 .cancel_statement(&self.statement_id)
@@ -1276,9 +1274,7 @@ impl AsyncStatementCanceller {
 impl Drop for ExecutedAsyncStatement {
     fn drop(&mut self) {
         if self.owning {
-            if let Some(volume) = &self.volume {
-                volume.cancel();
-            }
+            self.cancel_volume();
             self.owner_released.store(true, Ordering::Release);
             self.clear_pending_result();
         }

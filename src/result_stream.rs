@@ -719,7 +719,7 @@ impl ResultStream {
     }
 
     pub(crate) fn volume_state(&self) -> Option<Arc<crate::volume::VolumeState>> {
-        self.volume.as_ref().map(Arc::clone)
+        self.volume.clone()
     }
 
     pub(crate) fn cancel_volume(&self) {

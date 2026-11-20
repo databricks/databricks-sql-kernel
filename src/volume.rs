@@ -64,9 +64,9 @@ impl VolumeOptions {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
 pub enum VolumeCompletion {
-    NotVolume,
-    NeedsInputStream,
-    Completed,
+    NotVolume = 0,
+    NeedsInputStream = 1,
+    Completed = 2,
 }
 
 pub(crate) struct VolumeState {
@@ -1467,7 +1467,6 @@ mod tests {
         }
     }
 
-    #[cfg(any(unix, windows))]
     #[test]
     fn symlinks_require_lexical_authority_and_resolved_target_in_any_allowed_root() {
         #[cfg(unix)]
@@ -1480,6 +1479,12 @@ mod tests {
         std::fs::create_dir(&root).unwrap();
         std::fs::create_dir(&other).unwrap();
         std::fs::write(root.join("file"), b"ok").unwrap();
+        #[cfg(windows)]
+        assert!(allowed_path(
+            root.join("file").to_str().unwrap(),
+            &[dir.path().join("ROOT")]
+        )
+        .is_ok());
         symlink_file(root.join("file"), root.join("inside")).unwrap();
         symlink_file(other.join("missing"), root.join("escape")).unwrap();
         symlink_dir(&root, dir.path().join("alias")).unwrap();

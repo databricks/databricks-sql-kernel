@@ -1586,6 +1586,20 @@ mod tests {
     }
 
     #[test]
+    fn http_socket_timeout_default_and_zero_preserve_request_timeout() {
+        for (socket_timeout_ms, storage_read_timeout) in [
+            (None, Some(std::time::Duration::from_secs(15 * 60))),
+            (Some(0), None),
+        ] {
+            let mut options = base();
+            options.socket_timeout_ms = socket_timeout_ms;
+            let http = build_http_config(&mut options);
+            assert_eq!(http.storage_read_timeout, storage_read_timeout);
+            assert_eq!(http.request_timeout, std::time::Duration::from_secs(120));
+        }
+    }
+
+    #[test]
     fn http_retry_knobs_map_onto_http_config() {
         let mut o = base();
         o.socket_timeout_ms = Some(4_500);
