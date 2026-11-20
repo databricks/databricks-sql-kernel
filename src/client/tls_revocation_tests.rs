@@ -50,7 +50,7 @@ const CURRENT: (i32, u8, u8) = (2099, 1, 1);
 
 /// What the CRL at one distribution point serves.
 #[derive(Clone, Copy)]
-enum Served {
+pub(crate) enum Served {
     /// A current CRL that lists nothing.
     Good,
     /// A current CRL that lists the covered certificate as revoked.
@@ -87,9 +87,9 @@ const SCENARIOS: &[Scenario] = &[
     Scenario { name: "leaf without a distribution point", leaf: None, intermediate: Served::Good, strict: Outcome::Undetermined, accept: Outcome::Pass },
 ];
 
-struct Pki {
+pub(crate) struct Pki {
     root_der: CertificateDer<'static>,
-    root_pem: String,
+    pub(crate) root_pem: String,
     root_issuer: Issuer<'static, KeyPair>,
     intermediate_issuer: Issuer<'static, KeyPair>,
     intermediate_der: CertificateDer<'static>,
@@ -198,16 +198,16 @@ fn route(served: Served, issuer: &Issuer<'_, KeyPair>, covered: u64) -> Route {
 }
 
 /// A PKI, its CRL origin server, and the TLS leaf server.
-struct Fixture {
+pub(crate) struct Fixture {
     crl: CrlServer,
-    pki: Pki,
-    addr: SocketAddr,
+    pub(crate) pki: Pki,
+    pub(crate) addr: SocketAddr,
 }
 
 /// Each fixture's CRL paths are unique, so no two tests share a CRL URL.
 static FIXTURE_ID: AtomicUsize = AtomicUsize::new(0);
 
-fn fixture(leaf: Option<Served>, intermediate: Served, san: &str) -> Fixture {
+pub(crate) fn fixture(leaf: Option<Served>, intermediate: Served, san: &str) -> Fixture {
     let crl = CrlServer::start();
     let id = FIXTURE_ID.fetch_add(1, Ordering::Relaxed);
     let leaf_path = format!("/{id}/leaf.crl");
@@ -480,7 +480,10 @@ async fn check(scenario: &Scenario, accept: bool, want: Outcome) {
     let fx = fixture(scenario.leaf, scenario.intermediate, "127.0.0.1");
     let label = format!("{} (accept_undetermined={accept})", scenario.name);
     let result = get(revocation_config(&fx.pki.root_pem), Some(accept), fx.addr).await;
-    eprintln!("{label}: result={result:?} crl_requests={:?}", fx.crl.paths());
+    eprintln!(
+        "{label}: result={result:?} crl_requests={:?}",
+        fx.crl.paths()
+    );
     match (want, &result) {
         (Outcome::Pass, Ok(())) => {}
         (Outcome::Revoked, Err(err)) => assert!(err.contains("revoked"), "{label}: {err}"),

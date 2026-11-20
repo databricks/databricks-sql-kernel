@@ -3510,4 +3510,56 @@ mod revocation_open_tests {
             );
         }
     }
+
+    /// Strict revocation through the C ABI, on Windows with tls-rustls: a leaf that its CRL
+    /// revokes fails session open. The TLS endpoint is a local server, and its chain and CRL
+    /// come from the revocation test fixture. The failure is in the TLS handshake, before any
+    /// HTTP request, so no SEA server is needed.
+    #[cfg(all(windows, feature = "tls-rustls"))]
+    #[test]
+    fn tls_revocation_strict_open_rejects_a_revoked_leaf() {
+        use crate::client::tls_revocation::tests::{fixture, Served};
+
+        let fx = fixture(Some(Served::Revoked), Served::Good, "127.0.0.1");
+        let host = CString::new(format!("https://{}", fx.addr)).unwrap();
+        let http_path = CString::new("/sql/1.0/warehouses/test_wh").unwrap();
+        let token = CString::new("dapi-test-token").unwrap();
+        let root = fx.pki.root_pem.as_bytes();
+        unsafe {
+            let mut config: *mut KernelSessionConfig = std::ptr::null_mut();
+            assert_eq!(
+                kernel_session_config_new(&mut config),
+                KernelStatusCode::Success
+            );
+            assert_eq!(
+                kernel_session_config_set_http_path(config, host.as_ptr(), http_path.as_ptr()),
+                KernelStatusCode::Success
+            );
+            assert_eq!(
+                kernel_session_config_set_auth_pat(config, token.as_ptr()),
+                KernelStatusCode::Success
+            );
+            assert_eq!(
+                kernel_session_config_set_tls_trusted_certs(config, root.as_ptr(), root.len()),
+                KernelStatusCode::Success
+            );
+            // Strict: an undetermined status would also fail, so this asserts the revoked
+            // message specifically.
+            assert_eq!(
+                kernel_session_config_set_tls_certificate_revocation(config, true, false),
+                KernelStatusCode::Success
+            );
+
+            let mut session: *mut kernel_session_t = std::ptr::null_mut();
+            let status = kernel_session_open(config, &mut session);
+            assert_eq!(status, KernelStatusCode::NetworkError);
+            assert!(session.is_null());
+
+            let mut out = std::mem::MaybeUninit::<crate::c_abi::error::KernelError>::uninit();
+            assert!(crate::c_abi::error::kernel_get_last_error(out.as_mut_ptr()));
+            let error = out.assume_init();
+            let message = CStr::from_ptr(error.message).to_str().unwrap();
+            assert!(message.contains("revoked"), "{message}");
+        }
+    }
 }
