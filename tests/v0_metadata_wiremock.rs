@@ -42,7 +42,9 @@ use databricks_sql_kernel::{
 };
 use serde_json::json;
 use std::sync::Arc;
-use wiremock::matchers::{body_partial_json, body_string_contains, header, method, path};
+use wiremock::matchers::{
+    body_partial_json, body_string_contains, header, method, path, path_regex,
+};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 // ─── Helpers ────────────────────────────────────────────────────────
@@ -1083,7 +1085,7 @@ async fn list_tables_speculation_preserves_catalog_matches_types_and_values() {
     for native in [false, true] {
         for (pattern, literal, catalogs, matched, count) in &cases {
             for filter in filters {
-                let server = MockServer::start().await;
+                let server = MockServer::builder().start().await;
                 mount_create_session(&server).await;
                 mount_delete_session(&server).await;
                 let catalog_batch = string_batch(vec![(
@@ -1240,10 +1242,126 @@ async fn list_tables_speculation_preserves_catalog_matches_types_and_values() {
 }
 
 #[tokio::test]
+async fn list_tables_speculative_slot_keeps_eight_table_executions_in_flight() {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    let server = MockServer::builder().start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+    let catalogs = [
+        "c_t", "c0t", "c1t", "c2t", "c3t", "c4t", "c5t", "c6t", "c7t",
+    ];
+    let catalog_batch = string_batch(vec![(
+        "catalog",
+        catalogs.iter().copied().map(Some).collect(),
+    )]);
+    mount_execute_expecting_sql(
+        &server,
+        "SHOW CATALOGS",
+        closed_inline_response_body(&catalog_batch),
+    )
+    .await;
+    let started = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&started);
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .and(body_string_contains("IN CATALOG `"))
+        .respond_with(move |request: &wiremock::Request| {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            let catalog = body["statement"]
+                .as_str()
+                .unwrap()
+                .split("IN CATALOG `")
+                .nth(1)
+                .unwrap()
+                .split('`')
+                .next()
+                .unwrap();
+            counter.fetch_add(1, Ordering::SeqCst);
+            ResponseTemplate::new(200).set_body_json(json!({
+                "statement_id": format!("budget-{catalog}"), "status": {"state": "RUNNING"}
+            }))
+        })
+        .expect(9)
+        .mount(&server)
+        .await;
+    let responses: HashMap<_, _> = catalogs
+        .iter()
+        .map(|catalog| {
+            let batch = string_batch(vec![
+                ("namespace", vec![Some("default")]),
+                ("tableName", vec![Some("t")]),
+                ("catalogName", vec![Some(*catalog)]),
+                ("tableType", vec![Some("TABLE")]),
+            ]);
+            let id = format!("budget-{catalog}");
+            let response = closed_inline_response_body(&batch).replace("stmt-test", &id);
+            (id, response)
+        })
+        .collect();
+    let released = Arc::new(AtomicBool::new(false));
+    let gate = Arc::clone(&released);
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/api/2\.0/sql/statements/budget-"))
+        .respond_with(move |request: &wiremock::Request| {
+            let id = request.url.path().rsplit('/').next().unwrap();
+            if gate.load(Ordering::SeqCst) {
+                ResponseTemplate::new(200).set_body_string(responses[id].clone())
+            } else {
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "statement_id": id, "status": {"state": "RUNNING"}
+                }))
+            }
+        })
+        .mount(&server)
+        .await;
+    let session = open_session(&server).await;
+    let metadata = session.metadata();
+    let mut future =
+        Box::pin(metadata.list_tables(Some(LikePattern::new("c_t").unwrap()), None, None, None));
+    let sample = async {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while started.load(Ordering::SeqCst) < 8 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("eight table executions must start while the gate is closed");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        started.load(Ordering::SeqCst)
+    };
+    let in_flight = tokio::select! {
+        result = &mut future => panic!("table executions must remain gated: {:?}", result.err()),
+        observed = sample => observed,
+    };
+    released.store(true, Ordering::SeqCst);
+    let mut stream = tokio::time::timeout(Duration::from_secs(10), future)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        drain_stream(&mut stream)
+            .await
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum::<usize>(),
+        9
+    );
+    session.close().await.unwrap();
+    server.verify().await;
+    assert_eq!(
+        in_flight, 8,
+        "the speculative literal must reserve one of eight table slots"
+    );
+}
+
+#[tokio::test]
 async fn list_tables_speculation_starts_before_catalog_lookup_finishes() {
     use std::time::Duration;
 
-    let server = MockServer::start().await;
+    let server = MockServer::builder().start().await;
     mount_create_session(&server).await;
     mount_delete_session(&server).await;
     let catalogs = string_batch(vec![("catalog", vec![Some("bench_name")])]);
@@ -1318,7 +1436,7 @@ async fn list_tables_not_found_speculation_retries_after_catalog_confirmation() 
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     let sql_state = "42704";
-    let server = MockServer::start().await;
+    let server = MockServer::builder().start().await;
     mount_create_session(&server).await;
     mount_delete_session(&server).await;
     let catalogs = string_batch(vec![("catalog", vec![Some("bench_name")])]);
@@ -1391,7 +1509,7 @@ async fn list_tables_read_phase_not_found_errors_propagate_without_retry() {
                 "TABLE_OR_VIEW_NOT_FOUND",
                 "NO_SUCH_CATALOG_EXCEPTION",
             ] {
-                let server = MockServer::start().await;
+                let server = MockServer::builder().start().await;
                 mount_create_session(&server).await;
                 mount_delete_session(&server).await;
                 let catalogs = string_batch(vec![("catalog", vec![Some("c1"), Some(catalog)])]);
@@ -1475,7 +1593,7 @@ async fn list_tables_read_phase_not_found_errors_propagate_without_retry() {
 async fn list_tables_confirmed_speculative_errors_do_not_repeat_the_query() {
     for sql_state in ["42501", "HY000"] {
         for catalogs in [vec!["bench_name"], vec!["benchXname", "bench_name"]] {
-            let server = MockServer::start().await;
+            let server = MockServer::builder().start().await;
             mount_create_session(&server).await;
             mount_delete_session(&server).await;
             let catalogs =
@@ -1537,7 +1655,7 @@ async fn list_tables_confirmed_speculative_errors_do_not_repeat_the_query() {
 
 #[tokio::test]
 async fn list_tables_unmatched_speculative_error_does_not_fail_other_catalogs() {
-    let server = MockServer::start().await;
+    let server = MockServer::builder().start().await;
     mount_create_session(&server).await;
     mount_delete_session(&server).await;
     let catalogs = string_batch(vec![("catalog", vec![Some("benchXname")])]);
@@ -1588,6 +1706,10 @@ async fn list_tables_unmatched_speculative_error_does_not_fail_other_catalogs() 
         batches[0].column(0).as_string::<i32>().value(0),
         "benchXname"
     );
+    assert_eq!(
+        wait_for_close_delete(&server, 1, std::time::Duration::from_secs(2)).await,
+        1
+    );
     session.close().await.unwrap();
     server.verify().await;
 }
@@ -1615,7 +1737,7 @@ async fn list_tables_ineligible_patterns_skip_slow_unusable_speculation() {
         ("Bench_name", "Bench_name", "bench_name"),
     ];
     for (pattern, literal, matched) in cases {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         mount_create_session(&server).await;
         mount_delete_session(&server).await;
         let catalogs = string_batch(vec![("catalog", vec![Some(matched)])]);
@@ -1687,7 +1809,7 @@ async fn list_tables_ineligible_patterns_skip_slow_unusable_speculation() {
 async fn list_tables_slow_literal_in_multi_match_is_fetched_only_once() {
     use std::time::Duration;
 
-    let server = MockServer::start().await;
+    let server = MockServer::builder().start().await;
     mount_create_session(&server).await;
     mount_delete_session(&server).await;
     let catalogs = string_batch(vec![("catalog", vec![Some("c-t"), Some("c_t")])]);
@@ -1749,7 +1871,7 @@ async fn list_tables_slow_literal_in_multi_match_is_fetched_only_once() {
 async fn list_tables_speculation_closes_result_when_catalog_lookup_fails() {
     use std::time::Duration;
 
-    let server = MockServer::start().await;
+    let server = MockServer::builder().start().await;
     mount_create_session(&server).await;
     mount_delete_session(&server).await;
     Mock::given(method("POST"))
@@ -1834,7 +1956,7 @@ async fn list_tables_speculation_closes_result_when_catalog_lookup_fails() {
 async fn list_tables_unused_execution_is_released_before_other_catalogs_finish() {
     use std::time::Duration;
 
-    let server = MockServer::start().await;
+    let server = MockServer::builder().start().await;
     mount_create_session(&server).await;
     mount_delete_session(&server).await;
     let catalogs = string_batch(vec![("catalog", vec![Some("benchXname")])]);
@@ -1905,7 +2027,7 @@ async fn list_tables_unused_execution_is_released_before_other_catalogs_finish()
 async fn list_tables_canceled_pending_speculation_closes_after_execute() {
     use std::time::Duration;
 
-    let server = MockServer::start().await;
+    let server = MockServer::builder().start().await;
     mount_create_session(&server).await;
     mount_delete_session(&server).await;
     let catalogs = string_batch(vec![("catalog", vec![Some("bench_name")])]);
@@ -1983,7 +2105,7 @@ async fn list_tables_canceled_speculation_completes_one_close() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
-    let server = MockServer::start().await;
+    let server = MockServer::builder().start().await;
     mount_create_session(&server).await;
     mount_delete_session(&server).await;
     let catalogs = string_batch(vec![("catalog", vec![Some("bench_name")])]);
