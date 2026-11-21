@@ -11,10 +11,10 @@ changes go in their respective binding's NEXT_CHANGELOG.
 
 ### Added
 
-- Explicit, execution-scoped completion of server-marked Volume PUT/GET/REMOVE
-  instructions, with allowed-root checks, resumable owned-byte PUT input, in-place GET
-  publication and cached completion outcomes. Resolved symlink targets must remain
-  within the configured roots.
+- Volume `PUT`, `GET` and `REMOVE`: `ResultStream::complete_volume_operation`
+  runs the file transfer. Local paths, and the files they resolve to through
+  symlinks, must be inside the caller's allowed directories. A `PUT` can also
+  upload bytes the caller supplies.
 
 ### Changed
 

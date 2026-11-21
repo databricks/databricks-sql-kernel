@@ -202,7 +202,7 @@ async fn storage_transfers_outlive_rpc_deadline() {
     http.overall_timeout = Duration::from_millis(200);
     let session = session_with_http(
         &server,
-        response_with_batches(&server, true, local.to_str().unwrap(), "GET", &[1]),
+        response(&server, true, local.to_str().unwrap()),
         http,
     )
     .await;
@@ -497,12 +497,7 @@ async fn reading_before_volume_completion_returns_invalid_state() {
     let server = MockServer::start().await;
     let dir = tempfile::tempdir().unwrap();
     let local = dir.path().join("download");
-    let session = session_with_http(
-        &server,
-        response_with_batches(&server, true, local.to_str().unwrap(), "GET", &[1]),
-        HttpConfig::default(),
-    )
-    .await;
+    let session = session(&server, response(&server, true, local.to_str().unwrap())).await;
     let mut statement = session.statement();
     statement.spec().sql("GET");
     let mut executed = statement.execute().await.unwrap();

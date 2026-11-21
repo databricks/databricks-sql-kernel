@@ -245,6 +245,9 @@ pub struct Statement {
     /// new `execute()` / `submit()` so a canceller never targets a
     /// stale prior statement.
     inflight_id: InflightId,
+    /// Volume transfer state of the current execution, shared with any
+    /// [`StatementCanceller`]. Replaced at the start of each new execution, so
+    /// a canceller always reaches the current transfer.
     volume: Arc<Mutex<Arc<crate::volume::VolumeState>>>,
 }
 
@@ -780,8 +783,8 @@ impl Statement {
         build_execute_params(&self.spec, wait_timeout_secs)
     }
 
-    /// Clear the shared in-flight-id slot at the very start of a new
-    /// dispatch, before any `.await`.
+    /// Clear the shared in-flight-id slot and replace the Volume transfer
+    /// state at the very start of a new dispatch, before any `.await`.
     ///
     /// The slot still holds the *prior* execution's server statement id
     /// until this runs. A [`StatementCanceller`] retained across a
@@ -795,6 +798,10 @@ impl Statement {
     /// contract. Clearing synchronously at entry collapses that window to
     /// nothing: a canceller firing before the new id is observed is a
     /// tolerated no-op (`dispatched = false`), never a hit on the stale id.
+    ///
+    /// The prior execution's Volume transfer is cancelled and a fresh state
+    /// installed in the same step, so a retained canceller reaches the new
+    /// execution's transfer, not the previous one.
     ///
     /// Kept out of [`invalidate_prior`] deliberately — that is also called
     /// by [`Statement::close`], where the slot must survive so a detached
@@ -947,12 +954,12 @@ impl Drop for MidExecuteCancelGuard {
 /// [`Statement`]. Produced by [`Statement::canceller`].
 ///
 /// Holds only the shared session handle and the `Statement`'s shared
-/// in-flight-id slot — **not** the `Statement` itself — so a binding
-/// can fire a server-side cancel from another thread while `execute()`
-/// is blocked. The sync-execute analogue of
+/// in-flight-id slot and its Volume transfer state — **not** the `Statement`
+/// itself — so a binding can fire a server-side cancel from another thread
+/// while `execute()` is blocked. The sync-execute analogue of
 /// [`AsyncStatementCanceller`](crate::statement::executed_async::AsyncStatementCanceller).
 ///
-/// Cheap to [`Clone`] (two `Arc` bumps).
+/// Cheap to [`Clone`] (three `Arc` bumps).
 #[derive(Clone)]
 pub struct StatementCanceller {
     session: Arc<SessionInner>,
@@ -991,7 +998,8 @@ impl StatementCanceller {
     /// Idempotent against a server already in a terminal state (the
     /// kernel's `cancel_statement` is a no-op there). Safe to call
     /// concurrently with the `execute()` it targets — the two share
-    /// only the id slot (behind a `Mutex`), no mutable statement state.
+    /// only the id slot and the Volume state (each behind a `Mutex`), no
+    /// mutable statement state.
     pub async fn cancel(&self) -> Result<bool> {
         self.cancel_volume_operation();
         let id = self.inflight_id.lock().ok().and_then(|g| g.clone());

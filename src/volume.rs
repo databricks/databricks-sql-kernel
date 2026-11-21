@@ -155,7 +155,7 @@ impl VolumeState {
                         .await
                         .map_err(|e| {
                             Error::internal()
-                                .message(format!("Volume publication task failed: {e}"))
+                                .message(format!("Volume download copy task failed: {e}"))
                         })??;
                     }
                     Ok(outcome)
@@ -1675,6 +1675,12 @@ mod tests {
                 .unwrap(),
             VolumeCompletion::Completed
         );
+        assert!(server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .all(|request| !request.headers.contains_key("referer")));
     }
 
     #[tokio::test]

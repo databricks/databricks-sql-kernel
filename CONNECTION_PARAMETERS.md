@@ -128,6 +128,7 @@ until implemented) and `External` (a caller-supplied `TokenProvider`).
 | Field | Description | Default |
 |-------|-------------|---------|
 | `request_timeout` | Per-request timeout (connect + body). | `120s` |
+| `storage_read_timeout` | Idle limit for Volume file transfers: a transfer fails after this long without progress. | `None` (no limit) |
 | `overall_timeout` | Maximum total time across retries for one logical RPC. | `900s` |
 | `pool_max_idle_per_host` | Connection-pool size (max idle warm sockets per host). Raise for bursty concurrent workloads. | `100` |
 | `retry_min_wait` | Minimum backoff between retries; also the floor for a server `Retry-After` and the base of exponential backoff (`min_wait × 2^attempt`). | `1s` |

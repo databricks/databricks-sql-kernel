@@ -366,7 +366,6 @@ impl AsyncStatement {
         let Some(canceller) = canceller else {
             return Err(closed_err("AsyncStatement"));
         };
-        canceller.cancel_volume_operation();
         guarded(async move { canceller.cancel().await.map_err(napi_err_from_kernel) }).await
     }
 

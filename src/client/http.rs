@@ -413,6 +413,7 @@ impl StorageClient {
                         }
                     }),
                     None,
+                    // No Referer on redirects: it would carry the presigned URL.
                     false,
                 )
             })

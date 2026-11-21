@@ -282,7 +282,7 @@ mod tests {
     }
 
     #[test]
-    fn store_error_folds_error_code_slug_into_message() {
+    fn store_error_exposes_error_code_and_local_file_details() {
         let mut error = Error::sql_error()
             .message("statement gone")
             .with_error_code("STATEMENT_NOT_FOUND");

@@ -14,8 +14,9 @@ layout, or npm publishing. Pure-kernel changes go in the root
 
 ### Added
 
-- Explicit Volume completion and marker access on synchronous and asynchronous
-  result handles, with structured local filesystem error details.
+- `Statement` and `AsyncResultHandle` gain `isVolumeOperation` and
+  `completeVolumeOperation` for Volume `PUT`, `GET` and `REMOVE`. Local file
+  errors carry `localOsError`, `localErrorKind` and `localPath`.
 
 ### Changed
 

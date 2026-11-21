@@ -470,7 +470,7 @@ impl Session {
             &config.connection,
             &config.auth,
             config.driver_system_configuration.clone(),
-            http_client.clone(),
+            http_client,
             session_info.session_id.clone(),
         ));
         telemetry

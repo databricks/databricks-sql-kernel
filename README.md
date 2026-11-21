@@ -68,8 +68,9 @@ and security vulnerabilities should be reported according to
 
 ## Volume file operations
 
-Call `ResultStream::complete_volume_operation` with `VolumeOptions` before reading
-server-marked PUT, GET and REMOVE rows; omit completion for raw results.
+For a Volume `PUT`, `GET` or `REMOVE`, call
+`ResultStream::complete_volume_operation` before reading rows. It runs the
+file transfer; without it the result is only the server's instruction row.
 See [`ResultStream::complete_volume_operation`](https://docs.rs/databricks-sql-kernel/latest/databricks_sql_kernel/struct.ResultStream.html#method.complete_volume_operation)
 for transfer behavior.
 
