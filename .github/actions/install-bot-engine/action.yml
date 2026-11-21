@@ -113,12 +113,13 @@ runs:
         if [ -s "$JFROG_NPMRC_FILE" ]; then
           NPM_ARGS=(--userconfig "$JFROG_NPMRC_FILE")
         fi
+        source "${{ github.action_path }}/redact-command-output.sh"
         # pip reads PIP_INDEX_URL from the env setup-jfrog exported. REF mode
         # resolves the published engine's deps unpinned + installs the SDK/CLI by
         # version (a consumer can't see the engine's hash-locked requirements).
         # SDK_VERSION/CLI_VERSION track the engine at ENGINE_REF.
-        python -m pip install --upgrade pip
-        pip install "databricks-bot-engine @ git+https://github.com/${ENGINE_REPO}@${ENGINE_REF}"
-        pip install "claude-agent-sdk==${SDK_VERSION}"
-        npm install "${NPM_ARGS[@]}" -g "@anthropic-ai/claude-code@${CLI_VERSION}"
+        run_with_redacted_url_queries python -m pip install --upgrade pip
+        run_with_redacted_url_queries pip install "databricks-bot-engine @ git+https://github.com/${ENGINE_REPO}@${ENGINE_REF}"
+        run_with_redacted_url_queries pip install "claude-agent-sdk==${SDK_VERSION}"
+        run_with_redacted_url_queries npm install "${NPM_ARGS[@]}" -g "@anthropic-ai/claude-code@${CLI_VERSION}"
         echo "$(npm prefix -g)/bin" >> "$GITHUB_PATH"
