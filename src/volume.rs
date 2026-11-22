@@ -437,7 +437,10 @@ async fn storage_send(
     tokio::pin!(send);
     let response = if let (true, Some(timeout)) = (upload, timeout) {
         loop {
-            let deadline = *progress.borrow_and_update() + timeout;
+            let last = *progress.borrow_and_update();
+            let Some(deadline) = last.checked_add(timeout) else {
+                break (&mut send).await;
+            };
             tokio::select! {
                 biased;
                 response = &mut send => break response,
@@ -578,21 +581,27 @@ fn resolve_existing_parent(
     }
 }
 
-fn within_root(path: &Path, root: &Path) -> bool {
-    #[cfg(windows)]
-    {
-        let mut path = path.components();
-        root.components().all(|root| {
-            path.next().is_some_and(|part| {
-                part.as_os_str().to_string_lossy().to_lowercase()
-                    == root.as_os_str().to_string_lossy().to_lowercase()
-            })
+/// Whether `path` is `root` or inside it. The drive or share prefix never
+/// depends on case. After resolving links, pass `ignore_name_case: false`:
+/// a case-sensitive directory can hold two names that differ only by case.
+#[cfg(windows)]
+fn within_root(path: &Path, root: &Path, ignore_name_case: bool) -> bool {
+    let lower = |part: Component<'_>| part.as_os_str().to_string_lossy().to_lowercase();
+    let mut path = path.components();
+    root.components().all(|root| {
+        path.next().is_some_and(|part| {
+            if ignore_name_case || matches!(root, Component::Prefix(_)) {
+                lower(part) == lower(root)
+            } else {
+                part == root
+            }
         })
-    }
-    #[cfg(not(windows))]
-    {
-        path.starts_with(root)
-    }
+    })
+}
+
+#[cfg(not(windows))]
+fn within_root(path: &Path, root: &Path, _ignore_name_case: bool) -> bool {
+    path.starts_with(root)
 }
 
 fn allowed_path(requested: &str, roots: &[PathBuf]) -> Result<PathBuf> {
@@ -605,7 +614,7 @@ fn allowed_path(requested: &str, roots: &[PathBuf]) -> Result<PathBuf> {
         .filter(|root| !root.as_os_str().is_empty())
         .map(|root| normalize(root))
         .collect::<Result<Vec<_>>>()?;
-    if !roots.iter().any(|root| within_root(&path, root)) {
+    if !roots.iter().any(|root| within_root(&path, root, true)) {
         return Err(
             invalid("Local file path is outside the configured allowed roots")
                 .with_error_code("VOLUME_PATH_NOT_ALLOWED"),
@@ -625,7 +634,7 @@ fn allowed_path(requested: &str, roots: &[PathBuf]) -> Result<PathBuf> {
                 continue;
             }
         };
-        if within_root(&resolved, &root) {
+        if within_root(&resolved, &root, false) {
             return Ok(resolved);
         }
     }
@@ -1314,6 +1323,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn upload_accepts_maximum_idle_timeout() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(body_bytes(b"upload"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let state = VolumeState::new(
+            transfer_state(0).retry.clone(),
+            storage(Some(Duration::MAX)),
+            Default::default(),
+        );
+        assert_eq!(
+            state
+                .complete(
+                    async {
+                        Ok(instruction(
+                            "PUT",
+                            &server.uri(),
+                            Path::new("__input_stream__"),
+                        ))
+                    },
+                    &VolumeOptions::default(),
+                    Some(b"upload".to_vec()),
+                )
+                .await
+                .unwrap(),
+            VolumeCompletion::Completed
+        );
+    }
+
+    #[tokio::test]
     async fn get_progress_and_put_idle_limits() {
         use tokio::io::AsyncReadExt;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1464,6 +1506,36 @@ mod tests {
             }
             assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
             peer.await.unwrap();
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn resolved_names_match_exactly_and_prefix_ignores_case() {
+        for (path, root, allowed) in [
+            (r"\\?\C:\data\safe\x", r"\\?\C:\data\safe", true),
+            (r"\\?\c:\data\safe\x", r"\\?\C:\data\safe", true),
+            (r"\\?\C:\data\SAFE\x", r"\\?\C:\data\safe", false),
+            (
+                r"\\?\UNC\server\share\dir\x",
+                r"\\?\UNC\Server\Share\dir",
+                true,
+            ),
+            (
+                r"\\?\UNC\server\share\DIR\x",
+                r"\\?\UNC\Server\Share\dir",
+                false,
+            ),
+        ] {
+            assert_eq!(
+                within_root(Path::new(path), Path::new(root), false),
+                allowed,
+                "{path}"
+            );
+            assert!(
+                within_root(Path::new(path), Path::new(root), true),
+                "{path}"
+            );
         }
     }
 
