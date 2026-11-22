@@ -171,7 +171,7 @@ fn timeout_query_id(params: &ExecuteParams) -> Option<String> {
 ///
 /// This client implements the `Transport` trait using REST endpoints.
 /// The `reader_factory` is set after construction via `set_reader_factory()` because
-/// `ResultReaderFactory` needs `Arc<dyn Transport>` which requires wrapping
+/// `ResultReaderFactory` needs a `Weak<dyn Transport>`, which requires wrapping
 /// `SeaRestTransport` in `Arc` first.
 pub(crate) struct SeaRestTransport {
     http_client: Arc<DatabricksHttpClient>,
@@ -208,7 +208,7 @@ impl SeaRestTransport {
     ///
     /// After construction, call `set_reader_factory()` to enable result reader creation.
     /// This two-step initialization is required because `ResultReaderFactory` needs
-    /// `Arc<dyn Transport>`, which is only available after wrapping in `Arc`.
+    /// `Weak<dyn Transport>`, which is only available after wrapping in `Arc`.
     pub fn new(
         http_client: Arc<DatabricksHttpClient>,
         host: impl Into<String>,
@@ -1910,7 +1910,7 @@ mod tests {
         ));
         let runtime_handle = tokio::runtime::Handle::current();
         let reader_factory = ResultReaderFactory::new(
-            transport.clone() as Arc<dyn Transport>,
+            Arc::<SeaRestTransport>::downgrade(&transport),
             http_client,
             CloudFetchConfig::default(),
             PostProcessOptions::default(),

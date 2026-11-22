@@ -42,7 +42,7 @@ use arrow_ipc::reader::StreamReader;
 use arrow_schema::{ArrowError, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use std::io::Cursor;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 pub use cloudfetch::StreamingCloudFetchProvider as CloudFetchReader;
@@ -54,7 +54,10 @@ pub use cloudfetch::StreamingCloudFetchProvider as CloudFetchReader;
 /// or any future backend implementation.
 #[derive(Debug)]
 pub(crate) struct ResultReaderFactory {
-    client: Arc<dyn Transport>,
+    /// Weak because the transport owns this factory: a strong reference
+    /// would form a cycle that keeps the transport, its HTTP client and its
+    /// runtime handle alive after the session closes.
+    client: Weak<dyn Transport>,
     http_client: Arc<DatabricksHttpClient>,
     config: CloudFetchConfig,
     post_process_options: PostProcessOptions,
@@ -64,7 +67,7 @@ pub(crate) struct ResultReaderFactory {
 impl ResultReaderFactory {
     /// Create a new result reader factory.
     pub(crate) fn new(
-        client: Arc<dyn Transport>,
+        client: Weak<dyn Transport>,
         http_client: Arc<DatabricksHttpClient>,
         config: CloudFetchConfig,
         mut post_process_options: PostProcessOptions,
@@ -79,6 +82,15 @@ impl ResultReaderFactory {
             post_process_options,
             runtime_handle,
         }
+    }
+
+    /// Readers hold a strong reference so an open result stream keeps the
+    /// transport alive for its own chunk fetches.
+    fn transport(&self) -> Result<Arc<dyn Transport>> {
+        self.client.upgrade().ok_or_else(|| {
+            Error::invalid_state()
+                .message("transport was dropped before the result reader was created")
+        })
     }
 
     /// Create a reader from a statement execution response.
@@ -546,7 +558,7 @@ impl ResultReaderFactory {
         // out the per-link field yet — see
         // `SeaChunkLinkFetcher::decode_continuation`.
         let fetcher = SeaChunkLinkFetcher::new(
-            self.client.clone(),
+            self.transport()?,
             statement_id.to_string(),
             external_links,
             total_chunk_count,
@@ -628,7 +640,7 @@ impl ResultReaderFactory {
 
         let source: Arc<dyn crate::reader::inline::InlineChunkSource> =
             Arc::new(AttributedInlineChunkSource {
-                client: Arc::clone(&self.client),
+                client: self.transport()?,
                 session_attribution,
             });
         let provider = InlineStreamingProvider::new(
@@ -2103,20 +2115,23 @@ mod tests {
 
     /// Build a `ResultReaderFactory` against the panicking stub
     /// transport. Used by control-flow tests that don't fire any
-    /// RPC.
-    fn factory_for_control_flow_test() -> ResultReaderFactory {
+    /// RPC. The factory only holds the transport weakly, so callers
+    /// must keep the returned transport alive for the test.
+    fn factory_for_control_flow_test() -> (ResultReaderFactory, Arc<dyn Transport>) {
         let http_client = Arc::new(
             DatabricksHttpClient::with_default_retry(HttpClientConfig::default()).unwrap(),
         );
         let runtime = tokio::runtime::Handle::current();
-        ResultReaderFactory::new(
-            Arc::new(PanickingTransport),
+        let transport: Arc<dyn Transport> = Arc::new(PanickingTransport);
+        let factory = ResultReaderFactory::new(
+            Arc::downgrade(&transport),
             http_client,
             CloudFetchConfig::default(),
             PostProcessOptions::default(),
             GeospatialResultRepresentation::String,
             runtime,
-        )
+        );
+        (factory, transport)
     }
 
     fn ok_status() -> StatementStatus {
@@ -2157,7 +2172,7 @@ mod tests {
     /// result after the first chunk.
     #[tokio::test]
     async fn rollout_guard_errors_when_total_chunks_disagrees_with_next_chunk_index() {
-        let factory = factory_for_control_flow_test();
+        let (factory, _transport) = factory_for_control_flow_test();
         let response = ExecuteResponse {
             statement_id: "stmt-1".to_string(),
             status: ok_status(),
@@ -2197,7 +2212,7 @@ mod tests {
     /// `total_chunk_count`.
     #[tokio::test]
     async fn rollout_guard_does_not_fire_on_genuinely_single_chunk() {
-        let factory = factory_for_control_flow_test();
+        let (factory, _transport) = factory_for_control_flow_test();
         let response = ExecuteResponse {
             statement_id: "stmt-1".to_string(),
             status: ok_status(),
@@ -2234,7 +2249,7 @@ mod tests {
     /// to 0 would silently corrupt the next-fetch row_offset.
     #[tokio::test]
     async fn initial_response_requires_row_count_when_streaming() {
-        let factory = factory_for_control_flow_test();
+        let (factory, _transport) = factory_for_control_flow_test();
         let response = ExecuteResponse {
             statement_id: "stmt-1".to_string(),
             status: ok_status(),
@@ -2268,7 +2283,7 @@ mod tests {
 
     #[tokio::test]
     async fn initial_response_requires_chunk_index_when_streaming() {
-        let factory = factory_for_control_flow_test();
+        let (factory, _transport) = factory_for_control_flow_test();
         let response = ExecuteResponse {
             statement_id: "stmt-1".to_string(),
             status: ok_status(),
@@ -2315,7 +2330,7 @@ mod tests {
     /// rather than a silent pass.
     #[tokio::test]
     async fn zero_chunk_count_short_circuits_to_empty_reader() {
-        let factory = factory_for_control_flow_test();
+        let (factory, _transport) = factory_for_control_flow_test();
         let response = ExecuteResponse {
             statement_id: "stmt-1".to_string(),
             status: ok_status(),
@@ -2348,7 +2363,7 @@ mod tests {
     /// of the field is not mis-read as `Some(0)`.
     #[tokio::test]
     async fn absent_total_chunk_count_falls_through() {
-        let factory = factory_for_control_flow_test();
+        let (factory, _transport) = factory_for_control_flow_test();
         let response = ExecuteResponse {
             statement_id: "stmt-1".to_string(),
             status: ok_status(),
@@ -2372,7 +2387,7 @@ mod tests {
     /// it's not the manifest-driven `EmptyReader` path.
     #[tokio::test]
     async fn non_zero_total_chunk_count_does_not_short_circuit() {
-        let factory = factory_for_control_flow_test();
+        let (factory, _transport) = factory_for_control_flow_test();
         let response = ExecuteResponse {
             statement_id: "stmt-1".to_string(),
             status: ok_status(),
