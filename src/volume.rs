@@ -21,7 +21,7 @@
 use crate::client::retry::{calculate_backoff, RequestType, RetryConfig, RetryStrategy};
 use crate::kernel_error::{Error, LocalFileError, Result};
 use arrow_array::{Array, LargeStringArray, MapArray, RecordBatch, StringArray, StringViewArray};
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use reqwest::{header::HeaderMap, Client, Method};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -260,11 +260,15 @@ impl VolumeState {
                         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
                         Err(error) => return Err(local_error(error, &local_file)),
                     };
-                    let temp = tempfile::tempfile_in(
-                        path.parent()
-                            .ok_or_else(|| invalid("Missing destination parent"))?,
-                    )
-                    .or_else(|_| tempfile::tempfile())
+                    let parent = path
+                        .parent()
+                        .ok_or_else(|| invalid("Missing destination parent"))?;
+                    let temp = match tempfile::tempfile_in(parent) {
+                        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                            tempfile::tempfile()
+                        }
+                        other => other,
+                    }
                     .map_err(|e| local_error(e, &local_file))?;
                     let writer = tokio::fs::File::from_std(
                         temp.try_clone().map_err(|e| local_error(e, &local_file))?,
@@ -287,17 +291,45 @@ impl VolumeState {
             .headers(instruction.headers.clone());
         let upload_error = Arc::new(Mutex::new(None));
         let (progress, changed) = tokio::sync::watch::channel(tokio::time::Instant::now());
-        let reader: Option<(Box<dyn tokio::io::AsyncRead + Unpin + Send>, u64)> =
-            if let Some((file, length)) = source {
-                Some((Box::new(tokio::fs::File::from_std(file)), length))
-            } else {
-                input.map(|bytes| {
-                    (
-                        Box::new(std::io::Cursor::new(bytes.clone())) as _,
-                        bytes.len() as u64,
-                    )
+        let mut upload_file = None;
+        let reader: Option<(
+            futures::stream::BoxStream<'static, std::io::Result<Bytes>>,
+            u64,
+        )> = if let Some((file, length)) = source.as_ref() {
+            let reader = Arc::new(tokio::sync::Mutex::new(Some(tokio::fs::File::from_std(
+                file.try_clone().map_err(|e| local_error(e, &local_file))?,
+            ))));
+            upload_file = Some(Arc::clone(&reader));
+            Some((
+                futures::stream::try_unfold(reader, |reader| async move {
+                    let mut bytes = Vec::with_capacity(256 * 1024);
+                    let count = {
+                        let mut file = reader.lock().await;
+                        match file.as_mut() {
+                            Some(file) => {
+                                tokio::io::AsyncReadExt::read_buf(file, &mut bytes).await?
+                            }
+                            None => 0,
+                        }
+                    };
+                    Ok::<_, std::io::Error>(if count == 0 {
+                        None
+                    } else {
+                        Some((Bytes::from(bytes), reader))
+                    })
                 })
-            };
+                .boxed(),
+                *length,
+            ))
+        } else {
+            input.map(|bytes| {
+                (
+                    ReaderStream::with_capacity(std::io::Cursor::new(bytes.clone()), 256 * 1024)
+                        .boxed(),
+                    bytes.len() as u64,
+                )
+            })
+        };
         if let Some((reader, length)) = reader {
             request = request
                 .headers(HeaderMap::from_iter([(
@@ -319,20 +351,51 @@ impl VolumeState {
             changed,
         )
         .await?;
-        if let Some(bytes) = input.filter(|_| matches!(response.status().as_u16(), 307 | 308)) {
-            // reqwest cannot replay a streamed body on a redirect. Resend from memory
-            // so it can follow; this resend has no idle timeout.
-            response = client
-                .put(&instruction.url)
-                .headers(instruction.headers.clone())
-                .headers(HeaderMap::from_iter([(
-                    reqwest::header::CONTENT_LENGTH,
-                    bytes.len().into(),
-                )]))
-                .body(reqwest::Body::from(bytes.clone()))
-                .send()
-                .await
-                .map_err(storage_error)?;
+        if matches!(response.status().as_u16(), 307 | 308) {
+            if let Some(upload_file) = upload_file {
+                let file = upload_file.lock().await.take();
+                if let Some(file) = file {
+                    // The cloned handles share a cursor; finish the first reader before rewinding.
+                    drop(file.into_std().await);
+                }
+            }
+            let bytes = match (input, source) {
+                (Some(bytes), _) => Some(bytes.clone()),
+                (None, Some((mut file, _))) => {
+                    let local_file = local_file.clone();
+                    Some(
+                        tokio::task::spawn_blocking(move || {
+                            use std::io::{Read, Seek};
+                            file.rewind().map_err(|e| local_error(e, &local_file))?;
+                            let mut bytes = Vec::new();
+                            file.read_to_end(&mut bytes)
+                                .map_err(|e| local_error(e, &local_file))?;
+                            Ok::<_, Error>(Bytes::from(bytes))
+                        })
+                        .await
+                        .map_err(|e| {
+                            Error::internal()
+                                .message(format!("Volume upload read task failed: {e}"))
+                        })??,
+                    )
+                }
+                _ => None,
+            };
+            if let Some(bytes) = bytes {
+                // reqwest cannot replay a streamed body on a redirect. Resend from memory
+                // so it can follow; this resend has no idle timeout.
+                response = client
+                    .put(&instruction.url)
+                    .headers(instruction.headers.clone())
+                    .headers(HeaderMap::from_iter([(
+                        reqwest::header::CONTENT_LENGTH,
+                        bytes.len().into(),
+                    )]))
+                    .body(reqwest::Body::from(bytes))
+                    .send()
+                    .await
+                    .map_err(storage_error)?;
+            }
         }
         let status = response.status();
         if !(status.is_success()
@@ -405,13 +468,13 @@ impl VolumeState {
 }
 
 fn upload_body(
-    reader: impl tokio::io::AsyncRead + Unpin + Send + 'static,
+    reader: impl futures::Stream<Item = std::io::Result<Bytes>> + Send + 'static,
     path: String,
     error: Arc<Mutex<Option<Error>>>,
     progress: tokio::sync::watch::Sender<tokio::time::Instant>,
 ) -> reqwest::Body {
     reqwest::Body::wrap_stream(
-        ReaderStream::with_capacity(reader, 256 * 1024)
+        reader
             .inspect_ok(move |_| {
                 progress.send_replace(tokio::time::Instant::now());
             })
@@ -441,6 +504,7 @@ async fn storage_send(
             let Some(deadline) = last.checked_add(timeout) else {
                 break (&mut send).await;
             };
+            // PUT response timeouts may follow a committed write; GET retries only rewrite the temporary file.
             tokio::select! {
                 biased;
                 response = &mut send => break response,
@@ -824,7 +888,7 @@ mod tests {
         let os_code = cause.raw_os_error();
         let captured = Arc::new(Mutex::new(None));
         let body = upload_body(
-            FailedRead(Some(cause)),
+            ReaderStream::with_capacity(FailedRead(Some(cause)), 256 * 1024),
             source.to_str().unwrap().into(),
             Arc::clone(&captured),
             tokio::sync::watch::channel(tokio::time::Instant::now()).0,
@@ -922,7 +986,7 @@ mod tests {
     #[tokio::test]
     async fn storage_statuses_and_retry_limits_preserve_classification() {
         for (operation, status, retries, budget, requests, missing_success) in [
-            ("PUT", 307, 2, Duration::from_secs(10), 1, true),
+            ("PUT", 403, 2, Duration::from_secs(10), 1, true),
             ("REMOVE", 403, 2, Duration::from_secs(10), 1, true),
             ("REMOVE", 404, 2, Duration::from_secs(10), 1, true),
             ("REMOVE", 404, 2, Duration::from_secs(10), 1, false),
@@ -1073,6 +1137,20 @@ mod tests {
                 .unwrap(),
             VolumeCompletion::Completed
         );
+    }
+
+    #[tokio::test]
+    async fn get_with_missing_parent_fails_before_downloading() {
+        let server = MockServer::start().await;
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("missing/download");
+        let batch = instruction("GET", &server.uri(), &destination);
+        let error = transfer_state(0)
+            .complete(async { Ok(batch) }, &options(directory.path()), None)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, crate::ErrorCode::NotFound);
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -1407,7 +1485,12 @@ mod tests {
         });
         let error = Arc::new(Mutex::new(None));
         let (progress, changed) = tokio::sync::watch::channel(tokio::time::Instant::now());
-        let body = upload_body(reader, "input".into(), Arc::clone(&error), progress);
+        let body = upload_body(
+            ReaderStream::with_capacity(reader, 256 * 1024),
+            "input".into(),
+            Arc::clone(&error),
+            progress,
+        );
         storage_send(
             Client::new()
                 .put(server.uri())
@@ -1713,46 +1796,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn redirected_stream_put_replays_full_bytes() {
-        let server = MockServer::start().await;
-        let payload = vec![b'x'; 512 * 1024 + 1];
-        Mock::given(method("PUT"))
-            .and(path("/original"))
-            .and(body_bytes(payload.clone()))
-            .respond_with(ResponseTemplate::new(307).insert_header("location", "/target"))
-            .expect(2)
-            .mount(&server)
-            .await;
-        Mock::given(method("PUT"))
-            .and(path("/target"))
-            .and(body_bytes(payload.clone()))
-            .respond_with(ResponseTemplate::new(200))
-            .expect(1)
-            .mount(&server)
-            .await;
-        assert_eq!(
-            transfer_state(0)
-                .complete(
-                    async {
-                        Ok(instruction(
-                            "PUT",
-                            &format!("{}/original", server.uri()),
-                            Path::new("__input_stream__"),
-                        ))
-                    },
-                    &VolumeOptions::default(),
-                    Some(payload),
-                )
+    async fn redirected_put_replays_full_bytes() {
+        for (stream, status) in [(true, 307), (false, 307), (false, 308)] {
+            let server = MockServer::start().await;
+            let payload = vec![b'x'; 512 * 1024 + 1];
+            let directory = tempfile::tempdir().unwrap();
+            let source = directory.path().join("source");
+            std::fs::write(&source, &payload).unwrap();
+            Mock::given(method("PUT"))
+                .and(path("/original"))
+                .and(body_bytes(payload.clone()))
+                .respond_with(ResponseTemplate::new(status).insert_header("location", "/target"))
+                .expect(2)
+                .mount(&server)
+                .await;
+            Mock::given(method("PUT"))
+                .and(path("/target"))
+                .and(body_bytes(payload.clone()))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let batch = instruction(
+                "PUT",
+                &format!("{}/original", server.uri()),
+                if stream {
+                    Path::new("__input_stream__")
+                } else {
+                    &source
+                },
+            );
+            assert_eq!(
+                transfer_state(0)
+                    .complete(
+                        async { Ok(batch) },
+                        &options(directory.path()),
+                        stream.then_some(payload),
+                    )
+                    .await
+                    .unwrap(),
+                VolumeCompletion::Completed
+            );
+            assert!(server
+                .received_requests()
                 .await
-                .unwrap(),
-            VolumeCompletion::Completed
-        );
-        assert!(server
-            .received_requests()
-            .await
-            .unwrap()
-            .iter()
-            .all(|request| !request.headers.contains_key("referer")));
+                .unwrap()
+                .iter()
+                .all(|request| !request.headers.contains_key("referer")));
+        }
     }
 
     #[tokio::test]

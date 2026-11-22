@@ -394,6 +394,61 @@ async fn owner_reader_and_repeated_materialization_share_one_completion() {
 }
 
 #[tokio::test]
+async fn async_executed_canceller_interrupts_volume_transfer() {
+    let server = MockServer::start().await;
+    let directory = tempfile::tempdir().unwrap();
+    let destination = directory.path().join("download");
+    let session = session(
+        &server,
+        response(&server, true, destination.to_str().unwrap()),
+    )
+    .await;
+    Mock::given(method("GET"))
+        .and(path("/object"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_secs(3))
+                .set_body_bytes(b"data"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut statement = session.statement();
+    statement.spec().sql("operation");
+    let executed = statement.submit().await.unwrap();
+    let canceller = executed.canceller();
+    let mut stream = executed.fetch_result().await.unwrap();
+    let options = VolumeOptions::new(vec![directory.path().to_owned()], false);
+    let cancel = async {
+        while !server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .any(|request| request.url.path() == "/object")
+        {
+            tokio::task::yield_now().await;
+        }
+        canceller.cancel().await.unwrap();
+    };
+    let (result, _) = tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::join!(stream.complete_volume_operation(&options, None), cancel)
+    })
+    .await
+    .unwrap();
+    assert_eq!(result.unwrap_err().code, ErrorCode::Cancelled);
+    assert_eq!(
+        stream
+            .complete_volume_operation(&options, None)
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::Cancelled
+    );
+    session.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn cancellation_and_session_close_interrupt_instruction_or_storage_after_sql_closed() {
     for (instruction_page, close_session) in
         [(false, false), (false, true), (true, false), (true, true)]

@@ -324,7 +324,7 @@ impl Session {
     /// is bounded by the shorter limit. Unset or `0` keeps the kernel default
     /// (120 seconds).
     /// For Volume file transfers a positive value is an idle limit instead:
-    /// a transfer fails after that long without progress, except a stream PUT
+    /// a transfer fails after that long without progress, except a PUT
     /// that storage redirects, which is resent without the limit.
     /// Unset or `0` sets no Volume idle limit.
     ///

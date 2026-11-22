@@ -654,10 +654,10 @@ impl ResultStream {
 
     /// Runs the file transfer for a Volume PUT, GET or REMOVE result.
     ///
-    /// Call before reading rows; the rows stay readable afterwards. The outcome is
-    /// cached, so a repeat call does not transfer again. A GET downloads to a
-    /// temporary file and then copies it over the destination, so a failed
-    /// download leaves an existing file unchanged.
+    /// Call before reading rows; the rows stay readable afterwards. The outcome,
+    /// success or failure, is cached, so a repeat call does not transfer again.
+    /// A GET downloads to a temporary file and then copies it over the destination,
+    /// so a failed download leaves an existing file unchanged.
     /// A failure during that copy can leave the destination partly written.
     /// Cancelling does not undo work already done: a PUT or REMOVE may already
     /// have reached storage, and a copy that has started runs to the end.

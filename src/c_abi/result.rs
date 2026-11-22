@@ -120,6 +120,7 @@ enum ResultStreamShape {
 
 /// Detached canceller for a result stream. Holds a clone of the stream's
 /// [`CancellationToken`], so firing it interrupts an in-flight `next_batch`.
+/// It also stops a running Volume file transfer.
 ///
 /// A `CancellationToken` clone shares the same underlying atomic state, so the
 /// canceller keeps working after the stream handle is closed — closing the
@@ -602,8 +603,9 @@ pub unsafe extern "C" fn kernel_result_stream_canceller_new(
 /// Fire the cancellation of the result stream this canceller was created for
 /// (odbc#355-B). Purely client-side (no server RPC): it flips the shared token,
 /// which an in-flight `kernel_result_stream_next_batch` observes via its
-/// `tokio::select!` and unwinds. Idempotent, non-blocking, and safe to call
-/// concurrently with `next_batch`/`close` on the stream's owning thread.
+/// `tokio::select!` and unwinds. It also stops a running Volume file transfer.
+/// Idempotent, non-blocking, and safe to call concurrently with
+/// `next_batch`/`close` on the stream's owning thread.
 ///
 /// Always returns `Success` for a live handle. After this returns, the stream is
 /// permanently aborted: every subsequent `next_batch` returns `Cancelled`.
