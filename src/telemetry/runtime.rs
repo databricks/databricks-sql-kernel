@@ -337,12 +337,16 @@ fn exporter_for_config(
             // parallel tests commonly reuse the same mock host with different
             // capturing exporters, and cache reuse would route events to the
             // exporter from whichever test created the host client first.
-            return (maybe_wrap_exporter(&breaker_key, config, exporter), true);
+            return (
+                maybe_wrap_exporter(&connection.host, &breaker_key, config, exporter),
+                true,
+            );
         }
     }
 
     (
         maybe_wrap_exporter(
+            &connection.host,
             &breaker_key,
             config,
             Arc::new(DatabricksTelemetryExporter::new(
