@@ -30,7 +30,7 @@ pub(super) struct TelemetryClient {
     close_flush_timeout: std::time::Duration,
     pending: Mutex<Vec<TelemetryFrontendLog>>,
     queue_count: AtomicUsize,
-    flush_lock: tokio::sync::Mutex<()>,
+    flush_lock: Arc<tokio::sync::Mutex<()>>,
     state: AtomicU8,
     timer: Mutex<Option<tokio::task::JoinHandle<()>>>,
     runtime_handle: Handle,
@@ -59,7 +59,7 @@ impl TelemetryClient {
             close_flush_timeout: config.close_flush_timeout,
             pending: Mutex::new(Vec::new()),
             queue_count: AtomicUsize::new(0),
-            flush_lock: tokio::sync::Mutex::new(()),
+            flush_lock: Arc::new(tokio::sync::Mutex::new(())),
             state: AtomicU8::new(STATE_ACTIVE),
             timer: Mutex::new(None),
             runtime_handle,
@@ -80,9 +80,13 @@ impl TelemetryClient {
         };
 
         if count >= self.batch_size {
+            let Ok(guard) = Arc::clone(&self.flush_lock).try_lock_owned() else {
+                return;
+            };
             let client = Arc::clone(self);
             self.runtime_handle.spawn(async move {
-                client.flush_once_if_idle().await;
+                let _guard = guard;
+                client.export_pending().await;
             });
         }
     }
@@ -336,6 +340,138 @@ mod tests {
         let requests = exporter.requests();
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].proto_logs.len(), 1);
+    }
+
+    #[test]
+    fn burst_reserves_one_flush_before_the_runtime_runs() {
+        let exporter = CapturingTelemetryExporter::default();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let client = Arc::new(TelemetryClient {
+            exporter: Arc::new(exporter.clone()),
+            batch_size: 100,
+            flush_interval: Duration::from_secs(60),
+            close_flush_timeout: Duration::from_secs(5),
+            pending: Mutex::new(Vec::new()),
+            queue_count: AtomicUsize::new(0),
+            flush_lock: Arc::new(tokio::sync::Mutex::new(())),
+            state: AtomicU8::new(STATE_ACTIVE),
+            timer: Mutex::new(None),
+            runtime_handle: runtime.handle().clone(),
+        });
+
+        for index in 0..2_000 {
+            client.enqueue(sample_log(&index.to_string()));
+        }
+        assert_eq!(runtime.metrics().num_alive_tasks(), 1);
+
+        runtime.block_on(client.close());
+        let mut ids: Vec<usize> = exporter
+            .requests()
+            .iter()
+            .flat_map(|request| &request.proto_logs)
+            .map(|log| event_id(log).parse().unwrap())
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, (0..2_000).collect::<Vec<_>>());
+    }
+
+    #[derive(Default)]
+    struct PausedExporter {
+        captured: CapturingTelemetryExporter,
+        started: tokio::sync::Notify,
+        resume: tokio::sync::Notify,
+    }
+
+    impl TelemetryExporter for PausedExporter {
+        fn export<'a>(
+            &'a self,
+            request: TelemetryRequest,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = super::super::TelemetryExportResult> + Send + 'a>,
+        > {
+            Box::pin(async move {
+                if request
+                    .proto_logs
+                    .iter()
+                    .any(|log| event_id(log) == "first")
+                {
+                    self.started.notify_one();
+                    self.resume.notified().await;
+                }
+                self.captured.export(request).await
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn timer_and_close_flush_events_enqueued_during_export() {
+        for close in [false, true] {
+            let exporter = Arc::new(PausedExporter::default());
+            let config = TelemetryConfig {
+                enabled: Some(true),
+                batch_size: 1,
+                flush_interval: if close {
+                    Duration::from_secs(60)
+                } else {
+                    Duration::from_millis(20)
+                },
+                close_flush_timeout: Duration::from_secs(5),
+                ..TelemetryConfig::default()
+            };
+            let client = TelemetryClient::new(&config, exporter.clone()).unwrap();
+            client.enqueue(sample_log("first"));
+            tokio::time::timeout(Duration::from_secs(5), exporter.started.notified())
+                .await
+                .expect("first export should start");
+            client.enqueue(sample_log("second"));
+
+            let closing = if close {
+                let client = Arc::clone(&client);
+                Some(tokio::spawn(async move { client.close().await }))
+            } else {
+                None
+            };
+            if close {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while client.state.load(Ordering::Acquire) == STATE_ACTIVE {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("close should wait for the running export");
+            }
+            exporter.resume.notify_one();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while exporter.captured.requests().len() < 2 {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("pending event should be flushed");
+            if let Some(closing) = closing {
+                closing.await.unwrap();
+            } else {
+                client.close().await;
+            }
+
+            let ids: Vec<String> = exporter
+                .captured
+                .requests()
+                .into_iter()
+                .flat_map(|request| request.proto_logs)
+                .map(|log| event_id(&log))
+                .collect();
+            assert_eq!(ids, ["first", "second"]);
+        }
+    }
+
+    fn event_id(log: &str) -> String {
+        serde_json::from_str::<TelemetryFrontendLog>(log)
+            .unwrap()
+            .frontend_log_event_id
     }
 
     fn sample_log(id: &str) -> TelemetryFrontendLog {

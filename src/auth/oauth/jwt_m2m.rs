@@ -34,7 +34,7 @@
 //! M2M tokens are not cached to disk (same rationale as [`super::m2m`]):
 //! the private key is always available for re-authentication.
 
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use oauth2::basic::BasicTokenType;
 use oauth2::{EmptyExtraTokenFields, StandardTokenResponse, TokenResponse as _};
@@ -112,8 +112,9 @@ pub struct JwtClientCredentialsProvider {
     signing_key: Arc<JwtSigningKey>,
     /// Thread-safe token store managing the token lifecycle.
     token_store: TokenStore,
-    /// HTTP client for token endpoint requests.
-    http_client: Arc<DatabricksHttpClient>,
+    /// HTTP client for token endpoint requests. Weak; see
+    /// [`super::upgrade_http_client`].
+    http_client: Weak<DatabricksHttpClient>,
     /// OAuth scopes to request.
     scopes: Vec<String>,
     /// Tokio runtime handle captured at construction so the sync
@@ -152,7 +153,8 @@ impl JwtClientCredentialsProvider {
     /// * `jwt_kid` — key id for the JWT header.
     /// * `jwt_passphrase` — passphrase for an encrypted PKCS#8 key, else `None`.
     /// * `jwt_algorithm` — JWT algorithm name (`None` → `RS256`).
-    /// * `http_client` — shared HTTP client.
+    /// * `http_client` — shared HTTP client. The caller must keep it alive;
+    ///   the provider holds only a weak reference.
     /// * `scopes` — OAuth scopes to request.
     /// * `token_endpoint_override` — token endpoint URL, or `None` to discover via OIDC.
     #[allow(clippy::too_many_arguments)]
@@ -163,7 +165,7 @@ impl JwtClientCredentialsProvider {
         jwt_kid: &str,
         jwt_passphrase: Option<&str>,
         jwt_algorithm: Option<&str>,
-        http_client: Arc<DatabricksHttpClient>,
+        http_client: &Arc<DatabricksHttpClient>,
         scopes: Vec<String>,
         token_endpoint_override: Option<String>,
     ) -> Result<Self> {
@@ -178,7 +180,7 @@ impl JwtClientCredentialsProvider {
         let token_endpoint = match token_endpoint_override {
             Some(endpoint) => endpoint,
             None => {
-                OidcEndpoints::discover(host, &http_client)
+                OidcEndpoints::discover(host, http_client)
                     .await?
                     .token_endpoint
             }
@@ -190,7 +192,7 @@ impl JwtClientCredentialsProvider {
             token_endpoint,
             signing_key,
             token_store: TokenStore::new(),
-            http_client,
+            http_client: Arc::downgrade(http_client),
             scopes,
             runtime_handle: RuntimeHandle::current(),
         })
@@ -246,6 +248,7 @@ impl AuthProvider for JwtClientCredentialsProvider {
         let jwt_kid = self.jwt_kid.clone();
 
         let token = self.token_store.get_or_refresh(move || {
+            let http_client = super::upgrade_http_client(&http_client)?;
             // Sign a fresh assertion only now that a refresh is actually
             // running (fresh-token calls return before reaching here).
             let client_assertion =
@@ -379,6 +382,7 @@ mod tests {
             .await;
 
         let (_dir, key_path) = write_test_key();
+        let client = http_client();
         let provider = JwtClientCredentialsProvider::new(
             &server.uri(),
             "test-client-id",
@@ -386,7 +390,7 @@ mod tests {
             "test-kid",
             None,
             Some("RS256"),
-            http_client(),
+            &client,
             vec!["all-apis".to_string()],
             None,
         )
@@ -423,6 +427,7 @@ mod tests {
             .await;
 
         let (_dir, key_path) = write_test_key();
+        let client = http_client();
         let provider = JwtClientCredentialsProvider::new(
             &server.uri(),
             "test-client-id",
@@ -430,7 +435,7 @@ mod tests {
             "test-kid",
             None,
             Some("RS256"),
-            http_client(),
+            &client,
             vec!["all-apis".to_string()],
             None,
         )
@@ -491,6 +496,7 @@ mod tests {
             .await;
 
         let (_dir, key_path) = write_test_key();
+        let client = http_client();
         let provider = JwtClientCredentialsProvider::new(
             &server.uri(),
             "test-client-id",
@@ -498,7 +504,7 @@ mod tests {
             "test-kid",
             None,
             None,
-            http_client(),
+            &client,
             vec!["all-apis".to_string()],
             None,
         )
@@ -527,6 +533,7 @@ mod tests {
             .await;
 
         let (_dir, key_path) = write_test_key();
+        let client = http_client();
         let provider = JwtClientCredentialsProvider::new(
             &server.uri(),
             "test-client-id",
@@ -534,7 +541,7 @@ mod tests {
             "test-kid",
             None,
             None,
-            http_client(),
+            &client,
             vec!["all-apis".to_string()],
             Some(token_url),
         )
@@ -560,7 +567,7 @@ mod tests {
             "test-kid",
             None,
             Some("ES512"),
-            http_client(),
+            &http_client(),
             vec!["all-apis".to_string()],
             None,
         )
@@ -582,7 +589,7 @@ mod tests {
             "test-kid",
             None,
             None,
-            http_client(),
+            &http_client(),
             vec!["all-apis".to_string()],
             None,
         )
@@ -605,6 +612,7 @@ mod tests {
             .await;
 
         let (_dir, key_path) = write_test_key();
+        let client = http_client();
         let provider = JwtClientCredentialsProvider::new(
             &server.uri(),
             "test-client-id",
@@ -612,7 +620,7 @@ mod tests {
             "test-kid",
             None,
             None,
-            http_client(),
+            &client,
             vec!["all-apis".to_string()],
             None,
         )
@@ -650,6 +658,7 @@ mod tests {
             .await;
 
         let (_dir, key_path) = write_test_key();
+        let client = http_client();
         let provider = JwtClientCredentialsProvider::new(
             &server.uri(),
             "test-client-id",
@@ -657,7 +666,7 @@ mod tests {
             "test-kid",
             None,
             None,
-            http_client(),
+            &client,
             vec!["all-apis".to_string()],
             None,
         )
@@ -667,5 +676,36 @@ mod tests {
         let err = provider.get_auth_header().expect_err("should fail on 400");
         assert_eq!(err.code, crate::kernel_error::ErrorCode::Unauthenticated);
         assert_eq!(err.http_status, Some(400));
+    }
+
+    /// The HTTP client owns its auth provider, so a provider holding the client
+    /// strongly would leak both, plus the provider's tokio runtime handle.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn provider_does_not_retain_http_client() {
+        let (_dir, key_path) = write_test_key();
+        let client = http_client();
+        let weak_client = Arc::downgrade(&client);
+        let provider = Arc::new(
+            JwtClientCredentialsProvider::new(
+                "https://ws.cloud.databricks.com",
+                "test-client-id",
+                &key_path,
+                "test-kid",
+                None,
+                None,
+                &client,
+                vec!["all-apis".to_string()],
+                Some("https://ws.cloud.databricks.com/oidc/v1/token".to_string()),
+            )
+            .await
+            .expect("provider"),
+        );
+        let weak_provider = Arc::downgrade(&provider);
+        client.set_auth_provider(provider);
+
+        drop(client);
+
+        assert!(weak_client.upgrade().is_none());
+        assert!(weak_provider.upgrade().is_none());
     }
 }

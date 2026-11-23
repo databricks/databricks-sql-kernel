@@ -116,7 +116,7 @@ async fn test_u2m_refresh_token_full_flow() {
     let provider = AuthorizationCodeProvider::new_with_full_config(
         &mock_server.uri(),
         "test-client-id",
-        http_client,
+        &http_client,
         vec!["all-apis".to_string(), "offline_access".to_string()],
         vec![8020],
         Duration::from_secs(120),
@@ -190,7 +190,7 @@ async fn test_u2m_refresh_token_stale_immediate_return() {
     let provider = AuthorizationCodeProvider::new_with_full_config(
         &mock_server.uri(),
         "test-client-id-stale",
-        http_client,
+        &http_client,
         vec!["all-apis".to_string(), "offline_access".to_string()],
         vec![8021],
         Duration::from_secs(120),
@@ -270,7 +270,7 @@ async fn test_u2m_refresh_token_expired_fallback() {
     let mut provider = AuthorizationCodeProvider::new_with_full_config(
         &mock_server.uri(),
         "test-client-id-expired",
-        http_client,
+        &http_client,
         vec!["all-apis".to_string(), "offline_access".to_string()],
         vec![0],                // Use port 0 to avoid conflicts
         Duration::from_secs(5), // Short timeout for test
@@ -345,7 +345,7 @@ async fn test_u2m_refresh_updates_cache() {
     let provider = AuthorizationCodeProvider::new_with_full_config(
         &mock_server.uri(),
         "test-client-id-cache",
-        http_client,
+        &http_client,
         vec!["all-apis".to_string(), "offline_access".to_string()],
         vec![8023],
         Duration::from_secs(120),

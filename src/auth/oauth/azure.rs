@@ -161,7 +161,7 @@ impl AzureServicePrincipalProvider {
         azure_client_secret: &str,
         tenant: &str,
         workspace_resource_id: Option<String>,
-        http_client: std::sync::Arc<crate::client::http::DatabricksHttpClient>,
+        http_client: &std::sync::Arc<crate::client::http::DatabricksHttpClient>,
     ) -> crate::kernel_error::Result<Self> {
         Self::new_with_token_url(
             host,
@@ -185,13 +185,13 @@ impl AzureServicePrincipalProvider {
         azure_client_secret: &str,
         token_url: String,
         workspace_resource_id: Option<String>,
-        http_client: std::sync::Arc<crate::client::http::DatabricksHttpClient>,
+        http_client: &std::sync::Arc<crate::client::http::DatabricksHttpClient>,
     ) -> crate::kernel_error::Result<Self> {
         let data = super::m2m::ClientCredentialsProvider::new_with_full_config(
             host,
             azure_client_id,
             azure_client_secret,
-            http_client.clone(),
+            http_client,
             vec![sp_m2m_scope(host)],
             Some(token_url.clone()),
         )
@@ -586,7 +586,7 @@ mod tests {
             "sp-client-secret",
             token_url,
             Some("/subscriptions/s/resourceGroups/rg/workspace/w".to_string()),
-            http_client,
+            &http_client,
         )
         .await
         .expect("provider builds");
@@ -619,7 +619,7 @@ mod tests {
             "sp-client-secret",
             token_url,
             None,
-            http_client,
+            &http_client,
         )
         .await
         .expect("provider builds");

@@ -11,8 +11,6 @@ changes go in their respective binding's NEXT_CHANGELOG.
 
 ### Added
 
-- A native Rust ADBC 1.1 driver in `adbc/`, with an optional standard ADBC C
-  ABI for driver-manager loading from other languages.
 - Opt-in TLS certificate revocation checking, off by default. It is supported
   only on Windows with `tls-rustls`, where Windows CryptoAPI decides the status
   after webpki has verified the chain. Requesting it anywhere else (including
@@ -28,17 +26,9 @@ changes go in their respective binding's NEXT_CHANGELOG.
 
 ### Changed
 
-- Rust ADBC requests identify themselves as `RustADBCDatabricksDriver/<version>`
-  with an optional partner entry from `adbc.databricks.user_agent_entry`
-  (`adbc.spark.user_agent_entry` is a compatibility alias). `User-Agent` in
-  `adbc.databricks.http.headers` is now rejected; use the dedicated entry option.
-
 ### Updated
 
 ### Fixed
-
-- `Session::open` authenticates once before resolving feature flags. A failed OAuth token request now fails the open immediately instead of being sent a second time by CreateSession.
-- A timed-out or reset CloudFetch download no longer writes the presigned URL's signature (`sig=`, `X-Amz-Signature`) to the log or the returned error. The request URL in those messages now ends at the path, and debug request lines stop at `?`.
 
 ---
 *Note: When making changes, please add your change under the appropriate

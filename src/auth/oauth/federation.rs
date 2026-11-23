@@ -207,9 +207,7 @@ impl FederationProvider {
     /// Performs the token exchange and returns the in-house token. Errors here
     /// are turned into the pass-through fallback by the caller.
     async fn exchange(&self, source_token: &str) -> Result<OAuthToken> {
-        let http_client = self.http_client.upgrade().ok_or_else(|| {
-            Error::invalid_state().message("Token federation HTTP client is no longer available")
-        })?;
+        let http_client = super::upgrade_http_client(&self.http_client)?;
         let mut form: Vec<(&str, &str)> = vec![
             ("grant_type", GRANT_TYPE_JWT_BEARER),
             ("assertion", source_token),
