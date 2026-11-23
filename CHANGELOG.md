@@ -2,8 +2,8 @@
 
 This changelog tracks releases of the Rust crate published to crates.io.
 The Python (pyo3) and Node.js (napi) bindings have their own changelogs
-under [`pyo3/CHANGELOG.md`](pyo3/CHANGELOG.md) and
-[`napi/CHANGELOG.md`](napi/CHANGELOG.md); they ship on independent
+in the repository's [Python changelog](https://github.com/databricks/databricks-sql-kernel/blob/main/pyo3/CHANGELOG.md) and
+[Node.js changelog](https://github.com/databricks/databricks-sql-kernel/blob/main/napi/CHANGELOG.md); they ship on independent
 cadences and may not move in lockstep with the crate.
 
 ## [Unreleased]

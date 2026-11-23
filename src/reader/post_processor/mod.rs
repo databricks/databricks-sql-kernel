@@ -31,7 +31,9 @@
 //! `next_batch` indirection regardless of how many transforms are
 //! active, and so the "no work" case is genuinely zero-cost.
 //!
-//! See `docs/designs/complex-types-json-stringify.md` for the design.
+//! See the [complex-type JSON design] for details.
+//!
+//! [complex-type JSON design]: https://github.com/databricks/databricks-sql-kernel/blob/main/docs/designs/complex-types-json-stringify.md
 
 mod geospatial;
 mod json;
