@@ -34,7 +34,7 @@ include = [
     "/CHANGELOG.md",
     "/CONNECTION_PARAMETERS.md",
     "/LICENSE",
-    "/NOTICE",
+    "/NOTICE.txt",
 ]
 
 [dependencies]
