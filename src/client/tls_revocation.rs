@@ -171,23 +171,69 @@ impl Drop for Context {
 struct ChainContext(*mut CERT_CHAIN_CONTEXT);
 
 impl ChainContext {
-    /// The revocation status of the chain. CryptoAPI combines the status of the elements into
-    /// the chain's bits (the root is not checked, so its bits do not appear). The elements are
-    /// read as well, so no element's bits are missed. The trust bits are not read.
-    fn status(&self) -> Status {
+    /// The revocation status of the chain, read from each simple chain from the leaf up (see
+    /// `status_from_chain`), keeping the worst result. The trust bits are not read.
+    fn status(&self, custom_cas: &[&[u8]]) -> Status {
         // SAFETY: the chain is live until this guard drops, and every read is of a field CryptoAPI
-        // sets. Each simple chain pointer is valid for `cChain`, and each element pointer for the
-        // `cElement` of its simple chain.
+        // sets. Each simple chain pointer is valid for `cChain`, each element pointer for the
+        // `cElement` of its simple chain, and each certificate pointer for its element. The DER
+        // bytes stay valid while the chain lives, and are used only within this call.
         unsafe {
             let chain = &*self.0;
-            let mut bits = vec![chain.TrustStatus.dwErrorStatus];
+            let chain_bits = chain.TrustStatus.dwErrorStatus;
+            if chain.cChain == 0 {
+                return status_from_chain(chain_bits, &[], custom_cas);
+            }
+            let mut worst = Status::Good;
             for i in 0..chain.cChain as usize {
                 let simple = &**chain.rgpChain.add(i);
-                bits.push(simple.TrustStatus.dwErrorStatus);
+                let mut elements: Vec<(&[u8], u32)> = Vec::with_capacity(simple.cElement as usize);
                 for j in 0..simple.cElement as usize {
-                    bits.push((**simple.rgpElement.add(j)).TrustStatus.dwErrorStatus);
+                    let element = &**simple.rgpElement.add(j);
+                    let cert = &*element.pCertContext;
+                    let der: &[u8] = if cert.pbCertEncoded.is_null() {
+                        &[]
+                    } else {
+                        std::slice::from_raw_parts(cert.pbCertEncoded, cert.cbCertEncoded as usize)
+                    };
+                    elements.push((der, element.TrustStatus.dwErrorStatus));
                 }
+                worst = worse(worst, status_from_chain(chain_bits, &elements, custom_cas));
             }
+            worst
+        }
+    }
+}
+
+/// The more severe of two statuses: revoked, then undetermined, then good.
+fn worse(a: Status, b: Status) -> Status {
+    match (a, b) {
+        (Status::Revoked, _) | (_, Status::Revoked) => Status::Revoked,
+        (Status::Undetermined, _) | (_, Status::Undetermined) => Status::Undetermined,
+        _ => Status::Good,
+    }
+}
+
+/// The status of one simple chain. `elements` are its certificates, from the leaf up, with their
+/// trust error bits. `chain_bits` are the chain-level bits, which are used only when no element is
+/// a custom CA.
+///
+/// A custom CA on the chain is a trust anchor. Anchors are not revocation-checked, and neither are
+/// the certificates above one, so the elements below the first anchor are read on their own. The
+/// chain-level bits are dropped then, because they combine the anchor and the certificates above
+/// it. Without a custom CA on the chain, the chain-level and element bits are read as before.
+fn status_from_chain(chain_bits: u32, elements: &[(&[u8], u32)], custom_cas: &[&[u8]]) -> Status {
+    match elements
+        .iter()
+        .position(|(der, _)| custom_cas.contains(der))
+    {
+        Some(anchor) => {
+            let bits: Vec<u32> = elements[..anchor].iter().map(|(_, bits)| *bits).collect();
+            status_from_bits(&bits)
+        }
+        None => {
+            let mut bits = vec![chain_bits];
+            bits.extend(elements.iter().map(|(_, bits)| *bits));
             status_from_bits(&bits)
         }
     }
@@ -321,6 +367,7 @@ fn cryptoapi_status(
         &store,
         null_mut(),
         REVOCATION_TIMEOUT,
+        custom_cas,
     );
     // With a custom CA, Windows does not trust its root. The default engine can then end the
     // chain at an untrusted root and report no revocation status, so the result is undetermined.
@@ -346,18 +393,27 @@ fn cryptoapi_status(
     let Some(engine) = ChainEngine::exclusive(&roots) else {
         return status;
     };
-    chain_status("exclusive-root engine", &leaf, &store, engine.0, remaining)
+    chain_status(
+        "exclusive-root engine",
+        &leaf,
+        &store,
+        engine.0,
+        remaining,
+        custom_cas,
+    )
 }
 
 /// Builds the chain for `leaf` with `engine` (null is the default engine) and reads its
-/// revocation status. `budget` bounds the revocation fetches of this build. `label` names the
-/// engine in the test-only diagnostics.
+/// revocation status. `budget` bounds the revocation fetches of this build. `custom_cas` are the
+/// trust anchors that the status reading stops at. `label` names the engine in the test-only
+/// diagnostics.
 fn chain_status(
     label: &str,
     leaf: &Context,
     store: &Store,
     engine: HCERTCHAINENGINE,
     budget: Duration,
+    custom_cas: &[&[u8]],
 ) -> Status {
     // Only the test-only diagnostics below read `label`.
     let _ = label;
@@ -395,7 +451,7 @@ fn chain_status(
     let chain = ChainContext(chain);
     #[cfg(test)]
     eprintln!("revocation diagnostics [{label}]: {}", chain.describe());
-    chain.status()
+    chain.status(custom_cas)
 }
 
 /// A chain engine whose exclusive root is a store of custom CAs. Freed on drop.

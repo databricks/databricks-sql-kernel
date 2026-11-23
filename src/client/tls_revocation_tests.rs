@@ -569,6 +569,80 @@ fn status_from_bits_maps_each_case() {
 }
 
 #[test]
+fn status_from_chain_stops_at_a_custom_anchor() {
+    // Synthetic certificates: only their identity matters for the anchor match.
+    let leaf: &[u8] = b"leaf";
+    let anchor: &[u8] = b"anchor";
+    let issuer: &[u8] = b"issuer";
+    let other: &[u8] = b"other";
+    let cas: [&[u8]; 1] = [anchor];
+    let unknown = CERT_TRUST_REVOCATION_STATUS_UNKNOWN;
+
+    // Anchor in the middle: its bits and those of the certificates above it are ignored.
+    assert_eq!(
+        status_from_chain(
+            0,
+            &[
+                (leaf, 0),
+                (anchor, unknown),
+                (issuer, CERT_TRUST_IS_REVOKED)
+            ],
+            &cas
+        ),
+        Status::Good
+    );
+    // The leaf below an anchor is still checked.
+    assert_eq!(
+        status_from_chain(0, &[(leaf, CERT_TRUST_IS_REVOKED), (anchor, 0)], &cas),
+        Status::Revoked
+    );
+    assert_eq!(
+        status_from_chain(0, &[(leaf, unknown), (anchor, 0)], &cas),
+        Status::Undetermined
+    );
+    // The chain-level bits combine the anchor, so they are dropped once the chain is cut.
+    assert_eq!(
+        status_from_chain(CERT_TRUST_IS_REVOKED, &[(leaf, 0), (anchor, 0)], &cas),
+        Status::Good
+    );
+
+    // Custom CA is the root: the certificates below it are checked, the root is not.
+    assert_eq!(
+        status_from_chain(0, &[(leaf, 0), (other, unknown), (anchor, 0)], &cas),
+        Status::Undetermined
+    );
+    assert_eq!(
+        status_from_chain(
+            0,
+            &[(leaf, 0), (other, 0), (anchor, CERT_TRUST_IS_REVOKED)],
+            &cas
+        ),
+        Status::Good
+    );
+
+    // No custom CA on the chain: the chain-level and element bits are read as before.
+    assert_eq!(
+        status_from_chain(0, &[(leaf, 0), (other, unknown), (issuer, 0)], &cas),
+        Status::Undetermined
+    );
+    assert_eq!(
+        status_from_chain(CERT_TRUST_IS_REVOKED, &[(leaf, 0), (other, 0)], &cas),
+        Status::Revoked
+    );
+    assert_eq!(status_from_chain(0, &[], &cas), Status::Good);
+
+    // A leaf that is itself the custom CA is an anchor, so nothing below it is checked.
+    assert_eq!(
+        status_from_chain(
+            CERT_TRUST_IS_REVOKED,
+            &[(anchor, CERT_TRUST_IS_REVOKED), (issuer, 0)],
+            &cas
+        ),
+        Status::Good
+    );
+}
+
+#[test]
 fn stapled_ocsp_empty_or_garbage_does_not_change_the_outcome() {
     // An empty response is skipped, and bytes that are not OCSP are attached and then ignored or
     // refused by CryptoAPI. Neither may change a good chain or a CRL-revoked leaf.
