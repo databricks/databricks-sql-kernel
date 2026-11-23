@@ -11,10 +11,6 @@ they ship on independent cadences.
 ### Added
 
 ### Changed
-- Allow pyarrow 24.x through 26.x on Python 3.10+ (`pyarrow>=23.0.1,<27`),
-  so the wheel installs alongside pyarrow 26, the first release clear of
-  CVE-2026-92287. Python 3.10 resolves to pyarrow 25.x because pyarrow 26
-  requires Python 3.11.
 
 ### Fixed
 
