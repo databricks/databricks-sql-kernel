@@ -32,7 +32,10 @@ not use FFI.
 
 ## Status
 
-Early. Expect breaking changes.
+The kernel is early in development; expect breaking changes.
+
+The Rust ADBC implementation under [`adbc/`](adbc/) is experimental,
+unsupported, and not currently published or distributed.
 
 ## Building
 
@@ -53,6 +56,14 @@ splitting, packaging, and binary-identity guidance.
 ## Configuration
 
 See [CONNECTION_PARAMETERS.md](CONNECTION_PARAMETERS.md) for every connection, auth, and session parameter the kernel accepts — its meaning, default value, and the config struct it lives on.
+
+## Community and support
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) to propose changes. Participation is
+governed by the [Databricks Open Source Code of Conduct](CODE_OF_CONDUCT.md),
+and security vulnerabilities should be reported according to
+[SECURITY.md](SECURITY.md). For other project questions, contact
+[eng-oss-sql-driver@databricks.com](mailto:eng-oss-sql-driver@databricks.com).
 
 ## License
 
