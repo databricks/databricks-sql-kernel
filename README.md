@@ -32,8 +32,8 @@ not use FFI.
 
 ## Status
 
-The kernel is production-ready. Its public APIs continue to evolve, so expect
-breaking changes.
+The native Rust API is production-ready. Its public APIs continue to evolve, so
+expect breaking changes. The custom C ABI remains under development.
 
 The Rust ADBC implementation under [`adbc/`](adbc/) is experimental,
 unsupported, and not currently published or distributed.

@@ -28,7 +28,7 @@ the change focused on the issue it addresses.
 
 ## Build and test
 
-Install the stable Rust toolchain, then run:
+Install the stable Rust toolchain and a C compiler, then run:
 
 ```bash
 cargo build
