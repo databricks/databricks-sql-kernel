@@ -36,6 +36,7 @@ on:
       # Root Cargo.toml change can affect napi via its `path = ".."`
       # kernel dep, so this workflow re-runs to catch mismatches.
       - "Cargo.toml"
+      - ".github/actions/setup-public-package-proxies/**"
       - ".github/workflows/napi-checks.yml"
   pull_request:
     branches: [main]
@@ -43,6 +44,7 @@ on:
       - "napi/**"
       - "src/**"
       - "Cargo.toml"
+      - ".github/actions/setup-public-package-proxies/**"
       - ".github/workflows/napi-checks.yml"
 
 concurrency:

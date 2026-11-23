@@ -109,11 +109,11 @@ How this shows up in the repo:
 
 - **GitHub Actions steps** are SHA-pinned, with the version tag in
   a trailing comment (e.g. `uses: actions/checkout@34e1148... # v4`).
-- **Fork-safe public dependencies** use
+- **Credential-free public dependencies** use
   `.github/actions/setup-public-package-proxies`. This credential-free
   composite configures Cargo and Python to use the filtered public proxies and
-  does not require `id-token: write`; use it for jobs that run fork-controlled
-  code and do not need private packages.
+  does not require `id-token: write`. Cargo-only CI uses it for trusted pushes,
+  same-repository PRs, and fork PRs when no private packages are needed.
 - **Authenticated or private dependencies** use
   `.github/actions/setup-jfrog`. This composite exchanges GitHub OIDC for
   access to `db-cargo-remote` and `db-pypi`, so callers must grant
