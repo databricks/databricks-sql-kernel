@@ -32,7 +32,8 @@ not use FFI.
 
 ## Status
 
-The kernel is early in development; expect breaking changes.
+The kernel is production-ready. Its public APIs continue to evolve, so expect
+breaking changes.
 
 The Rust ADBC implementation under [`adbc/`](adbc/) is experimental,
 unsupported, and not currently published or distributed.
@@ -67,4 +68,4 @@ and security vulnerabilities should be reported according to
 
 ## License
 
-Apache 2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
+Apache 2.0. See [LICENSE](LICENSE) and [NOTICE.txt](NOTICE.txt).

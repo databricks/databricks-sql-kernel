@@ -20,7 +20,8 @@ and documentation improvements can be submitted directly as pull requests.
 3. Add tests for behavioral changes.
 4. Run the checks described below.
 5. Commit with a DCO sign-off: `git commit -s`.
-6. Push your branch and open a pull request.
+6. Push your branch and open a pull request whose title follows
+   `type(scope): description` conventional-commit syntax.
 
 Maintainers will review the pull request. Please respond to feedback and keep
 the change focused on the issue it addresses.

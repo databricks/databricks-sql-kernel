@@ -10,4 +10,5 @@ and include a description, reproduction steps, and the potential impact.
 
 ## Supported versions
 
-Security updates are applied to the latest release only.
+Security fixes are applied to the `main` branch and the latest published
+release, if any.
