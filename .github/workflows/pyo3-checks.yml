@@ -56,12 +56,9 @@ jobs:
     runs-on:
       group: databricks-protected-runner-group
       labels: linux-ubuntu-latest
-    # `azure-prod` holds the Databricks secrets used by the live
-    # pytest suite below. Fork PRs are paused at "Waiting / approval
-    # required" until a maintainer clicks through, preventing secret
-    # exfil. PRs from forks that don't get approval still run the
-    # cargo-test step (no secrets needed) but the pytest step skips
-    # the `@live`-marked tests automatically when env vars are unset.
+    # `azure-prod` holds the Databricks secrets used by the live pytest suite.
+    # This job only runs for trusted pushes and same-repository PRs; fork PRs
+    # run the credential-free `fork-build-and-test` job instead.
     environment: azure-prod
     env:
       DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
@@ -166,9 +163,8 @@ jobs:
         # `@live`; they auto-skip when DATABRICKS_HOST/HTTP_PATH/
         # TOKEN are unset. With the env: block above the live tier
         # runs against the configured warehouse on PRs from this
-        # repo; on fork PRs without approval, the no-network tier
-        # (test_module.py + test_auth.py) runs and the live tier
-        # skips cleanly.
+        # repo. The separate `fork-build-and-test` job runs the
+        # no-network tier without these secrets.
         # The extension and dependencies are already installed above;
         # avoid another implicit project sync before starting pytest.
         run: uv run --no-sync pytest -v
