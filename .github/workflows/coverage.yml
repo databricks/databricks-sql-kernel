@@ -50,7 +50,6 @@ concurrency:
 
 permissions:
   contents: read
-  id-token: write
   pull-requests: write
 
 defaults:
@@ -71,7 +70,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - uses: ./.github/actions/setup-jfrog
+      - uses: ./.github/actions/setup-public-package-proxies
         with:
           cargo: "true"
 
@@ -97,18 +96,12 @@ jobs:
 
       # Codecov upload.
       #
-      # `use_oidc: true` is tokenless, but it requires the repo to be
-      # enrolled in Codecov's GitHub App with OIDC enabled in the
-      # Codecov dashboard. Until that is set up, the action falls
-      # back to anonymous upload which Codecov silently rate-limits
-      # and may drop. `fail_ci_if_error: false` keeps the job green
-      # in that case (we don't want a one-off Codecov outage to red-
-      # light unrelated PRs) — but it does mean coverage data may not
-      # actually land. Watch for the Codecov check on the first few
-      # PRs to confirm uploads are flowing.
+      # Upload anonymously. Granting `id-token: write` to the job would also
+      # grant contributor-controlled build scripts an OIDC mint permission.
+      # `fail_ci_if_error: false` keeps coverage advisory if anonymous upload
+      # is rate-limited.
       - name: Upload to Codecov
         uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f  # v7.0.0
         with:
           files: lcov.info,adbc-lcov.info
           fail_ci_if_error: false
-          use_oidc: true
