@@ -41,7 +41,9 @@ def pyarrow_requirement() -> Requirement:
         for req in (Requirement(r) for r in requires("databricks-sql-kernel") or [])
         if req.name == "pyarrow" and (req.marker is None or req.marker.evaluate())
     ]
-    assert len(matching) == 1, f"expected one pyarrow requirement for this interpreter, got {matching}"
+    assert len(matching) == 1, (
+        f"expected one pyarrow requirement for this interpreter, got {matching}"
+    )
     return matching[0]
 
 
