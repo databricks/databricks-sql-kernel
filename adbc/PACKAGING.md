@@ -21,11 +21,12 @@ Repository CI must validate all of the following before release:
    ADBC dependency graph.
 5. Platform-specific release jobs validate Linux, macOS, and Windows artifacts.
 
-Publication remains disabled while the repository and kernel crate are not
-publicly released. A release must publish `databricks-sql-kernel` first, then
-publish `databricks-adbc` with the matching version requirement. Both crates
-are built from the same repository source during development; no kernel FFI or
-C ABI is involved in that dependency.
+Publication remains disabled while the implementation is experimental. Any
+future release requires a separate product, support, security, and
+release-readiness decision. If publication is approved, release
+`databricks-sql-kernel` first, then `databricks-adbc` with the matching version
+requirement. Both crates are built from the same repository source during
+development; no kernel FFI or C ABI is involved in that dependency.
 
 The declared MSRV is Rust 1.89. Cargo dependencies used by internal CI must
 resolve through the Databricks package proxy. Release artifacts must include
