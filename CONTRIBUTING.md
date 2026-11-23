@@ -28,16 +28,21 @@ the change focused on the issue it addresses.
 
 ## Build and test
 
-Install the stable Rust toolchain and a C compiler, then run:
+Install the stable Rust toolchain. The cross-platform minimum checks are:
 
 ```bash
-cargo build
-cargo test --workspace
-make check
+cargo fmt --all -- --check
+cargo fmt --manifest-path adbc/Cargo.toml -- --check
+cargo clippy --all-targets -- -D warnings
+cargo clippy --manifest-path adbc/Cargo.toml --all-targets --features ffi -- -D warnings
+cargo test
+cargo test --manifest-path adbc/Cargo.toml --features ffi
 ```
 
-`make check` runs formatting, Clippy, tests, and native ABI smoke tests. The
-experimental ADBC workspace is validated separately by that target.
+On a Unix-like system with `make`, a POSIX shell, and a C compiler available as
+`cc`, run `make check` instead. It includes the checks above plus native C ABI
+smoke tests that use `LD_LIBRARY_PATH` or `DYLD_LIBRARY_PATH`; this target is not
+native-Windows-compatible.
 
 End-to-end tests that require a live Databricks connection are ignored by
 default. Do not include credentials, connection strings, customer data, or
