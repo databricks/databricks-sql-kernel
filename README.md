@@ -56,4 +56,4 @@ See [CONNECTION_PARAMETERS.md](CONNECTION_PARAMETERS.md) for every connection, a
 
 ## License
 
-Apache 2.0. See [LICENSE](LICENSE) and [NOTICE.txt](NOTICE.txt).
+Apache 2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
