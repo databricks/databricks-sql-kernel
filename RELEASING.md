@@ -5,8 +5,9 @@ published by CI from a version tag; do not publish packages from a workstation.
 
 ## Prepare the release
 
-1. Open a release pull request that updates the version in the root, PyO3, and
-   NAPI package manifests and refreshes their lockfiles. Keep the standalone
+1. Open a release pull request that updates the version in the root
+   `Cargo.toml`, `pyo3/Cargo.toml`, `pyo3/pyproject.toml`, `napi/Cargo.toml`,
+   and `napi/package.json`, and refreshes their lockfiles. Keep the standalone
    ADBC crate unpublished (`publish = false`); only update its kernel dependency
    requirement and lockfile.
 2. Move each component's staged entries from `NEXT_CHANGELOG.md`,
@@ -18,6 +19,7 @@ published by CI from a version tag; do not publish packages from a workstation.
 
    ```bash
    make check
+   cargo check --locked --manifest-path adbc/Cargo.toml
    cargo check --locked --manifest-path pyo3/Cargo.toml
    cargo check --locked --manifest-path napi/Cargo.toml
    cargo package --locked --list
@@ -53,7 +55,10 @@ Run each applicable public-package workflow in dry-run mode first. A real
 publication requires the configured release-environment approval. The workflows
 verify the tag and manifest versions, build on protected runners, scan the
 assembled artifacts, publish from hardened runners, and create or update the
-GitHub release from the component changelogs.
+GitHub release from the component changelogs. If one of these dry runs fails
+after the tag has triggered the internal JFrog publish, fix the issue in a new
+release pull request, bump the version, and repeat the release process; do not
+reuse an internally published version.
 
 Rust ADBC is experimental and has no publication workflow. Do not publish it or
 attach ADBC artifacts to a release.
