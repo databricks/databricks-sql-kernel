@@ -29,16 +29,26 @@ authors = [{ name = "Databricks" }]
 #    (Python 3.14) wheels from 23.x onward, so an older ceiling forces
 #    a from-source build that fails on 3.14. Keeping the floor aligned
 #    with the connector also keeps the two surfaces installable side
-#    by side.
+#    by side. The ceiling must admit 26.x: every pyarrow below 26.0.0
+#    is flagged by CVE-2026-92287 (apache/arrow#51349; a Parquet KMS
+#    decryption path this binding never calls), and a `<24` ceiling
+#    made `pip install "databricks-sql-connector[kernel]" "pyarrow>=26"`
+#    unresolvable (databricks/databricks-sql-python#1076). pyarrow 26
+#    needs Python >= 3.11, so 3.10 resolves to 25.x inside this bound.
+#    The handoff uses arrow-pyarrow's C Data Interface calls
+#    (`_import_from_c` / `__arrow_c_*`), which pyarrow keeps stable
+#    across these majors; `tests/test_fetch.py` exercises it offline.
 #  * Python 3.9: pyarrow 23.x dropped 3.9 wheels, so 3.9 takes the
 #    last series that still ships them (`>=14,<19`). 3.9 never sees
 #    3.14, so the cp314 concern does not apply here.
 #
-# Both `<24` / `<19` ceilings preserve the major-version upper bound
+# Both `<27` / `<19` ceilings preserve the major-version upper bound
 # the go/pinning-python-deps policy requires (a future pyarrow major
 # then surfaces as a deliberate bump, not a silent auto-resolve).
+# `tests/test_dependency_bounds.py` keeps the 3.10+ ceiling from
+# dropping back below 26.0.0.
 dependencies = [
-    "pyarrow>=23.0.1,<24; python_version >= '3.10'",
+    "pyarrow>=23.0.1,<27; python_version >= '3.10'",
     "pyarrow>=14,<19; python_version < '3.10'",
 ]
 
