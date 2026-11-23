@@ -101,25 +101,26 @@ the CI gate lives on `deny.toml`.
 ## Supply-chain hardening
 
 Per [go/hardened-gha](https://docs.google.com/document/d/1zoHgolfZO_IUBIU3w40NmYsoZ9eTRdAmjlfwYOxkj70/edit),
-the protected runners block direct access to public package
-registries (crates.io, PyPI, npm, etc.). All third-party
-dependency fetches route through Databricks' JFrog Artifactory
-proxy at `databricks.jfrog.io`.
+the protected runners block direct access to public package registries
+(crates.io, PyPI, npm, etc.). Third-party dependency fetches route through
+Databricks-filtered proxies.
 
 How this shows up in the repo:
 
 - **GitHub Actions steps** are SHA-pinned, with the version tag in
   a trailing comment (e.g. `uses: actions/checkout@34e1148... # v4`).
-- **Cargo** access goes through `db-cargo-remote`. Workflows that
-  hit cargo run `./.github/actions/setup-jfrog` with `cargo: "true"`
-  before `setup-rust-toolchain`. `Cargo.lock` carries per-crate
-  SHA256 checksums (`source = "registry+..."` + `checksum = "..."`),
-  which is Cargo's native pinning mechanism.
-- **PyPI** access goes through `db-pypi`. The `pyo3-checks.yml`
-  workflow runs the same composite with `uv: "true"` (exports
-  `UV_INDEX_URL` + `PIP_INDEX_URL` for fallback compatibility).
-  The pyo3 sub-crate uses [uv](https://docs.astral.sh/uv/) for
-  Python env management.
+- **Fork-safe public dependencies** use
+  `.github/actions/setup-public-package-proxies`. This credential-free
+  composite configures Cargo and Python to use the filtered public proxies and
+  does not require `id-token: write`; use it for jobs that run fork-controlled
+  code and do not need private packages.
+- **Authenticated or private dependencies** use
+  `.github/actions/setup-jfrog`. This composite exchanges GitHub OIDC for
+  access to `db-cargo-remote` and `db-pypi`, so callers must grant
+  `id-token: write` and must not expose that job to fork-controlled code.
+- `Cargo.lock` carries per-crate SHA256 checksums (`source = "registry+..."` +
+  `checksum = "..."`), which is Cargo's native pinning mechanism. The pyo3
+  sub-crate uses [uv](https://docs.astral.sh/uv/) for Python env management.
 - **Python dep pinning follows the externally-published-library
   rule from [go/pinning-python-deps](https://docs.google.com/document/d/1thJsoOBW3NzvRV6pWpujcD8mn4KOXgAW8t10iw6Z6LA/edit)**:
   major-version upper bounds in `pyo3/pyproject.toml`
@@ -129,11 +130,8 @@ How this shows up in the repo:
   own pyarrow consumers. The `db-pypi` proxy's 7-day age filter
   is the baseline supply-chain protection; `uv sync` re-resolves
   each CI run within the major-version bounds.
-- **Composite action**: `.github/actions/setup-jfrog/action.yml`
-  encapsulates the OIDC token exchange (`id-token: write`
-  permission required) plus the cargo / uv config writes.
-  Workflows that need registry access reference it with
-  `uses: ./.github/actions/setup-jfrog`.
+- **Composite actions**: both proxy setup actions write Cargo and uv/pip
+  configuration; only `setup-jfrog` performs an OIDC token exchange.
 
 ## Local development environment
 

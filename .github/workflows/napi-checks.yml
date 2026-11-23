@@ -74,9 +74,9 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # Route cargo through the JFrog crates proxy. The protected
-      # Use the unauthenticated filtered proxy so fork PRs never receive
-      # an OIDC mint permission while executing contributor-controlled code.
+      # Route cargo through the unauthenticated filtered proxy so fork PRs
+      # never receive an OIDC mint permission while executing
+      # contributor-controlled code.
       - uses: ./.github/actions/setup-public-package-proxies
         with:
           cargo: "true"
