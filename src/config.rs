@@ -1052,9 +1052,11 @@ pub struct TlsConfig {
     /// Trust, name and signatures are still decided by webpki, as with checking off.
     /// CryptoAPI then checks every certificate in the chain it builds except the root.
     /// Only the revocation bits are read. The trust bits are ignored. A trust anchor is not
-    /// revocation-checked, including a self-signed server certificate configured as a custom CA,
-    /// as in RFC 5280, the JDK PKIX path validator and CryptoAPI's exclude-root flag. The leaf
-    /// and the other chain certificates are checked. A chain with an invalid signature on any
+    /// revocation-checked, and neither are the certificates above it. A custom CA on the chain is
+    /// an anchor, including a self-signed server certificate configured as a custom CA and a custom
+    /// intermediate anchor, even when Windows can build past it to an installed root. This follows
+    /// RFC 5280, the JDK PKIX path validator and CryptoAPI's exclude-root flag. The leaf and the
+    /// certificates below an anchor are checked. A chain with an invalid signature on any
     /// element is undetermined, never good. A non-empty stapled OCSP response from the server is
     /// attached to the leaf, so CryptoAPI can use it without a fetch. rustls's client requests
     /// OCSP stapling by default, and an empty or refused response is ignored. CRL and OCSP
