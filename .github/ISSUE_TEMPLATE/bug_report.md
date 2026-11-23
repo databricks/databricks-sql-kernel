@@ -29,4 +29,5 @@ Describe what you expected to happen.
 ## Additional context
 
 Include redacted logs or other relevant details. For security vulnerabilities,
-follow [SECURITY.md](../../SECURITY.md) instead of opening a public issue.
+follow [SECURITY.md](https://github.com/databricks/databricks-sql-kernel/blob/main/SECURITY.md)
+instead of opening a public issue.
