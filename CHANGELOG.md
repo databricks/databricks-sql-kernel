@@ -14,6 +14,52 @@ cadences and may not move in lockstep with the crate.
 
 ### Fixed
 
+## [v1.5.0] - 2026-11-23
+
+### Added
+- A native Rust ADBC 1.1 driver in `adbc/`, with an optional standard ADBC C
+  ABI for driver-manager loading from other languages.
+- `AsyncStatementReader::num_modified_rows()` exposes the cached affected-row
+  count without polling or consuming results.
+
+### Changed
+- Rust ADBC requests identify themselves as `RustADBCDatabricksDriver/<version>`
+  with an optional partner entry from `adbc.databricks.user_agent_entry`
+  (`adbc.spark.user_agent_entry` is a compatibility alias). `User-Agent` in
+  `adbc.databricks.http.headers` is now rejected; use the dedicated entry option.
+- **Breaking (Rust API):** `ClientCredentialsProvider`,
+  `JwtClientCredentialsProvider` and `AuthorizationCodeProvider` constructors
+  take `&Arc<DatabricksHttpClient>` instead of `Arc<DatabricksHttpClient>` and
+  hold it weakly, matching `FederationProvider`. Callers must keep the client
+  alive while using the provider; fetching a token after it is dropped fails
+  with `invalid_state`.
+- Reuse successful async completion responses when constructing results to
+  avoid redundant status requests.
+- Avoid spawning redundant telemetry flush tasks during event bursts.
+
+### Updated
+- Update Arrow dependencies to 59.3.2, `quinn-proto` to 0.11.19 and
+  `quinn-udp` to 0.5.16 for security fixes.
+
+### Fixed
+- `Session::open` authenticates once before resolving feature flags. A failed
+  OAuth token request fails the open immediately instead of being sent again
+  by CreateSession.
+- CloudFetch request errors and debug logs omit presigned URL query strings,
+  including signatures.
+- Closing a session releases its transport, HTTP client and runtime handle;
+  OAuth providers no longer retain the HTTP client through a reference cycle.
+- CloudFetch link prefetch advances ahead of downloads, shares in-flight page
+  requests, responds to cancellation and returns the cached tail before EOF.
+- Nonblocking CloudFetch reads yield on lock contention and return earlier
+  chunks before a later link-fetch error.
+- Fetch all pages of inline Arrow results when CloudFetch is disabled on a
+  warehouse that supports paged inline delivery.
+- Directly completed statements expose affected-row counts while preserving
+  server-provided counts and the fetched counter row.
+- TLS certificate verification errors fail after one attempt and report the
+  underlying cause, including for CloudFetch downloads.
+
 ## [v1.4.0] - 2026-11-03
 
 ### Added

@@ -14,6 +14,37 @@ they ship on independent cadences.
 
 ### Fixed
 
+## [v1.5.0] - 2026-11-23
+
+### Added
+- `ExecutedAsyncStatement.num_modified_rows` and
+  `AsyncStatementReader.num_modified_rows` expose cached affected-row counts
+  without polling or consuming results.
+
+### Changed
+- Buffered fetches, EOF reads and closing drained result handles avoid
+  unnecessary Tokio runtime entry and GIL release/reacquisition.
+- Reuse successful async completion responses to avoid redundant status
+  requests, and avoid redundant telemetry flush tasks during event bursts.
+
+### Updated
+- Bundle the kernel's Arrow and Quinn dependency security updates.
+
+### Fixed
+- Closing sessions releases transport and OAuth resources, fixing a leak of
+  four file descriptors per closed Python session.
+- A failed OAuth token request fails session creation immediately without a
+  duplicate authentication attempt.
+- CloudFetch prefetch continues across page boundaries, preserves complete
+  ordered results and responds to cancellation. Nonblocking reads yield on
+  lock contention.
+- Fetch all pages of inline Arrow results when CloudFetch is disabled on a
+  warehouse that supports paged inline delivery.
+- Directly completed statements expose affected-row counts without consuming
+  the fetched counter row.
+- TLS certificate verification errors fail immediately with their underlying
+  cause; CloudFetch errors and debug logs omit presigned URL query strings.
+
 ## [v1.4.0] - 2026-11-03
 
 ### Added
