@@ -127,9 +127,10 @@ How this shows up in the repo:
   (`pyarrow>=14,<19`), no exact pins, no transitive constraints,
   no committed lockfile. Exact pins would impede downstream
   `pip install databricks-sql-kernel` for end-users with their
-  own pyarrow consumers. The `db-pypi` proxy's 7-day age filter
-  is the baseline supply-chain protection; `uv sync` re-resolves
-  each CI run within the major-version bounds.
+  own pyarrow consumers. Trusted jobs use `db-pypi`, whose 7-day age filter is
+  their baseline supply-chain protection. Fork jobs use the credential-free
+  public proxy; its filtering policy is separate and does not promise the same
+  7-day delay. `uv sync` re-resolves each CI run within the major-version bounds.
 - **Composite actions**: both proxy setup actions write Cargo and uv/pip
   configuration; only `setup-jfrog` performs an OIDC token exchange.
 

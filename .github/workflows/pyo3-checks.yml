@@ -25,6 +25,8 @@ on:
       - "src/**"
       - "Cargo.toml"
       - "Cargo.lock"
+      - ".github/actions/setup-jfrog/**"
+      - ".github/actions/setup-public-package-proxies/**"
       - ".github/workflows/pyo3-checks.yml"
   pull_request:
     branches: [main]
@@ -33,6 +35,8 @@ on:
       - "src/**"
       - "Cargo.toml"
       - "Cargo.lock"
+      - ".github/actions/setup-jfrog/**"
+      - ".github/actions/setup-public-package-proxies/**"
       - ".github/workflows/pyo3-checks.yml"
 
 concurrency:
@@ -169,6 +173,9 @@ jobs:
         # avoid another implicit project sync before starting pytest.
         run: uv run --no-sync pytest -v
 
+  # Keep the build sequence aligned with `build-and-test` above. This variant
+  # intentionally substitutes the credential-free package proxies and omits
+  # the azure-prod environment, its secrets, and the live-test tier.
   fork-build-and-test:
     name: "PyO3 build + test (Python ${{ matrix.python-version }})"
     if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
