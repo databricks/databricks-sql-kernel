@@ -71,3 +71,22 @@ id = "RUSTSEC-2026-0258"
 # for a reqwest/hyper release carrying the fix) before renewing.
 ignoreUntil = 2027-02-14
 reason = "h2 (RUSTSEC-2026-0258) DoS is a server-side empty-DATA-frame flood; the kernel is an HTTP client only and runs no h2 server. Transitive via reqwest/hyper, pre-existing on main, latest 0.4.x so no bump available. Re-review on expiry."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0543"
+# chrono is classified as unmaintained; this advisory does not report a
+# vulnerability. The kernel exposes chrono types in its public Rust API and
+# Arrow also depends on chrono, so removal requires a coordinated API and
+# ecosystem migration rather than a security patch.
+ignoreUntil = 2027-02-28
+reason = "chrono is marked unmaintained, not vulnerable. It is part of the kernel's public API and the Arrow dependency graph; reassess replacement with the API/Arrow migration by expiry."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0592"
+# The vulnerable path is `url::Url::origin()` on an attacker-controlled,
+# deeply nested `blob:` URL. The kernel never calls `Url::origin()` and does
+# not accept blob URLs. url 2.5.9 fixes the issue, but the required Databricks
+# package proxy does not yet carry that release. Keep this exception short and
+# replace it with `cargo update -p url --precise 2.5.9` once available.
+ignoreUntil = 2026-12-15
+reason = "The kernel never calls Url::origin() or accepts blob URLs, so RUSTSEC-2026-0592 is unreachable. Temporary until patched url 2.5.9 reaches the required Databricks package proxy."
