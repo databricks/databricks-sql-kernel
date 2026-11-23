@@ -37,7 +37,9 @@ authors = [{ name = "Databricks" }]
 #    needs Python >= 3.11, so 3.10 resolves to 25.x inside this bound.
 #    The handoff uses arrow-pyarrow's C Data Interface calls
 #    (`_import_from_c` / `__arrow_c_*`); the offline `tests/test_fetch.py`
-#    handoff tests pass with pyarrow 24.0.0, 25.0.1 and 26.0.1.
+#    handoff tests pass with pyarrow 24.0.0, 25.0.1 and 26.0.1, and
+#    `pyo3-checks.yml` runs one leg pinned to the 23.0.1 floor next to
+#    the newest-in-bound legs.
 #  * Python 3.9: pyarrow 23.x dropped 3.9 wheels, so 3.9 takes the
 #    last series that still ships them (`>=14,<19`). 3.9 never sees
 #    3.14, so the cp314 concern does not apply here.
