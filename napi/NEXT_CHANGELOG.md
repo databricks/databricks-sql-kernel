@@ -24,6 +24,10 @@ layout, or npm publishing. Pure-kernel changes go in the root
 
 ### Fixed
 
+- `AsyncStatement.close()` also releases a result stream that an in-flight
+  fetch holds, once that operation finishes; later fetches return
+  `InvalidStatementHandle`. `close()` still does not wait for it.
+
 ---
 *Note: When making changes, please add your change under the appropriate
 section with a brief description. At release time, move the entries here

@@ -405,6 +405,15 @@ impl VolumeState {
                     error = error.message(format!("{tag}: {value}"));
                 }
             }
+            for (label, header) in [("RequestId", "x-amz-request-id"), ("HostId", "x-amz-id-2")] {
+                if let Some(value) = response
+                    .headers()
+                    .get(header)
+                    .and_then(|value| value.to_str().ok())
+                {
+                    error = error.message(format!("{label}: {value}"));
+                }
+            }
             return Err(error);
         }
         while let Some(bytes) = storage_read(self.storage.read_timeout, !upload, async {
@@ -1017,6 +1026,8 @@ mod tests {
                     ResponseTemplate::new(status)
                         .insert_header("retry-after", "0")
                         .insert_header("location", "/redirected")
+                        .insert_header("x-amz-request-id", "request-1")
+                        .insert_header("x-amz-id-2", "host-1")
                         .set_body_string("<Error><Code>AccessDenied</Code><Message>Permission refused</Message><SignatureProvided>secret</SignatureProvided></Error>"),
                 )
                 .expect(requests)
@@ -1061,6 +1072,9 @@ mod tests {
                 );
                 assert_eq!(error.retryable, status == 503);
                 assert!(error.message.contains("AccessDenied"));
+                assert!(error
+                    .message
+                    .contains("RequestId: request-1; HostId: host-1"));
                 assert!(error
                     .message
                     .contains(&format!("after {requests} attempts")));
