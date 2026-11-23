@@ -21,7 +21,7 @@
 use crate::client::retry::{calculate_backoff, RequestType, RetryConfig, RetryStrategy};
 use crate::kernel_error::{Error, LocalFileError, Result};
 use arrow_array::{Array, LargeStringArray, MapArray, RecordBatch, StringArray, StringViewArray};
-use futures::{StreamExt, TryStreamExt};
+use futures::TryStreamExt;
 use reqwest::{header::HeaderMap, Client, Method};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -291,45 +291,22 @@ impl VolumeState {
             .headers(instruction.headers.clone());
         let upload_error = Arc::new(Mutex::new(None));
         let (progress, changed) = tokio::sync::watch::channel(tokio::time::Instant::now());
-        let mut upload_file = None;
-        let reader: Option<(
-            futures::stream::BoxStream<'static, std::io::Result<Bytes>>,
-            u64,
-        )> = if let Some((file, length)) = source.as_ref() {
-            let reader = Arc::new(tokio::sync::Mutex::new(Some(tokio::fs::File::from_std(
-                file.try_clone().map_err(|e| local_error(e, &local_file))?,
-            ))));
-            upload_file = Some(Arc::clone(&reader));
-            Some((
-                futures::stream::try_unfold(reader, |reader| async move {
-                    let mut bytes = Vec::with_capacity(256 * 1024);
-                    let count = {
-                        let mut file = reader.lock().await;
-                        match file.as_mut() {
-                            Some(file) => {
-                                tokio::io::AsyncReadExt::read_buf(file, &mut bytes).await?
-                            }
-                            None => 0,
-                        }
-                    };
-                    Ok::<_, std::io::Error>(if count == 0 {
-                        None
-                    } else {
-                        Some((Bytes::from(bytes), reader))
-                    })
+        let reader: Option<(Box<dyn tokio::io::AsyncRead + Unpin + Send>, u64)> =
+            if let Some((file, length)) = source.as_ref() {
+                Some((
+                    Box::new(tokio::fs::File::from_std(
+                        file.try_clone().map_err(|e| local_error(e, &local_file))?,
+                    )),
+                    *length,
+                ))
+            } else {
+                input.map(|bytes| {
+                    (
+                        Box::new(std::io::Cursor::new(bytes.clone())) as _,
+                        bytes.len() as u64,
+                    )
                 })
-                .boxed(),
-                *length,
-            ))
-        } else {
-            input.map(|bytes| {
-                (
-                    ReaderStream::with_capacity(std::io::Cursor::new(bytes.clone()), 256 * 1024)
-                        .boxed(),
-                    bytes.len() as u64,
-                )
-            })
-        };
+            };
         if let Some((reader, length)) = reader {
             request = request
                 .headers(HeaderMap::from_iter([(
@@ -352,32 +329,20 @@ impl VolumeState {
         )
         .await?;
         if matches!(response.status().as_u16(), 307 | 308) {
-            if let Some(upload_file) = upload_file {
-                let file = upload_file.lock().await.take();
-                if let Some(file) = file {
-                    // The cloned handles share a cursor; finish the first reader before rewinding.
-                    drop(file.into_std().await);
-                }
-            }
             let bytes = match (input, source) {
                 (Some(bytes), _) => Some(bytes.clone()),
-                (None, Some((mut file, _))) => {
+                (None, Some((file, length))) => {
                     let local_file = local_file.clone();
-                    Some(
+                    Some(Bytes::from(
                         tokio::task::spawn_blocking(move || {
-                            use std::io::{Read, Seek};
-                            file.rewind().map_err(|e| local_error(e, &local_file))?;
-                            let mut bytes = Vec::new();
-                            file.read_to_end(&mut bytes)
-                                .map_err(|e| local_error(e, &local_file))?;
-                            Ok::<_, Error>(Bytes::from(bytes))
+                            read_from_start(&file, length).map_err(|e| local_error(e, &local_file))
                         })
                         .await
                         .map_err(|e| {
                             Error::internal()
                                 .message(format!("Volume upload read task failed: {e}"))
                         })??,
-                    )
+                    ))
                 }
                 _ => None,
             };
@@ -468,13 +433,13 @@ impl VolumeState {
 }
 
 fn upload_body(
-    reader: impl futures::Stream<Item = std::io::Result<Bytes>> + Send + 'static,
+    reader: impl tokio::io::AsyncRead + Unpin + Send + 'static,
     path: String,
     error: Arc<Mutex<Option<Error>>>,
     progress: tokio::sync::watch::Sender<tokio::time::Instant>,
 ) -> reqwest::Body {
     reqwest::Body::wrap_stream(
-        reader
+        ReaderStream::with_capacity(reader, 256 * 1024)
             .inspect_ok(move |_| {
                 progress.send_replace(tokio::time::Instant::now());
             })
@@ -570,6 +535,34 @@ fn response_body_error(error: reqwest::Error) -> Error {
     let mut error = storage_error(error);
     error.retryable |= retryable;
     error
+}
+
+/// Reads the first `length` bytes of `file` by offset. The first request's body
+/// shares this handle's position and may still be moving it.
+fn read_from_start(file: &std::fs::File, length: u64) -> std::io::Result<Vec<u8>> {
+    let length = usize::try_from(length).map_err(|_| std::io::ErrorKind::OutOfMemory)?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(length)
+        .map_err(|_| std::io::ErrorKind::OutOfMemory)?;
+    bytes.resize(length, 0);
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::FileExt::read_exact_at(file, &mut bytes, 0)?;
+        Ok(bytes)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        let mut filled = 0;
+        while filled < bytes.len() {
+            match file.seek_read(&mut bytes[filled..], filled as u64)? {
+                0 => return Err(std::io::ErrorKind::UnexpectedEof.into()),
+                read => filled += read,
+            }
+        }
+        Ok(bytes)
+    }
 }
 
 fn local_error(error: std::io::Error, path: &str) -> Error {
@@ -820,6 +813,29 @@ mod tests {
     use wiremock::matchers::{body_bytes, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    #[test]
+    fn replay_read_ignores_the_shared_file_position() {
+        use std::io::{Seek, SeekFrom};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("source");
+        let payload = b"0123456789".to_vec();
+        std::fs::write(&path, &payload).unwrap();
+        let mut file = std::fs::File::open(&path).unwrap();
+        file.seek(SeekFrom::Start(3)).unwrap();
+        assert_eq!(
+            read_from_start(&file, payload.len() as u64).unwrap(),
+            payload
+        );
+        #[cfg(unix)]
+        assert_eq!(file.stream_position().unwrap(), 3);
+        assert_eq!(
+            read_from_start(&file, payload.len() as u64 + 1)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
+    }
+
     fn instruction(operation: &str, url: &str, local: &Path) -> RecordBatch {
         let mut headers = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
         headers.keys().append_value("x-storage-token");
@@ -888,7 +904,7 @@ mod tests {
         let os_code = cause.raw_os_error();
         let captured = Arc::new(Mutex::new(None));
         let body = upload_body(
-            ReaderStream::with_capacity(FailedRead(Some(cause)), 256 * 1024),
+            FailedRead(Some(cause)),
             source.to_str().unwrap().into(),
             Arc::clone(&captured),
             tokio::sync::watch::channel(tokio::time::Instant::now()).0,
@@ -1485,12 +1501,7 @@ mod tests {
         });
         let error = Arc::new(Mutex::new(None));
         let (progress, changed) = tokio::sync::watch::channel(tokio::time::Instant::now());
-        let body = upload_body(
-            ReaderStream::with_capacity(reader, 256 * 1024),
-            "input".into(),
-            Arc::clone(&error),
-            progress,
-        );
+        let body = upload_body(reader, "input".into(), Arc::clone(&error), progress);
         storage_send(
             Client::new()
                 .put(server.uri())
