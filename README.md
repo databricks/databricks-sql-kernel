@@ -67,4 +67,4 @@ and security vulnerabilities should be reported according to
 
 ## License
 
-Apache 2.0. See [LICENSE](LICENSE) and [NOTICE.txt](NOTICE.txt).
+Apache 2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
