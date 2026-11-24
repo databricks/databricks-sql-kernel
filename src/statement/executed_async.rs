@@ -1139,8 +1139,7 @@ impl ExecutedAsyncStatement {
         // `Ok(())`, so the retry-on-failure branch is reachable only
         // once the transport is changed to surface real errors. The
         // load-then-store-on-success shape is the forward-prep for
-        // that change — see the JIRA candidate at
-        // `sea-workflow/jira-candidates/2026-05-25-kernel-sea-close-statement-surface-errors.md`.
+        // that change.
         async {
             if self.closed.load(Ordering::Acquire) {
                 return Ok(());
