@@ -494,6 +494,8 @@ impl AsyncResultHandle {
 
     /// Runs the file transfer for a Volume PUT, GET or REMOVE result. Call before
     /// fetching; the rows stay readable afterwards.
+    /// Keep the parent AsyncStatement alive until the transfer finishes; closing or
+    /// collecting it stops the transfer.
     #[napi]
     pub async fn complete_volume_operation(
         &self,
