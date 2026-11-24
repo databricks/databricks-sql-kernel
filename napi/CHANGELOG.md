@@ -14,6 +14,34 @@ they ship on independent cadences.
 
 ### Fixed
 
+## [v1.5.0] - 2026-11-23
+
+### Changed
+- Reuse successful async completion responses to avoid redundant status
+  requests, and avoid redundant telemetry flush tasks during event bursts.
+
+### Updated
+- Bundle the kernel's Arrow and Quinn dependency security updates.
+
+### Fixed
+- `AsyncStatement.close()` releases its canceller and result streams without
+  waiting for garbage collection, allowing the shared telemetry client and
+  its settings to be released. Fetching from an `AsyncResultHandle` after
+  close returns `InvalidStatementHandle`, unless a fetch was already using
+  the stream when close ran.
+- Closing connections releases their transport and OAuth resources.
+- A failed OAuth token request fails connection creation immediately without
+  a duplicate authentication attempt.
+- CloudFetch prefetch continues across page boundaries, preserves complete
+  ordered results and responds to cancellation. Nonblocking reads yield on
+  lock contention.
+- Fetch all pages of inline Arrow results when CloudFetch is disabled on a
+  warehouse that supports paged inline delivery.
+- Directly completed statements expose affected-row counts without consuming
+  the fetched counter row.
+- TLS certificate verification errors fail immediately with their underlying
+  cause; CloudFetch errors and debug logs omit presigned URL query strings.
+
 ## [v1.4.0] - 2026-11-03
 
 ### Changed

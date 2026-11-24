@@ -16,21 +16,16 @@
 
 # Databricks SQL Kernel — v0 Spec
 
-> Snapshot of the [Common Spec for SQL Driver Kernel](https://docs.google.com/document/d/1Wmev0fFMtQYC0OxELMVuS6hmZBvvxCoSfJDMOE5vxgY)
-> as of 2026-05-04. The Google Doc is the source of truth; this file is a
-> mirror so the kernel-v0 refactor can land discrete PRs against a stable
-> reference. Update this file when the spec changes upstream. Image-only
-> figures (`![][image1]`, `![][image2]`) are referenced in the source doc
-> and not reproduced here.
+> Snapshot of the Common Spec for SQL Driver Kernel as of 2026-05-04. This
+> file is the public reference for the kernel v0 API. Image-only figures
+> (`![][image1]`, `![][image2]`) from the original design are not reproduced
+> here.
 
 # Common Spec for SQL Driver Kernel
 
 # Background
 
 As we started OSS ODBC driver development, we took the Kernel-first approach in Rust to avoid building the same driver core for different user facing drivers. We started using ADBC Spec as the Kernel interface. As now we expand the scope of Kernel to support existing OSS Drivers like PySQL, Go Driver and NodeJS driver, we are redesigning the Kernel with an independent Databricks-first spec, completely decoupled from ADBC, making better use of Databricks constructs across different drivers.
-
-More details on this re-alignment:  
-[Heilmeier: Rust Kernel Strategy for OSS SQL Drivers](https://docs.google.com/document/d/1ZcsH0RP1fnmXEw3SeOi9e8Yi2PtOhYaBLr4jwwswifY/edit?tab=t.0#heading=h.63gxvivr4xae)
 
 # Requirements 
 

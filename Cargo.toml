@@ -14,7 +14,7 @@
 
 [package]
 name = "databricks-sql-kernel"
-version = "1.4.0"
+version = "1.5.0"
 edition = "2021"
 authors = ["Databricks"]
 license = "Apache-2.0"
@@ -22,6 +22,20 @@ description = "Databricks SQL Kernel — Rust client core for Databricks SQL dri
 repository = "https://github.com/databricks/databricks-sql-kernel"
 keywords = ["databricks", "arrow", "database", "sql"]
 categories = ["database"]
+include = [
+    "/src/**",
+    "/include/**",
+    "/tests/**",
+    "/docs/spec-v0.md",
+    "/docs/release-debuginfo.md",
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/CONNECTION_PARAMETERS.md",
+    "/LICENSE",
+    "/NOTICE.txt",
+]
 
 [dependencies]
 # The `log` feature makes `tracing::*` macros also emit `log::Record`s

@@ -69,8 +69,8 @@ bindings just select the flow.
 - **Azure U2M (`AzureOAuthU2M`, `azure-oauth`): planned — not yet in v0.**
   The `AzureOAuthU2M` variant / `AuthConfig::azure_oauth_u2m(...)` constructor and
   the pyo3 `auth_type="azure-oauth"` selector are **not** shipped in this release;
-  the design (PECOBLR-4120) is tracked in
-  `docs/designs/PECOBLR-4141-azure-service-principal-design.md`. When it lands the
+  the design (PECOBLR-4120) is tracked in the
+  [Azure service-principal design](https://github.com/databricks/databricks-sql-kernel/blob/main/docs/designs/PECOBLR-4141-azure-service-principal-design.md). When it lands the
   kernel will pin the workspace **v2.0** endpoints
   (`{host}/oidc/oauth2/v2.0/{authorize,token}`, which the workspace redirects to
   Entra), the Azure app client id (`96eecda7-…`), port `8030`, and the
@@ -87,8 +87,8 @@ bindings just select the flow.
   `azure_tenant_id` (optional — auto-discovered when omitted),
   `azure_workspace_resource_id` (optional — enables the management-token add-on,
   see below), `identity_federation_client_id` (optional WIF). Construct via the
-  `AuthConfig::azure_service_principal(...)` validating constructor. See
-  `docs/designs/PECOBLR-4141-azure-service-principal-design.md`.
+  `AuthConfig::azure_service_principal(...)` validating constructor. See the
+  [Azure service-principal design](https://github.com/databricks/databricks-sql-kernel/blob/main/docs/designs/PECOBLR-4141-azure-service-principal-design.md).
 
   The generic `OAuthM2M` path (Entra `token_url_override` +
   `2ff814a6-…/.default` scope) still works and requires an explicit tenant;

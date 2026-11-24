@@ -286,11 +286,10 @@ impl SeaRestTransport {
     ///
     /// `chunk_index` is a path parameter (the SEA REST contract).
     /// `row_offset` is appended as a query parameter on the inline-
-    /// Arrow path — the SEA inline-Arrow design (go/inline-arrow-sea,
-    /// "OSS JDBC Driver" section) revives the previously deprecated
-    /// `row_offset` field for clients fetching by `chunk_index +
-    /// rowOffset` against ThriftServer's `FETCH_ABSOLUTE`-based inline
-    /// path. On the CloudFetch path (where the kernel passes
+    /// Arrow path. This revives the previously deprecated `row_offset`
+    /// field for clients fetching by `chunk_index + rowOffset` against
+    /// ThriftServer's `FETCH_ABSOLUTE`-based inline path. On the
+    /// CloudFetch path (where the kernel passes
     /// `row_offset = 0`) we omit the parameter entirely so we don't
     /// perturb the existing wire shape that today's SEA accepts.
     ///
