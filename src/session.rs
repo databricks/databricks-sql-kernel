@@ -384,11 +384,10 @@ impl Session {
         http_client.auth_header()?;
         http_client.auth_extra_headers()?;
 
-        // 3. Transport. Two-phase: SeaRestTransport needs an
-        //    Arc<dyn Transport> to build the result-reader factory,
-        //    which in turn needs to be set on the transport via
-        //    OnceLock::set. So: construct, wrap in Arc, build factory,
-        //    install factory.
+        // 3. Transport. Two-phase: the result-reader factory needs a
+        //    reference back to the transport, which owns the factory via
+        //    OnceLock::set. So: construct, wrap in Arc, build the factory
+        //    from a Weak (a strong Arc would leak the pair), install it.
         let defaults = config.defaults.clone().unwrap_or_default();
         let transport_config = TransportConfig {
             cloudfetch_enabled: config.result.cloudfetch_enabled,
@@ -401,7 +400,7 @@ impl Session {
             transport_config,
         ));
         let reader_factory = ResultReaderFactory::new(
-            sea.clone() as Arc<dyn Transport>,
+            Arc::<SeaRestTransport>::downgrade(&sea),
             http_client.clone(),
             result_to_cloudfetch_config(&config.result),
             result_to_post_process_options(&config.result),
@@ -2217,6 +2216,48 @@ mod is_open_tests {
         assert!(
             !session.is_open(),
             "after initiate_delete the session must report not-open"
+        );
+    }
+
+    /// Closing a session must free its transport. The transport owns the
+    /// HTTP client and tokio runtime handles; when a binding runs one
+    /// runtime per session (PyO3), a leaked transport keeps that
+    /// runtime's epoll/eventfd descriptors open until the process hits
+    /// its FD limit.
+    #[tokio::test]
+    async fn close_releases_transport() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/warehouses/test_wh/sessions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"session_id":"sess-release","warehouse_id":"test_wh"}"#),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/api/2.0/sql/sessions/sess-release"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let session = Session::builder()
+            .http_path(server.uri(), "/sql/1.0/warehouses/test_wh")
+            .auth(AuthConfig::Pat {
+                token: "dapi_test_token".into(),
+                identity_federation_client_id: None,
+            })
+            .open()
+            .await
+            .expect("session must open");
+        let transport = Arc::downgrade(session.inner.transport());
+
+        session.close().await.expect("session must close");
+
+        assert!(
+            transport.upgrade().is_none(),
+            "transport must be dropped once the session is closed"
         );
     }
 

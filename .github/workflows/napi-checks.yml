@@ -36,6 +36,7 @@ on:
       # Root Cargo.toml change can affect napi via its `path = ".."`
       # kernel dep, so this workflow re-runs to catch mismatches.
       - "Cargo.toml"
+      - ".github/actions/setup-public-package-proxies/**"
       - ".github/workflows/napi-checks.yml"
   pull_request:
     branches: [main]
@@ -43,6 +44,7 @@ on:
       - "napi/**"
       - "src/**"
       - "Cargo.toml"
+      - ".github/actions/setup-public-package-proxies/**"
       - ".github/workflows/napi-checks.yml"
 
 concurrency:
@@ -51,8 +53,6 @@ concurrency:
 
 permissions:
   contents: read
-# `id-token: write` is scoped to the single job that exchanges an OIDC
-# token for JFrog access.
 
 defaults:
   run:
@@ -61,12 +61,8 @@ defaults:
 jobs:
   check-and-test:
     name: "napi fmt + clippy + test"
-    # Scoped here (not workflow-wide): `id-token: write` is only needed
-    # for the OIDC token exchange in `.github/actions/setup-jfrog` that
-    # authenticates against the JFrog cargo proxy. See go/hardened-gha.
     permissions:
       contents: read
-      id-token: write
     runs-on:
       group: databricks-protected-runner-group
       labels: linux-ubuntu-latest
@@ -80,12 +76,10 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # Route cargo through the JFrog crates proxy. The protected
-      # runner group blocks direct crates.io, so without this every
-      # cargo command below fails to update the registry index. The
-      # composite writes ~/.cargo/config.toml (a source replacement),
-      # which preserves resolved versions, so `--locked` stays valid.
-      - uses: ./.github/actions/setup-jfrog
+      # Route cargo through the unauthenticated filtered proxy so fork PRs
+      # never receive an OIDC mint permission while executing
+      # contributor-controlled code.
+      - uses: ./.github/actions/setup-public-package-proxies
         with:
           cargo: "true"
 

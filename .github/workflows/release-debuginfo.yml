@@ -28,7 +28,6 @@ concurrency:
 
 permissions:
   contents: read
-  id-token: write
 
 jobs:
   # Hosted macOS runners cannot check out this private repository through the
@@ -68,7 +67,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: ./.github/actions/setup-jfrog
+      - uses: ./.github/actions/setup-public-package-proxies
         with:
           cargo: "true"
 
@@ -99,7 +98,7 @@ jobs:
           rm -f repo-source.tar.gz
           test -f Cargo.toml
 
-      - uses: ./.github/actions/setup-jfrog
+      - uses: ./.github/actions/setup-public-package-proxies
         with:
           cargo: "true"
 
@@ -120,7 +119,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: ./.github/actions/setup-jfrog
+      - uses: ./.github/actions/setup-public-package-proxies
         with:
           cargo: "true"
 

@@ -1,5 +1,9 @@
 # Databricks ADBC Driver for Rust
 
+> [!WARNING]
+> This implementation is experimental, unsupported, and not currently published
+> or distributed. Its API and behavior may change without notice.
+
 This crate implements ADBC 1.1 for Databricks. It calls the Databricks SQL
 Kernel through its native Rust API and returns Arrow 59 record batches without
 an IPC or C-ABI conversion between the driver and kernel.

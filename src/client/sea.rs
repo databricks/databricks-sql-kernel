@@ -171,7 +171,7 @@ fn timeout_query_id(params: &ExecuteParams) -> Option<String> {
 ///
 /// This client implements the `Transport` trait using REST endpoints.
 /// The `reader_factory` is set after construction via `set_reader_factory()` because
-/// `ResultReaderFactory` needs `Arc<dyn Transport>` which requires wrapping
+/// `ResultReaderFactory` needs a `Weak<dyn Transport>`, which requires wrapping
 /// `SeaRestTransport` in `Arc` first.
 pub(crate) struct SeaRestTransport {
     http_client: Arc<DatabricksHttpClient>,
@@ -208,7 +208,7 @@ impl SeaRestTransport {
     ///
     /// After construction, call `set_reader_factory()` to enable result reader creation.
     /// This two-step initialization is required because `ResultReaderFactory` needs
-    /// `Arc<dyn Transport>`, which is only available after wrapping in `Arc`.
+    /// `Weak<dyn Transport>`, which is only available after wrapping in `Arc`.
     pub fn new(
         http_client: Arc<DatabricksHttpClient>,
         host: impl Into<String>,
@@ -286,11 +286,10 @@ impl SeaRestTransport {
     ///
     /// `chunk_index` is a path parameter (the SEA REST contract).
     /// `row_offset` is appended as a query parameter on the inline-
-    /// Arrow path — the SEA inline-Arrow design (go/inline-arrow-sea,
-    /// "OSS JDBC Driver" section) revives the previously deprecated
-    /// `row_offset` field for clients fetching by `chunk_index +
-    /// rowOffset` against ThriftServer's `FETCH_ABSOLUTE`-based inline
-    /// path. On the CloudFetch path (where the kernel passes
+    /// Arrow path. This revives the previously deprecated `row_offset`
+    /// field for clients fetching by `chunk_index + rowOffset` against
+    /// ThriftServer's `FETCH_ABSOLUTE`-based inline path. On the
+    /// CloudFetch path (where the kernel passes
     /// `row_offset = 0`) we omit the parameter entirely so we don't
     /// perturb the existing wire shape that today's SEA accepts.
     ///
@@ -1910,7 +1909,7 @@ mod tests {
         ));
         let runtime_handle = tokio::runtime::Handle::current();
         let reader_factory = ResultReaderFactory::new(
-            transport.clone() as Arc<dyn Transport>,
+            Arc::<SeaRestTransport>::downgrade(&transport),
             http_client,
             CloudFetchConfig::default(),
             PostProcessOptions::default(),
