@@ -125,13 +125,6 @@ fn resolve_wait_timeout(caller_wait_secs: Option<&str>) -> (Option<String>, Opti
     }
 }
 
-/// Build the `(sql, ExecutionParams)` dispatch pair from a statement spec.
-///
-/// Pure — borrows `spec`, touches no `Session` — so the spec → wire-params
-/// mapping (row_limit, the resolved wait/on-wait pair, and **1-based**
-/// positional + named parameter binding) is unit-testable without a live
-/// session. Shared by both the sync and async dispatch paths via
-/// [`Statement::prepare_for_dispatch`].
 fn build_execute_params(
     spec: &StatementSpec,
     wait_timeout_secs: Option<&str>,
@@ -462,10 +455,7 @@ impl Statement {
         .instrument(span)
         .await;
         if let Err(error) = &mut result {
-            if !self.spec.parameter_sets.is_empty() {
-                error.retryable = false;
-                self.invalidate_prior().await;
-            }
+            self.finish_failed_batch(error).await;
             telemetry.finalize(Some(error));
         }
         result
@@ -587,10 +577,7 @@ impl Statement {
         .instrument(span)
         .await;
         if let Err(error) = &mut result {
-            if !self.spec.parameter_sets.is_empty() {
-                error.retryable = false;
-                self.invalidate_prior().await;
-            }
+            self.finish_failed_batch(error).await;
             telemetry.finalize(Some(error));
         }
         result
@@ -738,13 +725,21 @@ impl Statement {
         .instrument(span)
         .await;
         if let Err(error) = &mut result {
-            if !self.spec.parameter_sets.is_empty() {
-                error.retryable = false;
-                self.invalidate_prior().await;
-            }
+            self.finish_failed_batch(error).await;
             telemetry.finalize(Some(error));
         }
         result
+    }
+
+    async fn finish_failed_batch(&mut self, error: &mut Error) {
+        if self.spec.parameter_sets.is_empty() {
+            return;
+        }
+        error.retryable = false;
+        if error.query_id.is_none() {
+            error.query_id = self.inflight_id.lock().ok().and_then(|id| id.clone());
+        }
+        self.invalidate_prior().await;
     }
 
     fn statement_telemetry(&self, operation_type: OperationType) -> StatementTelemetry {

@@ -692,8 +692,7 @@ KernelStatusCode kernel_statement_set_sql(kernel_statement_t* stmt, const char* 
  * then clear the scalar bindings. Repeat bind + add_parameter_set for each set,
  * then use kernel_statement_execute to submit the entire batch in one request.
  * The caller selects eligible SQL; the server validates the parameter sets.
- * Scalar bindings and batch sets cannot be submitted together. Native positional
- * wire ordinals are zero-based; the bind functions below remain 1-based.
+ * Scalar bindings and batch sets cannot be submitted together.
  * kernel_statement_set_sql clears all snapshots. Execute retains them.
  * num_modified_rows reports the aggregate affected count, or -1 if unavailable. */
 KernelStatusCode kernel_statement_add_parameter_set(kernel_statement_t* stmt);

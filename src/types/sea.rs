@@ -381,7 +381,7 @@ pub struct QueryTag {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct StatementParameterSet {
+pub(crate) struct StatementParameterSet {
     pub parameters: Vec<StatementParameter>,
 }
 

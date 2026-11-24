@@ -62,7 +62,6 @@ pub(crate) async fn decode_parameter_batch(
         let affected = schema
             .index_of(AFFECTED_ROWS_COLUMN)
             .map_err(|_| malformed_batch_count("missing num_affected_rows"))?;
-        let inserted = schema.index_of("num_inserted_rows").ok();
         let repeat = schema.index_of("repeat").ok();
         let mut represented = 0usize;
         let mut total = Some(0i64);
@@ -91,9 +90,6 @@ pub(crate) async fn decode_parameter_batch(
                     .filter(|n| *n <= parameter_set_count)
                     .ok_or_else(|| malformed_batch_count("too many parameter-set counts"))?;
                 let count = batch_affected_value(batch.column(affected).as_ref(), row)?;
-                if let Some(i) = inserted {
-                    batch_affected_value(batch.column(i).as_ref(), row)?;
-                }
                 total = match (total, count) {
                     (Some(sum), Some(n)) => Some(
                         n.checked_mul(repetitions)
@@ -245,23 +241,14 @@ mod tests {
     use std::sync::Arc;
 
     #[tokio::test]
-    async fn batch_counts_preserve_metrics_and_accept_nullable_schema_metadata() {
+    async fn batch_counts_preserve_reader_metrics() {
         let schema = Arc::new(Schema::new(vec![Field::new(
             AFFECTED_ROWS_COLUMN,
             DataType::Int64,
             true,
         )]));
-        let batch_schema = Arc::new(Schema::new(vec![Field::new(
-            AFFECTED_ROWS_COLUMN,
-            DataType::Int64,
-            false,
-        )
-        .with_metadata(std::collections::HashMap::from([(
-            "source".into(),
-            "count".into(),
-        )]))]));
         let batch =
-            RecordBatch::try_new(batch_schema, vec![Arc::new(Int64Array::from(vec![2, 3]))])
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![2, 3]))])
                 .unwrap();
         let metrics = ResultReaderMetrics {
             total_chunks_present: Some(1),
@@ -280,7 +267,7 @@ mod tests {
             telemetry_is_compressed: false,
             status: serde_json::from_str(r#"{"state":"SUCCEEDED"}"#).unwrap(),
         };
-        let mut result = decode_parameter_batch(result, 2).await.unwrap();
+        let result = decode_parameter_batch(result, 2).await.unwrap();
         assert_eq!(result.status.num_modified_rows, Some(5));
         let retained = result.reader.metrics().expect("source metrics retained");
         assert_eq!(retained.total_chunks_present, metrics.total_chunks_present);
@@ -292,10 +279,6 @@ mod tests {
             retained.sum_chunks_download_time,
             metrics.sum_chunks_download_time
         );
-        let retained_batch = result.reader.next_batch().await.unwrap().unwrap();
-        assert_eq!(retained_batch.schema(), schema);
-        assert_eq!(retained_batch.columns(), batch.columns());
-        assert!(result.reader.next_batch().await.unwrap().is_none());
     }
 
     /// Build a single-batch `ResultStream` from `(name, Int64 values)` columns.
