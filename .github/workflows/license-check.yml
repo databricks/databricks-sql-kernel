@@ -94,6 +94,11 @@ jobs:
 
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
 
+      - name: Check NOTICE files are included in packages
+        run: |
+          cargo package --list --allow-dirty | grep -qx NOTICE
+          cargo package --list --allow-dirty --manifest-path adbc/Cargo.toml | grep -qx NOTICE
+
       - name: Install cargo-deny
         uses: taiki-e/install-action@41049aa56687c35e0afa74eed4f09cec4f9afabf # v2.85.2
         with:
