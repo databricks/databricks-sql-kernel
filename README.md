@@ -25,23 +25,27 @@ surface) for direct Rust use, the PyO3 (Python) and napi-rs (Node.js)
 wrappers, and a C ABI for ODBC / Go consumers. See
 [`docs/spec-v0.md`](docs/spec-v0.md) for the API spec.
 
-The separate [`adbc/`](adbc/) Cargo workspace implements ADBC 1.1 directly over this
+The separate [`adbc/`](https://github.com/databricks/databricks-sql-kernel/tree/main/adbc) Cargo workspace implements ADBC 1.1 directly over this
 native Rust API. It provides both Rust traits and an optional standard ADBC C
 entry point for driver managers and other languages; the kernel boundary does
 not use FFI.
 
 ## Status
 
-Early. Expect breaking changes.
+The native Rust API is production-ready. Its public APIs continue to evolve, so
+expect breaking changes. The custom C ABI remains under development.
+
+The Rust ADBC implementation under [`adbc/`](adbc/) is experimental,
+unsupported, and not currently published or distributed.
 
 ## Building
 
 ```bash
 cargo build
 cargo test --workspace
-make check    # workspace fmt + clippy + tests and native ABI smoke tests
 
-# ADBC is a separate Cargo workspace and is validated explicitly by make check.
+# The following commands require a full repository checkout.
+make check    # workspace fmt + clippy + tests and native ABI smoke tests
 cargo test --manifest-path adbc/Cargo.toml --features ffi
 ```
 
@@ -53,6 +57,14 @@ splitting, packaging, and binary-identity guidance.
 ## Configuration
 
 See [CONNECTION_PARAMETERS.md](CONNECTION_PARAMETERS.md) for every connection, auth, and session parameter the kernel accepts — its meaning, default value, and the config struct it lives on.
+
+## Community and support
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) to propose changes. Participation is
+governed by the [Databricks Open Source Code of Conduct](CODE_OF_CONDUCT.md),
+and security vulnerabilities should be reported according to
+[SECURITY.md](SECURITY.md). For other project questions, contact
+[eng-oss-sql-driver@databricks.com](mailto:eng-oss-sql-driver@databricks.com).
 
 ## License
 
