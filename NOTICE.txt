@@ -184,6 +184,11 @@ Apache License 2.0
 This Software contains code from the following open source projects, licensed under the apache license 2.0 (https://www.apache.org/licenses/LICENSE-2.0).
 
 
+Package: Apache Arrow ADBC
+Project URL: https://arrow.apache.org/adbc/
+Copyright: Copyright 2022 The Apache Software Foundation
+
+
 Package: arrow-array
 Project URL: https://github.com/apache/arrow-rs
 Copyright: Copyright 2016-2026 The Apache Software Foundation
