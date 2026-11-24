@@ -289,6 +289,119 @@ async fn expired_certificate_fails_once_with_certificate_cause() {
 }
 
 #[tokio::test]
+async fn storage_redirect_rejects_https_to_http_on_the_same_port() {
+    let key = KeyPair::generate().unwrap();
+    let certificate = CertificateParams::new(vec!["127.0.0.1".to_string()])
+        .unwrap()
+        .self_signed(&key)
+        .unwrap();
+    let tls = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_no_client_auth()
+    .with_single_cert(
+        vec![certificate.der().clone()],
+        PrivatePkcs8KeyDer::from(key.serialize_der()).into(),
+    )
+    .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let socket = listener.accept().await.unwrap().0;
+        let mut stream = TlsAcceptor::from(Arc::new(tls))
+            .accept(socket)
+            .await
+            .unwrap();
+        let mut request = [0; 4096];
+        assert!(stream.read(&mut request).await.unwrap() > 0);
+        stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 302 Found\r\nLocation: http://{address}/plain\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), listener.accept())
+                .await
+                .is_err()
+        );
+    });
+    let client = test_client(
+        HttpClientConfig {
+            tls: TlsConfig {
+                allow_self_signed: Some(true),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        Duration::from_secs(2),
+    );
+    let storage = client.storage_client(None);
+    let error = storage
+        .get()
+        .await
+        .unwrap()
+        .get(format!("https://{address}/object"))
+        .send()
+        .await
+        .unwrap_err();
+    assert!(error.is_redirect(), "{error}");
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn storage_idle_timeout_also_bounds_connection_setup() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (shutdown, mut stopped) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let mut sockets = Vec::new();
+        loop {
+            tokio::select! {
+                _ = &mut stopped => return sockets.len(),
+                accepted = listener.accept() => sockets.push(accepted.unwrap().0),
+            }
+        }
+    });
+    let client = test_client(
+        HttpClientConfig {
+            connect_timeout: Duration::from_secs(2),
+            read_timeout: Duration::from_millis(10),
+            ..Default::default()
+        },
+        Duration::from_secs(10),
+    );
+    for timeout in [None, Some(Duration::from_millis(100))] {
+        let storage = client.storage_client(timeout);
+        let storage = storage.get().await.unwrap();
+        let deadline = if timeout.is_some() {
+            Duration::from_millis(500)
+        } else {
+            Duration::from_secs(3)
+        };
+        let result = tokio::time::timeout(
+            deadline,
+            storage
+                .put(format!("https://{address}/object"))
+                .body("bytes")
+                .send(),
+        )
+        .await;
+        let error = result
+            .expect("storage connection timeout must finish")
+            .unwrap_err();
+        assert!(error.is_connect() && error.is_timeout(), "{error}");
+    }
+    shutdown.send(()).unwrap();
+    assert_eq!(server.await.unwrap(), 2);
+}
+
+#[tokio::test]
 async fn tls_handshake_timeout_still_retries() {
     for request_type in [RequestType::CreateSession, RequestType::ExecuteStatement] {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

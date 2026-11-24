@@ -292,12 +292,12 @@ fn duration_millis(duration: Duration) -> i64 {
 mod tests {
     use super::*;
     use crate::kernel_error::ErrorCode;
-    use crate::reader::test_utils::ErrorReader;
+    use crate::reader::test_utils::{BatchThenErrorReader, ErrorReader, MockReader};
     use crate::reader::{ResultReader, ResultReaderMetrics};
     use crate::result_stream::ResultStream;
     use crate::telemetry::models::OperationType;
     use crate::telemetry::runtime::{ConnectionTelemetry, TelemetrySessionContext};
-    use arrow_array::RecordBatch;
+    use arrow_array::{RecordBatch, RecordBatchOptions};
     use arrow_schema::Schema;
     use async_trait::async_trait;
     use std::future::Future;
@@ -405,6 +405,97 @@ mod tests {
             event.context.consumption_latency.is_some(),
             "failed consumption should still record result-consumption latency"
         );
+    }
+
+    #[tokio::test]
+    async fn volume_errors_finalize_statement_with_error_before_drop() {
+        enum Case {
+            VolumeReader,
+            Instruction,
+        }
+        for case in [Case::VolumeReader, Case::Instruction] {
+            let connection = Arc::new(CapturingConnectionTelemetry::default());
+            let telemetry = StatementTelemetry::new(
+                connection.clone(),
+                StatementType::Sql,
+                OperationType::ExecuteStatement,
+            );
+            let schema = Arc::new(Schema::empty());
+            let batch = RecordBatch::try_new_with_options(
+                schema.clone(),
+                vec![],
+                &RecordBatchOptions::new().with_row_count(Some(1)),
+            )
+            .expect("one-row batch");
+            let (reader, code, message): (Box<dyn ResultReader>, _, _) = match case {
+                Case::VolumeReader => (
+                    Box::new(BatchThenErrorReader {
+                        batch: Some(batch),
+                        schema,
+                    }),
+                    ErrorCode::Internal,
+                    "simulated read error after first batch",
+                ),
+                Case::Instruction => (
+                    Box::new(MockReader::new(vec![batch])),
+                    ErrorCode::InvalidArgument,
+                    "Missing Volume instruction column",
+                ),
+            };
+            let mut stream = ResultStream::from_reader(reader)
+                .await
+                .expect("schema succeeds");
+            stream.attach_telemetry(telemetry);
+
+            stream.attach_volume(crate::volume::VolumeState::new(
+                Default::default(),
+                Arc::new(
+                    crate::client::DatabricksHttpClient::with_default_retry(Default::default())
+                        .unwrap()
+                        .storage_client(None),
+                ),
+                Default::default(),
+            ));
+            let options = Default::default();
+            let error = stream
+                .complete_volume_operation(&options, None)
+                .await
+                .unwrap_err();
+            let cached = stream
+                .complete_volume_operation(&options, None)
+                .await
+                .unwrap_err();
+            assert_eq!(cached.code, error.code);
+            assert_eq!(cached.message, error.message);
+            assert_eq!(error.code, code);
+            assert_eq!(error.message, message);
+            let events_before_drop = connection
+                .statement_events
+                .lock()
+                .expect("events mutex")
+                .len();
+            assert_eq!(
+                events_before_drop, 1,
+                "terminal error must finalize before Drop"
+            );
+
+            drop(stream);
+
+            let events = connection.statement_events.lock().expect("events mutex");
+            assert_eq!(
+                events.len(),
+                1,
+                "terminal error should finalize once; Drop must not overwrite it with success"
+            );
+            let event = &events[0];
+            assert_eq!(event.context.statement_type, StatementType::Sql);
+            assert_eq!(event.error_code, Some(code));
+            assert_eq!(event.error_message.as_deref(), Some(message));
+            assert!(
+                event.context.consumption_latency.is_some(),
+                "failed consumption should still record result-consumption latency"
+            );
+        }
     }
 
     #[tokio::test]

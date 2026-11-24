@@ -245,12 +245,17 @@ pub struct Statement {
     /// new `execute()` / `submit()` so a canceller never targets a
     /// stale prior statement.
     inflight_id: InflightId,
+    /// Volume transfer state of the current execution, shared with any
+    /// [`StatementCanceller`]. Replaced at the start of each new execution, so
+    /// a canceller always reaches the current transfer.
+    volume: Arc<Mutex<Arc<crate::volume::VolumeState>>>,
 }
 
 impl Statement {
     /// Construct a new statement bound to `session`. Crate-private —
     /// wrappers obtain a `Statement` via `Session::statement()`.
     pub(crate) fn new(session: Arc<SessionInner>) -> Self {
+        let volume = session.new_volume_state();
         Self {
             session,
             spec: StatementSpec::new(),
@@ -258,6 +263,7 @@ impl Statement {
             last_valid: None,
             last_closed: None,
             inflight_id: Arc::new(Mutex::new(None)),
+            volume: Arc::new(Mutex::new(volume)),
         }
     }
 
@@ -282,6 +288,7 @@ impl Statement {
         StatementCanceller {
             session: Arc::clone(&self.session),
             inflight_id: Arc::clone(&self.inflight_id),
+            volume: Arc::clone(&self.volume),
         }
     }
 
@@ -409,7 +416,14 @@ impl Statement {
             self.last_valid = Some(valid.clone());
             self.last_closed = Some(Arc::clone(&closed));
 
+            let marked = result
+                .manifest
+                .as_ref()
+                .is_some_and(|m| m.is_volume_operation);
             let mut result_stream = ResultStream::from_reader(result.reader).await?;
+            if marked {
+                result_stream.attach_volume(self.volume_state());
+            }
             result_stream.attach_telemetry(telemetry_for_body.clone());
             // SEA puts no row count on the status envelope; for a DML it
             // returns the count as the result set. If the server didn't
@@ -549,6 +563,7 @@ impl Statement {
                 response.status,
                 telemetry_for_body,
                 timeout,
+                self.volume_state(),
             ))
         }
         .instrument(span)
@@ -644,7 +659,14 @@ impl Statement {
                     self.last_statement_id = Some(result.statement_id.clone());
                     self.last_valid = Some(valid.clone());
                     self.last_closed = Some(Arc::clone(&closed));
+                    let marked = result
+                        .manifest
+                        .as_ref()
+                        .is_some_and(|m| m.is_volume_operation);
                     let mut result_stream = ResultStream::from_reader(result.reader).await?;
+                    if marked {
+                        result_stream.attach_volume(self.volume_state());
+                    }
                     result_stream.attach_telemetry(telemetry_for_body.clone());
                     let mut status = result.status;
                     if status.num_modified_rows.is_none() {
@@ -685,6 +707,7 @@ impl Statement {
                         resp.status,
                         telemetry_for_body,
                         ExecutionTimeout::Default,
+                        self.volume_state(),
                     )))
                 }
             }
@@ -695,6 +718,10 @@ impl Statement {
             telemetry.finalize(Some(error));
         }
         result
+    }
+
+    fn volume_state(&self) -> Arc<crate::volume::VolumeState> {
+        Arc::clone(&self.volume.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
     fn statement_telemetry(&self, operation_type: OperationType) -> StatementTelemetry {
@@ -729,6 +756,7 @@ impl Statement {
     /// for callers that forget to call `close()` explicitly, but
     /// the explicit path is the supported one.
     pub async fn close(mut self) -> Result<()> {
+        self.volume_state().cancel();
         let span = self.session.log_span().clone();
         async {
             self.invalidate_prior().await;
@@ -759,8 +787,8 @@ impl Statement {
         build_execute_params(&self.spec, wait_timeout_secs)
     }
 
-    /// Clear the shared in-flight-id slot at the very start of a new
-    /// dispatch, before any `.await`.
+    /// Clear the shared in-flight-id slot and replace the Volume transfer
+    /// state at the very start of a new dispatch, before any `.await`.
     ///
     /// The slot still holds the *prior* execution's server statement id
     /// until this runs. A [`StatementCanceller`] retained across a
@@ -775,11 +803,18 @@ impl Statement {
     /// nothing: a canceller firing before the new id is observed is a
     /// tolerated no-op (`dispatched = false`), never a hit on the stale id.
     ///
+    /// The prior execution's Volume transfer is cancelled and a fresh state
+    /// installed in the same step, so a retained canceller reaches the new
+    /// execution's transfer, not the previous one.
+    ///
     /// Kept out of [`invalidate_prior`] deliberately — that is also called
     /// by [`Statement::close`], where the slot must survive so a detached
     /// canceller can still dispatch against the just-closed statement (its
     /// cloned session `Arc` keeps the client side alive).
     fn reset_inflight_slot(&self) {
+        let mut volume = self.volume.lock().unwrap_or_else(|e| e.into_inner());
+        volume.cancel();
+        *volume = self.session.new_volume_state();
         if let Ok(mut slot) = self.inflight_id.lock() {
             *slot = None;
         }
@@ -923,19 +958,28 @@ impl Drop for MidExecuteCancelGuard {
 /// [`Statement`]. Produced by [`Statement::canceller`].
 ///
 /// Holds only the shared session handle and the `Statement`'s shared
-/// in-flight-id slot — **not** the `Statement` itself — so a binding
-/// can fire a server-side cancel from another thread while `execute()`
-/// is blocked. The sync-execute analogue of
+/// in-flight-id slot and its Volume transfer state — **not** the `Statement`
+/// itself — so a binding can fire a server-side cancel from another thread
+/// while `execute()` is blocked. The sync-execute analogue of
 /// [`AsyncStatementCanceller`](crate::statement::executed_async::AsyncStatementCanceller).
 ///
-/// Cheap to [`Clone`] (two `Arc` bumps).
+/// Cheap to [`Clone`] (three `Arc` bumps).
 #[derive(Clone)]
 pub struct StatementCanceller {
     session: Arc<SessionInner>,
     inflight_id: InflightId,
+    volume: Arc<Mutex<Arc<crate::volume::VolumeState>>>,
 }
 
 impl StatementCanceller {
+    /// Cancel local Volume completion without waiting for a server request.
+    pub fn cancel_volume_operation(&self) {
+        self.volume
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .cancel();
+    }
+
     /// Server-side cancel of the in-flight statement via
     /// `cancel_statement(statement_id)`.
     ///
@@ -958,8 +1002,10 @@ impl StatementCanceller {
     /// Idempotent against a server already in a terminal state (the
     /// kernel's `cancel_statement` is a no-op there). Safe to call
     /// concurrently with the `execute()` it targets — the two share
-    /// only the id slot (behind a `Mutex`), no mutable statement state.
+    /// only the id slot and the Volume state (each behind a `Mutex`), no
+    /// mutable statement state.
     pub async fn cancel(&self) -> Result<bool> {
+        self.cancel_volume_operation();
         let id = self.inflight_id.lock().ok().and_then(|g| g.clone());
         async {
             // Log both outcomes at the decision point so a host debugging a

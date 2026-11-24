@@ -97,6 +97,9 @@ pub(crate) struct SessionInner {
     /// behind the trait object; future variants slot in via
     /// `TransportMode`.
     transport: Arc<dyn Transport>,
+    storage_client: Arc<crate::client::http::StorageClient>,
+    storage_retry: RetryConfig,
+    volume_cancellation: tokio_util::sync::CancellationToken,
 
     /// Server-issued session identifier.
     session_id: String,
@@ -158,6 +161,18 @@ pub(crate) struct SessionInner {
 }
 
 impl SessionInner {
+    pub(crate) fn new_volume_state(&self) -> Arc<crate::volume::VolumeState> {
+        crate::volume::VolumeState::new(
+            self.storage_retry.clone(),
+            Arc::clone(&self.storage_client),
+            self.volume_cancellation.child_token(),
+        )
+    }
+
+    fn cancel_volume_operations(&self) {
+        self.volume_cancellation.cancel();
+    }
+
     /// Crate-internal accessor for the session's transport. Used by
     /// `Metadata` (and PR 4's `Statement`) to drive RPCs without
     /// reaching into private fields.
@@ -226,6 +241,7 @@ impl SessionInner {
     /// explicit close genuinely *initiates* the delete rather than
     /// deferring it to an idle-timeout.
     pub(crate) fn initiate_delete(&self) {
+        self.cancel_volume_operations();
         if self
             .closed
             .compare_exchange(
@@ -367,11 +383,13 @@ impl Session {
         //    it for OIDC discovery / token endpoint calls.
         let http_client_config = build_http_client_config(&config, org_id);
         let retry_configs = build_retry_configs_for_session(&config);
+        let storage_retry = retry_configs[&RequestCategory::Sea].clone();
         let http_client = Arc::new(
             DatabricksHttpClient::new(http_client_config, retry_configs).map_err(|e| {
                 Error::network_error().message(format!("Failed to construct HTTP client: {e}"))
             })?,
         );
+        let storage_client = Arc::new(http_client.storage_client(config.http.storage_read_timeout));
 
         // 2. Auth provider — async because OAuth flows hit the OIDC
         //    discovery endpoint.
@@ -472,6 +490,9 @@ impl Session {
         Ok(Session {
             inner: Arc::new(SessionInner {
                 transport,
+                storage_client,
+                storage_retry,
+                volume_cancellation: tokio_util::sync::CancellationToken::new(),
                 session_id: session_info.session_id,
                 config,
                 runtime_handle,
@@ -778,6 +799,7 @@ impl Session {
     ///   race): flag stays false, [`Drop`] picks up the slack.
     /// - On `Ok`: flag flips, [`Drop`] is a no-op.
     pub async fn close(self) -> Result<()> {
+        self.inner.cancel_volume_operations();
         // Bail early if a concurrent caller already finished a
         // successful close — no point hitting the wire twice.
         if self.inner.closed.load(std::sync::atomic::Ordering::Acquire) {

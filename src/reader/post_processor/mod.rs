@@ -469,6 +469,7 @@ mod tests {
 
     fn make_manifest(columns: Vec<ColumnInfo>) -> ResultManifest {
         ResultManifest {
+            is_volume_operation: false,
             format: "ARROW_STREAM".to_string(),
             schema: ResultSchema {
                 column_count: columns.len() as i32,

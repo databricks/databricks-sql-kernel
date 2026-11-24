@@ -86,6 +86,7 @@ pub struct kernel_result_stream_canceller_t {
 /// download — close the stream (and, for a sync-executed statement, the executed
 /// handle) to release those on their own completion.
 struct ResultStreamInner {
+    volume: Option<std::sync::Arc<crate::volume::VolumeState>>,
     /// Fired by a cloned [`ResultStreamCanceller`] to interrupt an in-flight
     /// `next_batch`. Once fired the stream is permanently aborted: `next_batch`
     /// returns `Cancelled` on every subsequent call rather than re-driving a
@@ -119,6 +120,7 @@ enum ResultStreamShape {
 
 /// Detached canceller for a result stream. Holds a clone of the stream's
 /// [`CancellationToken`], so firing it interrupts an in-flight `next_batch`.
+/// It also stops a running Volume file transfer.
 ///
 /// A `CancellationToken` clone shares the same underlying atomic state, so the
 /// canceller keeps working after the stream handle is closed — closing the
@@ -127,6 +129,7 @@ enum ResultStreamShape {
 /// reference to the stream's `&mut` state, so it is safe to `cancel()` from any
 /// thread concurrently with `next_batch`/`close` on the owning thread.
 struct ResultStreamCanceller {
+    volume: Option<std::sync::Arc<crate::volume::VolumeState>>,
     cancel: CancellationToken,
 }
 
@@ -139,6 +142,7 @@ pub(crate) fn into_raw_result_stream(
     stream: crate::result_stream::ResultStream,
 ) -> *mut kernel_result_stream_t {
     Box::into_raw(Box::new(ResultStreamInner {
+        volume: stream.volume_state(),
         cancel: CancellationToken::new(),
         shape: ResultStreamShape::Owned { schema, stream },
     })) as *mut kernel_result_stream_t
@@ -156,6 +160,7 @@ pub(crate) unsafe fn into_raw_executed_stream(
     valid: ValidityFlag,
 ) -> *mut kernel_result_stream_t {
     Box::into_raw(Box::new(ResultStreamInner {
+        volume: (*exec).result_stream().volume_state(),
         cancel: CancellationToken::new(),
         shape: ResultStreamShape::Executed { exec, valid },
     })) as *mut kernel_result_stream_t
@@ -584,6 +589,7 @@ pub unsafe extern "C" fn kernel_result_stream_canceller_new(
         // is a `Sync` atomic). SAFETY: `stream` is a live box (non-null checked).
         let p = stream as *mut ResultStreamInner;
         let handle = ResultStreamCanceller {
+            volume: (*std::ptr::addr_of!((*p).volume)).clone(),
             cancel: (*std::ptr::addr_of!((*p).cancel)).clone(),
         };
         std::ptr::write(
@@ -597,8 +603,9 @@ pub unsafe extern "C" fn kernel_result_stream_canceller_new(
 /// Fire the cancellation of the result stream this canceller was created for
 /// (odbc#355-B). Purely client-side (no server RPC): it flips the shared token,
 /// which an in-flight `kernel_result_stream_next_batch` observes via its
-/// `tokio::select!` and unwinds. Idempotent, non-blocking, and safe to call
-/// concurrently with `next_batch`/`close` on the stream's owning thread.
+/// `tokio::select!` and unwinds. It also stops a running Volume file transfer.
+/// Idempotent, non-blocking, and safe to call concurrently with
+/// `next_batch`/`close` on the stream's owning thread.
 ///
 /// Always returns `Success` for a live handle. After this returns, the stream is
 /// permanently aborted: every subsequent `next_batch` returns `Cancelled`.
@@ -618,6 +625,9 @@ pub unsafe extern "C" fn kernel_result_stream_canceller_cancel(
                 "kernel_result_stream_canceller_cancel: handle must not be null",
             );
         };
+        if let Some(volume) = &handle.volume {
+            volume.cancel();
+        }
         handle.cancel.cancel();
         KernelStatusCode::Success
     })
@@ -643,6 +653,86 @@ pub unsafe extern "C" fn kernel_result_stream_canceller_free(
         }
         drop(Box::from_raw(canceller as *mut ResultStreamCanceller));
         KernelStatusCode::Success
+    })
+}
+
+/// Same flag, read from the stream. Still succeeds after the executed statement
+/// is closed.
+/// # Safety
+/// `stream` must be live and `out` must be writable.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_result_stream_is_volume_operation(
+    stream: *const kernel_result_stream_t,
+    out: *mut bool,
+) -> KernelStatusCode {
+    catch_ffi(|| {
+        if stream.is_null() || out.is_null() {
+            return store_invalid_arg("Volume marker: null pointer");
+        }
+        let p = stream as *const ResultStreamInner;
+        std::ptr::write(out, (*std::ptr::addr_of!((*p).volume)).is_some());
+        KernelStatusCode::Success
+    })
+}
+
+/// Runs the file transfer for a Volume PUT, GET or REMOVE result. Call before
+/// fetching; the rows stay readable afterwards.
+/// `allowed_paths_json`: JSON array of local directories the transfer may use.
+/// `remove_not_found_is_success`: report success when the remote file is missing.
+/// Returns NeedsInputStream for a stream upload, which this API cannot perform.
+/// `kernel_result_stream_canceller_cancel` interrupts it from another thread.
+/// # Safety
+/// `stream` must be live with exclusive fetch access, `allowed_paths_json` must
+/// be NUL-terminated UTF-8, and `out_status` must be writable.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_result_stream_complete_volume_operation(
+    stream: *mut kernel_result_stream_t,
+    allowed_paths_json: *const std::ffi::c_char,
+    remove_not_found_is_success: bool,
+    out_status: *mut crate::VolumeCompletion,
+) -> KernelStatusCode {
+    catch_ffi(|| {
+        if stream.is_null() || allowed_paths_json.is_null() || out_status.is_null() {
+            return store_invalid_arg("Volume completion: null pointer");
+        }
+        let roots = match std::ffi::CStr::from_ptr(allowed_paths_json)
+            .to_str()
+            .ok()
+            .and_then(|text| serde_json::from_str::<Vec<String>>(text).ok())
+        {
+            Some(roots) => roots,
+            None => {
+                return store_invalid_arg("Volume allowed paths must be a JSON array of strings")
+            }
+        };
+        let options = crate::VolumeOptions::new(
+            roots.into_iter().map(Into::into).collect(),
+            remove_not_found_is_success,
+        );
+        let p = stream as *mut ResultStreamInner;
+        let shape = &mut *std::ptr::addr_of_mut!((*p).shape);
+        let result = match shape {
+            ResultStreamShape::Owned { stream, .. } => {
+                block_on_ffi(|| stream.complete_volume_operation(&options, None))
+            }
+            ResultStreamShape::Executed { exec, valid } => {
+                let exec = match executed_ref(*exec, valid) {
+                    Ok(exec) => exec,
+                    Err(code) => return code,
+                };
+                block_on_ffi(|| {
+                    exec.result_stream_mut()
+                        .complete_volume_operation(&options, None)
+                })
+            }
+        };
+        match result {
+            Ok(status) => {
+                std::ptr::write(out_status, status);
+                KernelStatusCode::Success
+            }
+            Err(code) => code,
+        }
     })
 }
 
@@ -676,6 +766,76 @@ mod tests {
                 .unwrap()
         });
         into_raw_result_stream(schema, stream)
+    }
+
+    #[test]
+    fn volume_completion_observes_detached_cancel() {
+        use crate::reader::test_utils::MockReader;
+        use crate::result_stream::ResultStream;
+        use arrow_array::StringArray;
+        use std::ffi::CString;
+
+        let schema = Arc::new(Schema::new(
+            ["operation", "presignedUrl", "headers", "localFile"]
+                .map(|name| Field::new(name, DataType::Utf8, false))
+                .to_vec(),
+        ));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            ["REMOVE", "http://unused.invalid/object", "{}", ""]
+                .into_iter()
+                .map(|value| Arc::new(StringArray::from(vec![value])) as _)
+                .collect(),
+        )
+        .unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let volume = crate::volume::VolumeState::new(
+            Default::default(),
+            Arc::new(
+                crate::client::DatabricksHttpClient::with_default_retry(Default::default())
+                    .unwrap()
+                    .storage_client(None),
+            ),
+            Default::default(),
+        );
+        let stream = rt.block_on(async {
+            let mut stream =
+                ResultStream::from_reader(Box::new(MockReader::new(vec![batch.clone()])))
+                    .await
+                    .unwrap();
+            stream.attach_volume(Arc::clone(&volume));
+            into_raw_result_stream(schema.clone(), stream)
+        });
+        let mut is_volume = false;
+        assert_eq!(
+            unsafe { kernel_result_stream_is_volume_operation(stream, &mut is_volume) },
+            KernelStatusCode::Success
+        );
+        assert!(is_volume);
+        let roots = CString::new("[]").unwrap();
+        let mut status = crate::VolumeCompletion::NotVolume;
+        let mut canceller = std::ptr::null_mut();
+        assert_eq!(
+            unsafe { kernel_result_stream_canceller_new(stream, &mut canceller) },
+            KernelStatusCode::Success
+        );
+        assert_eq!(
+            unsafe { kernel_result_stream_canceller_cancel(canceller) },
+            KernelStatusCode::Success
+        );
+        assert_eq!(
+            unsafe {
+                kernel_result_stream_complete_volume_operation(
+                    stream,
+                    roots.as_ptr(),
+                    false,
+                    &mut status,
+                )
+            },
+            KernelStatusCode::Cancelled
+        );
+        unsafe { kernel_result_stream_canceller_free(canceller) };
+        unsafe { kernel_result_stream_close(stream) };
     }
 
     /// End-of-stream on an Owned stream returns `Success` with a

@@ -55,6 +55,8 @@ pub struct KernelError {
 /// "no error recorded since the last clear".
 #[derive(Default)]
 struct LastError {
+    local_os_error: i32,
+    local_path: Option<CString>,
     code: Option<crate::kernel_error::ErrorCode>,
     message: Option<CString>,
     sql_state: Option<CString>,
@@ -62,6 +64,7 @@ struct LastError {
     http_status: u16,
     retryable: bool,
     query_id: Option<CString>,
+    error_code: Option<CString>,
 }
 
 thread_local! {
@@ -130,6 +133,35 @@ pub unsafe extern "C" fn kernel_get_last_error(out: *mut KernelError) -> bool {
     })
 }
 
+/// Original local OS error number, or zero when unavailable. Does not clear the error.
+#[no_mangle]
+pub extern "C" fn kernel_get_last_error_local_os_error() -> i32 {
+    LAST_ERROR.with(|last| last.borrow().local_os_error)
+}
+
+/// The error's string code, such as VOLUME_PATH_NOT_ALLOWED, or null.
+/// Valid until the next call that clears the error.
+#[no_mangle]
+pub extern "C" fn kernel_get_last_error_code() -> *const c_char {
+    LAST_ERROR.with(|last| {
+        last.borrow()
+            .error_code
+            .as_ref()
+            .map_or(std::ptr::null(), |s| s.as_ptr())
+    })
+}
+
+/// Borrowed requested local path, or null. Valid until the next error-clearing call.
+#[no_mangle]
+pub extern "C" fn kernel_get_last_error_local_path() -> *const c_char {
+    LAST_ERROR.with(|last| {
+        last.borrow()
+            .local_path
+            .as_ref()
+            .map_or(std::ptr::null(), |s| s.as_ptr())
+    })
+}
+
 /// Crate-internal: write a typed kernel [`Error`] into the thread-local
 /// last-error buffer. Every FFI function that returns a non-`Success`
 /// status code calls this (via [`crate::c_abi::block_on_ffi`] or directly)
@@ -151,6 +183,12 @@ pub(crate) fn store_error(err: Error) {
             message.push_str(ec);
         }
         *last = LastError {
+            local_os_error: err
+                .local_error
+                .as_ref()
+                .and_then(|e| e.raw_os_error)
+                .unwrap_or(0),
+            local_path: err.local_error.as_ref().map(|e| to_cstring_lossy(&e.path)),
             code: Some(err.code),
             message: Some(to_cstring_lossy(&message)),
             sql_state: err.sql_state.as_deref().map(to_cstring_lossy),
@@ -158,6 +196,7 @@ pub(crate) fn store_error(err: Error) {
             http_status: err.http_status.unwrap_or(0),
             retryable: err.retryable,
             query_id: err.query_id.as_deref().map(to_cstring_lossy),
+            error_code: err.error_code.as_deref().map(to_cstring_lossy),
         };
     });
 }
@@ -243,12 +282,16 @@ mod tests {
     }
 
     #[test]
-    fn store_error_folds_error_code_slug_into_message() {
-        store_error(
-            Error::sql_error()
-                .message("statement gone")
-                .with_error_code("STATEMENT_NOT_FOUND"),
-        );
+    fn store_error_exposes_error_code_and_local_file_details() {
+        let mut error = Error::sql_error()
+            .message("statement gone")
+            .with_error_code("STATEMENT_NOT_FOUND");
+        error.local_error = Some(Box::new(crate::kernel_error::LocalFileError::new(
+            Some(2),
+            std::io::ErrorKind::NotFound,
+            "local-file",
+        )));
+        store_error(error);
         with_last_error(|e| {
             let e = e.expect("error present");
             let msg = unsafe { std::ffi::CStr::from_ptr(e.message) }
@@ -256,8 +299,25 @@ mod tests {
                 .unwrap();
             assert!(msg.contains("statement gone"));
             assert!(msg.contains("STATEMENT_NOT_FOUND"));
+            assert_eq!(
+                unsafe { std::ffi::CStr::from_ptr(kernel_get_last_error_code()) }
+                    .to_str()
+                    .unwrap(),
+                "STATEMENT_NOT_FOUND"
+            );
         });
+        assert_eq!(kernel_get_last_error_local_os_error(), 2);
+        assert_eq!(
+            unsafe { std::ffi::CStr::from_ptr(kernel_get_last_error_local_path()) }
+                .to_str()
+                .unwrap(),
+            "local-file"
+        );
+        with_last_error(|error| assert!(error.is_some()));
         clear_error();
+        assert!(kernel_get_last_error_code().is_null());
+        assert_eq!(kernel_get_last_error_local_os_error(), 0);
+        assert!(kernel_get_last_error_local_path().is_null());
     }
 
     #[test]
