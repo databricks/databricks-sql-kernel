@@ -32,6 +32,10 @@ on:
       - "Cargo.lock"
       - "adbc/Cargo.toml"
       - "adbc/Cargo.lock"
+      - "LICENSE"
+      - "NOTICE"
+      - "adbc/LICENSE"
+      - "adbc/NOTICE"
       - "deny.toml"
       # napi/ is a standalone workspace with its own lockfile; its
       # dependency graph is invisible to a root `cargo deny` run, so
@@ -48,6 +52,10 @@ on:
       - "Cargo.lock"
       - "adbc/Cargo.toml"
       - "adbc/Cargo.lock"
+      - "LICENSE"
+      - "NOTICE"
+      - "adbc/LICENSE"
+      - "adbc/NOTICE"
       - "deny.toml"
       - "napi/Cargo.toml"
       - "napi/Cargo.lock"
@@ -76,6 +84,9 @@ jobs:
       labels: linux-ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Check ADBC legal files match repository copies
+        run: cmp LICENSE adbc/LICENSE && cmp NOTICE adbc/NOTICE
 
       - uses: ./.github/actions/setup-public-package-proxies
         with:
