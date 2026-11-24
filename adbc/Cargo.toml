@@ -16,6 +16,7 @@ include = [
     "/examples/**",
     "/README.md",
     "/LICENSE",
+    "/NOTICE.txt",
     "/PACKAGING.md",
 ]
 # Keep disabled while this implementation is experimental. Publication requires

@@ -1,0 +1,253 @@
+Copyright (2026) Databricks, Inc.
+This Software includes software developed at Databricks (https://www.databricks.com/) and its use is subject to the included LICENSE file.
+
+
+Dependencies are grouped below by license. The full text of each license is available via the link in the section header.
+MIT License
+This Software contains code from the following open source projects, licensed under the mit license (https://opensource.org/licenses/MIT).
+
+
+Package: aes
+Project URL: https://github.com/RustCrypto/block-ciphers
+Copyright: Copyright (c) 2018-2024 The RustCrypto Project Developers; Copyright (c) 2018 Artyom Pavlov
+
+
+Package: async-trait
+Project URL: https://github.com/dtolnay/async-trait
+Copyright: Copyright async-trait Authors.
+
+
+Package: base64
+Project URL: https://github.com/marshallpierce/rust-base64
+Copyright: Copyright (c) 2025 Alice Maz, Marshall Pierce
+
+
+Package: cbc
+Project URL: https://github.com/RustCrypto/block-modes
+Copyright: Copyright (c) 2018-2022 RustCrypto Developers; Copyright (c) 2018 Artyom Pavlov
+
+
+Package: chrono
+Project URL: https://github.com/chronotope/chrono
+Copyright: Copyright (c) 2014--2026, Kang Seonghoon and contributors; Copyright (c) 2014, Kang Seonghoon
+
+
+Package: dashmap
+Project URL: https://github.com/xacrimon/dashmap
+Copyright: Copyright (c) 2025 Joel Wejdenstål
+
+
+Package: dirs
+Project URL: https://github.com/soc/dirs-rs
+Copyright: Copyright (c) 2018-2019 dirs-rs contributors
+
+
+Package: futures
+Project URL: https://github.com/rust-lang/futures-rs
+Copyright: Copyright (c) 2016 Alex Crichton; Copyright (c) 2017 The Tokio Authors
+
+
+Package: geo-traits
+Project URL: https://github.com/georust/geo
+Copyright: Copyright (c) 2017 The GeoRust Project Developers
+
+
+Package: hex
+Project URL: https://github.com/KokaKiwi/rust-hex
+Copyright: Copyright (c) 2013-2014 The Rust Project Developers; Copyright (c) 2015-2020 The rust-hex Developers
+
+
+Package: hmac
+Project URL: https://github.com/RustCrypto/MACs
+Copyright: Copyright (c) 2017 Artyom Pavlov
+
+
+Package: jsonwebtoken
+Project URL: https://github.com/Keats/jsonwebtoken
+Copyright: Copyright (c) 2015 Vincent Prouillet
+
+
+Package: log
+Project URL: https://github.com/rust-lang/log
+Copyright: Copyright (c) 2014 The Rust Project Developers
+
+
+Package: lz4_flex
+Project URL: https://github.com/pseitz/lz4_flex
+Copyright: Copyright (c) 2020 Pascal Seitz
+
+
+Package: napi
+Project URL: https://github.com/napi-rs/napi-rs
+Copyright: Copyright (c) 2020-present LongYinan
+
+
+Package: napi-derive
+Project URL: https://github.com/napi-rs/napi-rs
+Copyright: Copyright (c) 2020-present LongYinan
+
+
+Package: oauth2
+Project URL: https://github.com/ramosbugs/oauth2-rs
+Copyright: Copyright (c) 2014 Alex Crichton
+
+
+Package: once_cell
+Project URL: https://github.com/matklad/once_cell
+Copyright: Copyright once_cell Authors.
+
+
+Package: open
+Project URL: https://github.com/Byron/open-rs
+Copyright: Copyright © 2015 Sebastian Thiel
+
+
+Package: pbkdf2
+Project URL: https://github.com/RustCrypto/password-hashes
+Copyright: Copyright (c) 2017 Artyom Pavlov; Copyright (c) 2018-2023 The RustCrypto Project Developers
+
+
+Package: pkcs8
+Project URL: https://github.com/RustCrypto/formats/tree/master/pkcs8
+Copyright: Copyright (c) 2020-2023 The RustCrypto Project Developers
+
+
+Package: pyo3
+Project URL: https://github.com/pyo3/pyo3
+Copyright: Copyright (c) 2023-present PyO3 Project and Contributors
+
+
+Package: pyo3-log
+Project URL: https://github.com/vorner/pyo3-log
+Copyright: Copyright pyo3-log Authors.
+
+
+Package: rand
+Project URL: https://github.com/rust-random/rand
+Copyright: Copyright 2018 Developers of the Rand project; Copyright (c) 2014 The Rust Project Developers
+
+
+Package: reqwest
+Project URL: https://github.com/seanmonstar/reqwest
+Copyright: Copyright (c) 2016-2026 Sean McArthur
+
+
+Package: serde
+Project URL: https://github.com/serde-rs/serde
+Copyright: Copyright serde Authors.
+
+
+Package: serde_json
+Project URL: https://github.com/serde-rs/json
+Copyright: Copyright serde_json Authors.
+
+
+Package: thiserror
+Project URL: https://github.com/dtolnay/thiserror
+Copyright: Copyright thiserror Authors.
+
+
+Package: tokio
+Project URL: https://github.com/tokio-rs/tokio
+Copyright: Copyright (c) Tokio Contributors
+
+
+Package: tokio-util
+Project URL: https://github.com/tokio-rs/tokio
+Copyright: Copyright (c) Tokio Contributors
+
+
+Package: tracing
+Project URL: https://github.com/tokio-rs/tracing
+Copyright: Copyright (c) 2019 Tokio Contributors
+
+
+Package: tracing-subscriber
+Project URL: https://github.com/tokio-rs/tracing
+Copyright: Copyright (c) 2019 Tokio Contributors
+
+
+Package: wkb
+Project URL: https://github.com/georust/wkb
+Copyright: Copyright (c) 2024 The GeoRust Project Developers
+
+
+Package: wkt
+Project URL: https://github.com/georust/wkt
+Copyright: Copyright (c) 2017 The GeoRust Project Developers
+
+
+Package: zeroize
+Project URL: https://github.com/RustCrypto/utils
+Copyright: Copyright (c) 2018-2026 The RustCrypto Project Developers
+Apache License 2.0
+This Software contains code from the following open source projects, licensed under the apache license 2.0 (https://www.apache.org/licenses/LICENSE-2.0).
+
+
+Package: Apache Arrow ADBC
+Project URL: https://arrow.apache.org/adbc/
+Copyright: Copyright 2022 The Apache Software Foundation
+
+
+Package: arrow-array
+Project URL: https://github.com/apache/arrow-rs
+Copyright: Copyright 2016-2026 The Apache Software Foundation
+
+
+Package: arrow-buffer
+Project URL: https://github.com/apache/arrow-rs
+Copyright: Copyright 2016-2026 The Apache Software Foundation
+
+
+Package: arrow-cast
+Project URL: https://github.com/apache/arrow-rs
+Copyright: Copyright 2016-2026 The Apache Software Foundation
+
+
+Package: arrow-ipc
+Project URL: https://github.com/apache/arrow-rs
+Copyright: Copyright 2016-2026 The Apache Software Foundation
+
+
+Package: arrow-ord
+Project URL: https://github.com/apache/arrow-rs
+Copyright: Copyright 2016-2026 The Apache Software Foundation
+
+
+Package: arrow-pyarrow
+Project URL: https://github.com/apache/arrow-rs
+Copyright: Copyright 2016-2026 The Apache Software Foundation
+
+
+Package: arrow-schema
+Project URL: https://github.com/apache/arrow-rs
+Copyright: Copyright 2016-2026 The Apache Software Foundation
+
+
+Package: arrow-select
+Project URL: https://github.com/apache/arrow-rs
+Copyright: Copyright 2016-2026 The Apache Software Foundation
+
+
+Package: moka
+Project URL: https://github.com/moka-rs/moka
+Copyright: Copyright (c) 2020 - 2026 Tatsuya Kawano
+
+
+Package: pyarrow
+Project URL: https://github.com/apache/arrow
+Copyright: Copyright 2016-2026 The Apache Software Foundation
+ISC License
+This Software contains code from the following open source projects, licensed under the isc license (https://opensource.org/licenses/ISC).
+
+
+Package: rustls-webpki
+Project URL: https://github.com/rustls/webpki
+Copyright: Copyright 2015 Brian Smith
+CDLA-Permissive-2.0
+This Software contains code from the following open source projects, licensed under the cdla-permissive-2.0 (https://cdla.dev/permissive-2-0/).
+
+
+Package: webpki-roots
+Project URL: https://github.com/rustls/webpki-roots
+Copyright: Copyright webpki-roots Authors.
