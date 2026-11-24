@@ -18,7 +18,8 @@ include = [
     "/LICENSE",
     "/PACKAGING.md",
 ]
-# Remove only after the public kernel crate and release process are available.
+# Keep disabled while this implementation is experimental. Publication requires
+# a separate product, support, security, and release-readiness decision.
 publish = false
 
 [dependencies]

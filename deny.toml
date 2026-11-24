@@ -49,6 +49,17 @@ ignore = [
     # here. Pre-existing on `main` (fires against the shared reqwest stack,
     # not this PR). Re-evaluate when the reqwest/hyper stack picks up the fix.
     "RUSTSEC-2026-0258",
+    # RUSTSEC-2026-0543 marks chrono as unmaintained; it does not describe a
+    # vulnerability. chrono is part of the public API and is also required by
+    # Arrow, so replacing it is an API and ecosystem migration rather than a
+    # security patch. Re-evaluate by 2027-02-28 or when Arrow migrates.
+    "RUSTSEC-2026-0543",
+    # RUSTSEC-2026-0592 is a stack overflow in `url::Url::origin()` for deeply
+    # nested `blob:` URLs. The kernel never calls `Url::origin()` and does not
+    # accept blob URLs. url 2.5.9 contains the fix, but it is not yet available
+    # from the required Databricks package proxy. This temporary exception must
+    # be replaced with a lockfile update as soon as 2.5.9 is available.
+    "RUSTSEC-2026-0592",
 ]
 
 [licenses]

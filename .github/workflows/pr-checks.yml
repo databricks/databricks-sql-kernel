@@ -49,10 +49,6 @@ concurrency:
 
 permissions:
   contents: read
-  # Required for the OIDC token exchange that the
-  # `.github/actions/setup-jfrog` composite uses to authenticate
-  # against the JFrog cargo proxy. See go/hardened-gha.
-  id-token: write
 
 defaults:
   run:
@@ -88,7 +84,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: ./.github/actions/setup-jfrog
+      - uses: ./.github/actions/setup-public-package-proxies
         with:
           cargo: "true"
 
@@ -114,7 +110,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: ./.github/actions/setup-jfrog
+      - uses: ./.github/actions/setup-public-package-proxies
         with:
           cargo: "true"
 
@@ -143,7 +139,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: ./.github/actions/setup-jfrog
+      - uses: ./.github/actions/setup-public-package-proxies
         with:
           cargo: "true"
 
@@ -172,7 +168,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: ./.github/actions/setup-jfrog
+      - uses: ./.github/actions/setup-public-package-proxies
         with:
           cargo: "true"
 
@@ -211,7 +207,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: ./.github/actions/setup-jfrog
+      - uses: ./.github/actions/setup-public-package-proxies
         with:
           cargo: "true"
 

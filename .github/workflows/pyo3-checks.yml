@@ -25,6 +25,8 @@ on:
       - "src/**"
       - "Cargo.toml"
       - "Cargo.lock"
+      - ".github/actions/setup-jfrog/**"
+      - ".github/actions/setup-public-package-proxies/**"
       - ".github/workflows/pyo3-checks.yml"
   pull_request:
     branches: [main]
@@ -33,6 +35,8 @@ on:
       - "src/**"
       - "Cargo.toml"
       - "Cargo.lock"
+      - ".github/actions/setup-jfrog/**"
+      - ".github/actions/setup-public-package-proxies/**"
       - ".github/workflows/pyo3-checks.yml"
 
 concurrency:
@@ -41,10 +45,6 @@ concurrency:
 
 permissions:
   contents: read
-  # Required for the OIDC token exchange that the
-  # `.github/actions/setup-jfrog` composite uses to authenticate
-  # against the JFrog cargo + pip proxies. See go/hardened-gha.
-  id-token: write
 
 defaults:
   run:
@@ -56,15 +56,16 @@ jobs:
     # legs so existing required-check rules keep matching; only the
     # floor leg gets a suffix.
     name: "PyO3 build + test (Python ${{ matrix.python-version }}${{ matrix.pyarrow != 'latest' && format(', pyarrow {0}', matrix.pyarrow) || '' }})"
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    permissions:
+      contents: read
+      id-token: write
     runs-on:
       group: databricks-protected-runner-group
       labels: linux-ubuntu-latest
-    # `azure-prod` holds the Databricks secrets used by the live
-    # pytest suite below. Fork PRs are paused at "Waiting / approval
-    # required" until a maintainer clicks through, preventing secret
-    # exfil. PRs from forks that don't get approval still run the
-    # cargo-test step (no secrets needed) but the pytest step skips
-    # the `@live`-marked tests automatically when env vars are unset.
+    # `azure-prod` holds the Databricks secrets used by the live pytest suite.
+    # This job only runs for trusted pushes and same-repository PRs; fork PRs
+    # run the credential-free `fork-build-and-test` job instead.
     environment: azure-prod
     env:
       DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
@@ -185,9 +186,77 @@ jobs:
         # `@live`; they auto-skip when DATABRICKS_HOST/HTTP_PATH/
         # TOKEN are unset. With the env: block above the live tier
         # runs against the configured warehouse on PRs from this
-        # repo; on fork PRs without approval, the no-network tier
-        # (test_module.py + test_auth.py) runs and the live tier
-        # skips cleanly.
+        # repo. The separate `fork-build-and-test` job runs the
+        # no-network tier without these secrets.
         # The extension and dependencies are already installed above;
         # avoid another implicit project sync before starting pytest.
+        run: uv run --no-sync pytest -v
+
+  # Keep the build sequence aligned with `build-and-test` above. This variant
+  # intentionally substitutes the credential-free package proxies and omits
+  # the azure-prod environment, its secrets, and the live-test tier.
+  fork-build-and-test:
+    name: "PyO3 build + test (Python ${{ matrix.python-version }}${{ matrix.pyarrow != 'latest' && format(', pyarrow {0}', matrix.pyarrow) || '' }})"
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
+    permissions:
+      contents: read
+    runs-on:
+      group: databricks-protected-runner-group
+      labels: linux-ubuntu-latest
+    env:
+      RUST_LOG: databricks_sql_kernel=info
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13", "3.14"]
+        # Same floor leg as `build-and-test`; see the comment there.
+        pyarrow: ["latest"]
+        include:
+          - python-version: "3.12"
+            pyarrow: "23.0.1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: ./.github/actions/setup-public-package-proxies
+        with:
+          cargo: "true"
+          uv: "true"
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          cache-workspaces: "pyo3 -> target"
+          cache-key: "fork-py${{ matrix.python-version }}"
+
+      - name: Setup sccache
+        uses: Mozilla-Actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.11.14"
+
+      - name: Install dev dependencies
+        working-directory: pyo3
+        run: uv sync --group dev --no-install-project
+
+      - name: Pin pyarrow to the declared floor
+        if: matrix.pyarrow != 'latest'
+        working-directory: pyo3
+        run: uv pip install "pyarrow==${{ matrix.pyarrow }}"
+
+      - name: Cargo unit tests
+        working-directory: pyo3
+        run: cargo test
+
+      - name: Build and install wheel
+        working-directory: pyo3
+        run: uv run --no-sync maturin develop
+
+      - name: Run no-network tests
+        working-directory: pyo3
         run: uv run --no-sync pytest -v
