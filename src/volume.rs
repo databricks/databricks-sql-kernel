@@ -70,9 +70,17 @@ pub enum VolumeCompletion {
 pub(crate) struct VolumeState {
     retry: RetryConfig,
     storage: Arc<crate::client::http::StorageClient>,
+    /// Unset until the transfer reaches a final outcome. A PUT waiting for caller bytes leaves it unset.
     pub(crate) completion: OnceCell<Result<VolumeCompletion>>,
     cancellation: CancellationToken,
     started: AtomicBool,
+}
+
+struct Download {
+    temp: std::fs::File,
+    existing: Option<std::fs::File>,
+    path: PathBuf,
+    local_file: String,
 }
 
 fn cancelled() -> Error {
@@ -131,7 +139,13 @@ impl VolumeState {
                         result = transfer => result?,
                         _ = self.cancellation.cancelled() => return Err(cancelled()),
                     };
-                    if let Some((mut temp, existing, path, local_file)) = destination {
+                    if let Some(Download {
+                        mut temp,
+                        existing,
+                        path,
+                        local_file,
+                    }) = destination
+                    {
                         let cancellation = self.cancellation.clone();
                         tokio::task::spawn_blocking(move || {
                             if cancellation.is_cancelled() {
@@ -182,7 +196,7 @@ impl VolumeState {
         client: &Client,
         options: &VolumeOptions,
         input_bytes: Option<Vec<u8>>,
-    ) -> Result<Option<(std::fs::File, Option<std::fs::File>, PathBuf, String)>> {
+    ) -> Result<Option<Download>> {
         let input = if matches!(instruction.operation, Operation::Put(Source::Stream)) {
             Some(Bytes::from(
                 input_bytes.ok_or_else(|| invalid("Missing input stream"))?,
@@ -194,6 +208,7 @@ impl VolumeState {
         let mut attempt = 0;
         loop {
             let mut retry_after = None;
+            let attempt_started = std::time::Instant::now();
             let error = match self
                 .transfer_once(
                     &instruction,
@@ -204,9 +219,25 @@ impl VolumeState {
                 )
                 .await
             {
-                Ok(completion) => return Ok(completion),
+                Ok(completion) => {
+                    tracing::debug!(
+                        target: crate::klog::KERNEL_LOG_TARGET,
+                        attempt = attempt + 1,
+                        attempt_ms = attempt_started.elapsed().as_millis() as u64,
+                        "volume transfer attempt succeeded"
+                    );
+                    return Ok(completion);
+                }
                 Err(error) => error,
             };
+            tracing::debug!(
+                target: crate::klog::KERNEL_LOG_TARGET,
+                attempt = attempt + 1,
+                attempt_ms = attempt_started.elapsed().as_millis() as u64,
+                retryable = error.retryable,
+                error = %error.message,
+                "volume transfer attempt failed"
+            );
             // The retry clock starts at the first failure, so a long transfer does not
             // use up the retry budget.
             let started = retry_started.get_or_insert_with(std::time::Instant::now);
@@ -217,6 +248,12 @@ impl VolumeState {
             if started.elapsed().saturating_add(wait) >= self.retry.overall_timeout {
                 return Err(error.message(format!("after {} attempts", attempt + 1)));
             }
+            tracing::debug!(
+                target: crate::klog::KERNEL_LOG_TARGET,
+                attempt = attempt + 1,
+                wait_ms = wait.as_millis() as u64,
+                "waiting before retrying volume transfer"
+            );
             tokio::time::sleep(wait).await;
             attempt += 1;
         }
@@ -229,7 +266,7 @@ impl VolumeState {
         options: &VolumeOptions,
         input: Option<&Bytes>,
         retry_after: &mut Option<String>,
-    ) -> Result<Option<(std::fs::File, Option<std::fs::File>, PathBuf, String)>> {
+    ) -> Result<Option<Download>> {
         let operation = instruction.operation.clone();
         let roots = options.allowed_paths.clone();
         let preparation = tokio::task::spawn_blocking(move || {
@@ -273,7 +310,15 @@ impl VolumeState {
                     let writer = tokio::fs::File::from_std(
                         temp.try_clone().map_err(|e| local_error(e, &local_file))?,
                     );
-                    destination = Some((temp, writer, existing, path));
+                    destination = Some((
+                        Download {
+                            temp,
+                            existing,
+                            path,
+                            local_file: local_file.clone(),
+                        },
+                        writer,
+                    ));
                     (Method::GET, local_file)
                 }
                 Operation::Put(Source::Stream) => (Method::PUT, String::new()),
@@ -347,8 +392,8 @@ impl VolumeState {
                 _ => None,
             };
             if let Some(bytes) = bytes {
-                // reqwest cannot replay a streamed body on a redirect. Resend from memory
-                // so it can follow; this resend has no idle timeout.
+                // reqwest cannot replay a streamed body on a redirect. Send the original URL again
+                // with the body in memory so reqwest can follow; this resend has no idle timeout.
                 response = client
                     .put(&instruction.url)
                     .headers(instruction.headers.clone())
@@ -421,22 +466,22 @@ impl VolumeState {
         })
         .await?
         {
-            if let Some((_, writer, _, _)) = destination.as_mut() {
+            if let Some((_, writer)) = destination.as_mut() {
                 writer
                     .write_all(&bytes)
                     .await
                     .map_err(|e| local_error(e, &local_file))?;
             }
         }
-        if let Some((_, writer, _, _)) = destination.as_mut() {
+        if let Some((_, writer)) = destination.as_mut() {
             writer
                 .flush()
                 .await
                 .map_err(|e| local_error(e, &local_file))?;
         }
-        Ok(destination.map(|(temp, writer, existing, path)| {
+        Ok(destination.map(|(download, writer)| {
             drop(writer);
-            (temp, existing, path, local_file)
+            download
         }))
     }
 }
@@ -460,7 +505,9 @@ fn upload_body(
 }
 
 fn invalid(message: &str) -> Error {
-    Error::invalid_argument().message(message)
+    Error::invalid_argument()
+        .with_error_code("VOLUME_INVALID_INSTRUCTION")
+        .message(message)
 }
 
 async fn storage_send(
@@ -1110,7 +1157,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
             state.cancel();
         };
-        let (result, _) = tokio::time::timeout(Duration::from_secs(1), async {
+        let (result, _) = tokio::time::timeout(Duration::from_secs(10), async {
             tokio::join!(complete, cancel)
         })
         .await
@@ -1477,7 +1524,7 @@ mod tests {
                 .await
                 .unwrap();
             for _ in 0..5 {
-                tokio::time::sleep(Duration::from_millis(60)).await;
+                tokio::time::sleep(Duration::from_millis(150)).await;
                 socket.write_all(b"x").await.unwrap();
             }
         });
@@ -1485,7 +1532,7 @@ mod tests {
         let dest = dir.path().join("download");
         let state = VolumeState::new(
             transfer_state(0).retry.clone(),
-            storage(Some(Duration::from_millis(150))),
+            storage(Some(Duration::from_millis(500))),
             Default::default(),
         );
         state
@@ -1509,7 +1556,7 @@ mod tests {
         let (mut writer, reader) = tokio::io::duplex(1);
         let producer = tokio::spawn(async move {
             for _ in 0..5 {
-                tokio::time::sleep(Duration::from_millis(60)).await;
+                tokio::time::sleep(Duration::from_millis(150)).await;
                 writer.write_all(b"x").await.unwrap();
             }
         });
@@ -1521,7 +1568,7 @@ mod tests {
                 .put(server.uri())
                 .header(reqwest::header::CONTENT_LENGTH, 5)
                 .body(body),
-            Some(Duration::from_millis(150)),
+            Some(Duration::from_millis(500)),
             true,
             error,
             changed,

@@ -421,7 +421,9 @@ impl Statement {
                 .as_ref()
                 .is_some_and(|m| m.is_volume_operation);
             let mut result_stream = ResultStream::from_reader(result.reader).await?;
-            result_stream.attach_volume(marked, self.volume_state());
+            if marked {
+                result_stream.attach_volume(self.volume_state());
+            }
             result_stream.attach_telemetry(telemetry_for_body.clone());
             // SEA puts no row count on the status envelope; for a DML it
             // returns the count as the result set. If the server didn't
@@ -662,7 +664,9 @@ impl Statement {
                         .as_ref()
                         .is_some_and(|m| m.is_volume_operation);
                     let mut result_stream = ResultStream::from_reader(result.reader).await?;
-                    result_stream.attach_volume(marked, self.volume_state());
+                    if marked {
+                        result_stream.attach_volume(self.volume_state());
+                    }
                     result_stream.attach_telemetry(telemetry_for_body.clone());
                     let mut status = result.status;
                     if status.num_modified_rows.is_none() {

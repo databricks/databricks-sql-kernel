@@ -447,18 +447,15 @@ mod tests {
                 .expect("schema succeeds");
             stream.attach_telemetry(telemetry);
 
-            stream.attach_volume(
-                true,
-                crate::volume::VolumeState::new(
-                    Default::default(),
-                    Arc::new(
-                        crate::client::DatabricksHttpClient::with_default_retry(Default::default())
-                            .unwrap()
-                            .storage_client(None),
-                    ),
-                    Default::default(),
+            stream.attach_volume(crate::volume::VolumeState::new(
+                Default::default(),
+                Arc::new(
+                    crate::client::DatabricksHttpClient::with_default_retry(Default::default())
+                        .unwrap()
+                        .storage_client(None),
                 ),
-            );
+                Default::default(),
+            ));
             let options = Default::default();
             let error = stream
                 .complete_volume_operation(&options, None)

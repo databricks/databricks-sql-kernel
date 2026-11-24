@@ -803,7 +803,7 @@ mod tests {
                 ResultStream::from_reader(Box::new(MockReader::new(vec![batch.clone()])))
                     .await
                     .unwrap();
-            stream.attach_volume(true, Arc::clone(&volume));
+            stream.attach_volume(Arc::clone(&volume));
             into_raw_result_stream(schema.clone(), stream)
         });
         let mut is_volume = false;

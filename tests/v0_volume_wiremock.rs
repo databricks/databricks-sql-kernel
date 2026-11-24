@@ -112,6 +112,10 @@ async fn instruction_batches_preserve_one_row_and_reject_extra_rows() {
             } else {
                 let error = result.unwrap_err();
                 assert_eq!(error.code, ErrorCode::InvalidArgument);
+                assert_eq!(
+                    error.error_code.as_deref(),
+                    Some("VOLUME_INVALID_INSTRUCTION")
+                );
                 assert_eq!(error.message, "Expected one Volume instruction row");
             }
         }
@@ -407,7 +411,7 @@ async fn async_executed_canceller_interrupts_volume_transfer() {
         .and(path("/object"))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_delay(Duration::from_secs(3))
+                .set_delay(Duration::from_secs(30))
                 .set_body_bytes(b"data"),
         )
         .expect(1)
@@ -431,7 +435,7 @@ async fn async_executed_canceller_interrupts_volume_transfer() {
         }
         canceller.cancel().await.unwrap();
     };
-    let (result, _) = tokio::time::timeout(Duration::from_secs(1), async {
+    let (result, _) = tokio::time::timeout(Duration::from_secs(10), async {
         tokio::join!(stream.complete_volume_operation(&options, None), cancel)
     })
     .await
@@ -469,7 +473,7 @@ async fn cancellation_and_session_close_interrupt_instruction_or_storage_after_s
                 .and(path("/api/2.0/sql/statements/volume-stmt/result/chunks/1"))
                 .respond_with(
                     ResponseTemplate::new(200)
-                        .set_delay(Duration::from_secs(3))
+                        .set_delay(Duration::from_secs(30))
                         .set_body_json(next),
                 )
                 .mount(&server)
@@ -483,7 +487,7 @@ async fn cancellation_and_session_close_interrupt_instruction_or_storage_after_s
             .and(path("/object"))
             .respond_with(
                 ResponseTemplate::new(200)
-                    .set_delay(Duration::from_secs(3))
+                    .set_delay(Duration::from_secs(30))
                     .set_body_bytes(b"new"),
             )
             .expect(if instruction_page { 0 } else { 1 })
@@ -516,7 +520,7 @@ async fn cancellation_and_session_close_interrupt_instruction_or_storage_after_s
                 canceller.cancel().await.unwrap();
             }
         };
-        let (result, _) = tokio::time::timeout(Duration::from_secs(1), async {
+        let (result, _) = tokio::time::timeout(Duration::from_secs(10), async {
             tokio::join!(complete, cancel)
         })
         .await

@@ -641,10 +641,8 @@ impl ResultStream {
         Ok(stream)
     }
 
-    pub(crate) fn attach_volume(&mut self, marked: bool, state: Arc<crate::volume::VolumeState>) {
-        if marked {
-            self.volume = Some(state);
-        }
+    pub(crate) fn attach_volume(&mut self, state: Arc<crate::volume::VolumeState>) {
+        self.volume = Some(state);
     }
 
     /// True when the server marked this result as a Volume PUT, GET or REMOVE.
@@ -682,7 +680,9 @@ impl ResultStream {
                 async {
                     let batch = loop {
                         let batch = self.peek_first_batch().await?.ok_or_else(|| {
-                            Error::invalid_argument().message("Missing Volume instruction row")
+                            Error::invalid_argument()
+                                .with_error_code("VOLUME_INVALID_INSTRUCTION")
+                                .message("Missing Volume instruction row")
                         })?;
                         let ResultBatch::Arrow(batch) = batch;
                         if batch.num_rows() != 0 {
@@ -706,6 +706,7 @@ impl ResultStream {
                             Ok(Some(batch)) if batch.num_rows() != 0 => {
                                 self.prefetched.push_back(Ok(ResultBatch::Arrow(batch)));
                                 return Err(Error::invalid_argument()
+                                    .with_error_code("VOLUME_INVALID_INSTRUCTION")
                                     .message("Expected one Volume instruction row"));
                             }
                             Ok(Some(_)) => {}
