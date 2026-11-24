@@ -267,68 +267,8 @@ impl VolumeState {
         input: Option<&Bytes>,
         retry_after: &mut Option<String>,
     ) -> Result<Option<Download>> {
-        let operation = instruction.operation.clone();
-        let roots = options.allowed_paths.clone();
-        let preparation = tokio::task::spawn_blocking(move || {
-            let mut source = None;
-            let mut destination = None;
-            let (method, local_file) = match operation {
-                Operation::Put(Source::File(path)) => {
-                    let local_file = path.to_string_lossy().into_owned();
-                    let path = allowed_path(&local_file, &roots)?;
-                    let mut file =
-                        std::fs::File::open(path).map_err(|e| local_error(e, &local_file))?;
-                    let metadata = file.metadata().map_err(|e| local_error(e, &local_file))?;
-                    if metadata.is_dir() {
-                        // A directory opens without error on Unix; reading it produces the OS error to report.
-                        let error = std::io::Read::read(&mut file, &mut [0])
-                            .err()
-                            .unwrap_or_else(|| std::io::ErrorKind::IsADirectory.into());
-                        return Err(local_error(error, &local_file));
-                    }
-                    source = Some((file, metadata.len()));
-                    (Method::PUT, local_file)
-                }
-                Operation::Get(path) => {
-                    let local_file = path.to_string_lossy().into_owned();
-                    let path = allowed_path(&local_file, &roots)?;
-                    let existing = match std::fs::OpenOptions::new().write(true).open(&path) {
-                        Ok(file) => Some(file),
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-                        Err(error) => return Err(local_error(error, &local_file)),
-                    };
-                    let parent = path
-                        .parent()
-                        .ok_or_else(|| invalid("Missing destination parent"))?;
-                    let temp = match tempfile::tempfile_in(parent) {
-                        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-                            tempfile::tempfile()
-                        }
-                        other => other,
-                    }
-                    .map_err(|e| local_error(e, &local_file))?;
-                    let writer = tokio::fs::File::from_std(
-                        temp.try_clone().map_err(|e| local_error(e, &local_file))?,
-                    );
-                    destination = Some((
-                        Download {
-                            temp,
-                            existing,
-                            path,
-                            local_file: local_file.clone(),
-                        },
-                        writer,
-                    ));
-                    (Method::GET, local_file)
-                }
-                Operation::Put(Source::Stream) => (Method::PUT, String::new()),
-                Operation::Remove => (Method::DELETE, String::new()),
-            };
-            Ok((method, local_file, source, destination))
-        });
-        let (method, local_file, source, mut destination) = preparation.await.map_err(|e| {
-            Error::internal().message(format!("Volume file preparation task failed: {e}"))
-        })??;
+        let (method, local_file, source, mut destination) =
+            Self::prepare_local(instruction, options).await?;
         let upload = method == Method::PUT;
         let remove = method == Method::DELETE;
         let mut request = client
@@ -411,56 +351,156 @@ impl VolumeState {
         if !(status.is_success()
             || (remove && status.as_u16() == 404 && options.remove_not_found_is_success))
         {
-            *retry_after = response
-                .headers()
-                .get(reqwest::header::RETRY_AFTER)
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_owned);
-            let mut error = Error::from_http_status(status.as_u16())
-                .with_error_code("VOLUME_STORAGE_HTTP_ERROR")
-                .with_retryable(
-                    RetryStrategy::for_request(RequestType::CloudFetchDownload, &self.retry)
-                        .is_retryable_status(status, retry_after.is_some()),
-                )
-                .message(format!(
-                    "Volume storage request failed: HTTP {}",
-                    status.as_u16()
-                ));
-            let mut body = Vec::new();
-            while body.len() < 4096 {
-                match storage_read(self.storage.read_timeout, !upload, async {
-                    response.chunk().await.map_err(response_body_error)
-                })
-                .await
-                {
-                    Ok(Some(chunk)) => {
-                        body.extend_from_slice(&chunk[..chunk.len().min(4096 - body.len())])
-                    }
-                    _ => break,
-                }
-            }
-            let text = String::from_utf8_lossy(&body);
-            for tag in ["Code", "Message"] {
-                if let Some(value) = text
-                    .split_once(&format!("<{tag}>"))
-                    .and_then(|(_, tail)| tail.split_once(&format!("</{tag}>")))
-                    .map(|(value, _)| value)
-                    .filter(|value| !value.contains(['<', '>']))
-                {
-                    error = error.message(format!("{tag}: {value}"));
-                }
-            }
-            for (label, header) in [("RequestId", "x-amz-request-id"), ("HostId", "x-amz-id-2")] {
-                if let Some(value) = response
-                    .headers()
-                    .get(header)
-                    .and_then(|value| value.to_str().ok())
-                {
-                    error = error.message(format!("{label}: {value}"));
-                }
-            }
-            return Err(error);
+            return Err(self
+                .storage_failure(&mut response, status, upload, retry_after)
+                .await);
         }
+        self.download_body(&mut response, upload, &local_file, &mut destination)
+            .await?;
+        Ok(destination.map(|(download, writer)| {
+            drop(writer);
+            download
+        }))
+    }
+
+    async fn prepare_local(
+        instruction: &Instruction,
+        options: &VolumeOptions,
+    ) -> Result<(
+        Method,
+        String,
+        Option<(std::fs::File, u64)>,
+        Option<(Download, tokio::fs::File)>,
+    )> {
+        let operation = instruction.operation.clone();
+        let roots = options.allowed_paths.clone();
+        let preparation = tokio::task::spawn_blocking(move || {
+            let mut source = None;
+            let mut destination = None;
+            let (method, local_file) = match operation {
+                Operation::Put(Source::File(path)) => {
+                    let local_file = path.to_string_lossy().into_owned();
+                    let path = allowed_path(&local_file, &roots)?;
+                    let mut file =
+                        std::fs::File::open(path).map_err(|e| local_error(e, &local_file))?;
+                    let metadata = file.metadata().map_err(|e| local_error(e, &local_file))?;
+                    if metadata.is_dir() {
+                        // A directory opens without error on Unix; reading it produces the OS error to report.
+                        let error = std::io::Read::read(&mut file, &mut [0])
+                            .err()
+                            .unwrap_or_else(|| std::io::ErrorKind::IsADirectory.into());
+                        return Err(local_error(error, &local_file));
+                    }
+                    source = Some((file, metadata.len()));
+                    (Method::PUT, local_file)
+                }
+                Operation::Get(path) => {
+                    let local_file = path.to_string_lossy().into_owned();
+                    let path = allowed_path(&local_file, &roots)?;
+                    let existing = match std::fs::OpenOptions::new().write(true).open(&path) {
+                        Ok(file) => Some(file),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                        Err(error) => return Err(local_error(error, &local_file)),
+                    };
+                    let parent = path
+                        .parent()
+                        .ok_or_else(|| invalid("Missing destination parent"))?;
+                    let temp = match tempfile::tempfile_in(parent) {
+                        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                            tempfile::tempfile()
+                        }
+                        other => other,
+                    }
+                    .map_err(|e| local_error(e, &local_file))?;
+                    let writer = tokio::fs::File::from_std(
+                        temp.try_clone().map_err(|e| local_error(e, &local_file))?,
+                    );
+                    destination = Some((
+                        Download {
+                            temp,
+                            existing,
+                            path,
+                            local_file: local_file.clone(),
+                        },
+                        writer,
+                    ));
+                    (Method::GET, local_file)
+                }
+                Operation::Put(Source::Stream) => (Method::PUT, String::new()),
+                Operation::Remove => (Method::DELETE, String::new()),
+            };
+            Ok((method, local_file, source, destination))
+        });
+        preparation.await.map_err(|e| {
+            Error::internal().message(format!("Volume file preparation task failed: {e}"))
+        })?
+    }
+
+    async fn storage_failure(
+        &self,
+        response: &mut reqwest::Response,
+        status: reqwest::StatusCode,
+        upload: bool,
+        retry_after: &mut Option<String>,
+    ) -> Error {
+        *retry_after = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let mut error = Error::from_http_status(status.as_u16())
+            .with_error_code("VOLUME_STORAGE_HTTP_ERROR")
+            .with_retryable(
+                RetryStrategy::for_request(RequestType::CloudFetchDownload, &self.retry)
+                    .is_retryable_status(status, retry_after.is_some()),
+            )
+            .message(format!(
+                "Volume storage request failed: HTTP {}",
+                status.as_u16()
+            ));
+        let mut body = Vec::new();
+        while body.len() < 4096 {
+            match storage_read(self.storage.read_timeout, !upload, async {
+                response.chunk().await.map_err(response_body_error)
+            })
+            .await
+            {
+                Ok(Some(chunk)) => {
+                    body.extend_from_slice(&chunk[..chunk.len().min(4096 - body.len())])
+                }
+                _ => break,
+            }
+        }
+        let text = String::from_utf8_lossy(&body);
+        for tag in ["Code", "Message"] {
+            if let Some(value) = text
+                .split_once(&format!("<{tag}>"))
+                .and_then(|(_, tail)| tail.split_once(&format!("</{tag}>")))
+                .map(|(value, _)| value)
+                .filter(|value| !value.contains(['<', '>']))
+            {
+                error = error.message(format!("{tag}: {value}"));
+            }
+        }
+        for (label, header) in [("RequestId", "x-amz-request-id"), ("HostId", "x-amz-id-2")] {
+            if let Some(value) = response
+                .headers()
+                .get(header)
+                .and_then(|value| value.to_str().ok())
+            {
+                error = error.message(format!("{label}: {value}"));
+            }
+        }
+        error
+    }
+
+    async fn download_body(
+        &self,
+        response: &mut reqwest::Response,
+        upload: bool,
+        local_file: &str,
+        destination: &mut Option<(Download, tokio::fs::File)>,
+    ) -> Result<()> {
         while let Some(bytes) = storage_read(self.storage.read_timeout, !upload, async {
             response.chunk().await.map_err(response_body_error)
         })
@@ -470,19 +510,16 @@ impl VolumeState {
                 writer
                     .write_all(&bytes)
                     .await
-                    .map_err(|e| local_error(e, &local_file))?;
+                    .map_err(|e| local_error(e, local_file))?;
             }
         }
         if let Some((_, writer)) = destination.as_mut() {
             writer
                 .flush()
                 .await
-                .map_err(|e| local_error(e, &local_file))?;
+                .map_err(|e| local_error(e, local_file))?;
         }
-        Ok(destination.map(|(download, writer)| {
-            drop(writer);
-            download
-        }))
+        Ok(())
     }
 }
 
