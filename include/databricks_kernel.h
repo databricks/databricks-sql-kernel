@@ -468,6 +468,32 @@ KernelStatusCode kernel_session_config_set_tls_client_certificate(
     KernelSessionConfig* config, const uint8_t* cert_pem, size_t cert_len,
     const uint8_t* key_pem, size_t key_len);
 
+/* Enable or disable TLS certificate-revocation checking (default: off).
+ *
+ * Supported only on Windows with the tls-rustls backend, where Windows CryptoAPI
+ * checks the revocation of the chain it builds for the server certificate, after
+ * webpki has verified the chain. A revoked certificate is always rejected.
+ * `accept_undetermined` governs a status that cannot be determined (a fetch
+ * failure or timeout, an offline status, a partial chain): false rejects it
+ * (strict), true accepts it. `check_revocation` false disables the check whatever
+ * `accept_undetermined` says. Revocation is also skipped when the self-signed
+ * setter is set.
+ *
+ * CRL and OCSP retrieval uses Windows networking and proxy settings, not the
+ * kernel's proxy configuration, and Windows caches the results. The check is
+ * synchronous: it blocks the calling thread's TLS handshake until CryptoAPI
+ * returns, so a connect or operation timeout can be exceeded by up to the
+ * revocation budget (about 10 s for CRL and OCSP retrieval in total, shared by a
+ * handshake's one or two chain builds; AIA and other chain-building fetches are
+ * bounded per URL, not in total). Session
+ * resumption is disabled while checking is on.
+ *
+ * Requesting it on any other platform, or on tls-native, makes opening a session
+ * fail with InvalidArgument, and the error names the unsupported platform or
+ * backend. */
+KernelStatusCode kernel_session_config_set_tls_certificate_revocation(
+    KernelSessionConfig* config, bool check_revocation, bool accept_undetermined);
+
 /* Configure the HTTP retry / backoff policy. `min_wait_ms` / `max_wait_ms`
  * are the backoff-wait bounds between attempts (the wait is exponential
  * with jitter, clamped to this range); `max_retries` is the number of

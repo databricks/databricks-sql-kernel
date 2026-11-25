@@ -199,6 +199,40 @@ pub struct TlsConfig {
     pub client_key_pem: Option<Vec<u8>>,
 }
 
+/// The revocation mode for a client, from the public options: `None` when checking is
+/// off, otherwise `Some(accept_undetermined)`.
+pub(crate) fn revocation_mode(
+    check: Option<bool>,
+    accept_undetermined: Option<bool>,
+) -> Option<bool> {
+    (check == Some(true)).then(|| accept_undetermined == Some(true))
+}
+
+/// The reason a revocation request cannot be honoured on this build, or `None` when it can.
+/// Revocation is implemented only on Windows with `tls-rustls`. Pure, so every platform and
+/// backend combination is testable on any host.
+pub(crate) fn revocation_unsupported_message(windows: bool, rustls: bool) -> Option<&'static str> {
+    match (windows, rustls) {
+        (true, true) => None,
+        (true, false) => {
+            Some("TLS certificate revocation checking requires the tls-rustls backend")
+        }
+        (false, _) => Some("TLS certificate revocation checking is supported only on Windows"),
+    }
+}
+
+/// Rejects a revocation request that this platform or backend cannot honour, with
+/// `InvalidArgument`. `allow_self_signed` turns revocation off, so it is not an error.
+pub(crate) fn check_revocation_support(tls: &TlsConfig, revocation: Option<bool>) -> Result<()> {
+    if revocation.is_none() || tls.allow_self_signed == Some(true) {
+        return Ok(());
+    }
+    match revocation_unsupported_message(cfg!(windows), cfg!(feature = "tls-rustls")) {
+        Some(message) => Err(Error::invalid_argument().message(message)),
+        None => Ok(()),
+    }
+}
+
 impl std::fmt::Debug for TlsConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Mirrors the redacting Debug on the public
@@ -386,6 +420,7 @@ pub struct DatabricksHttpClient {
     config: HttpClientConfig,
     auth_provider: OnceLock<Arc<dyn AuthProvider>>,
     retry_configs: HashMap<RequestCategory, RetryConfig>,
+    revocation: Option<bool>,
 }
 
 impl DatabricksHttpClient {
@@ -395,8 +430,19 @@ impl DatabricksHttpClient {
     /// calling `execute()`. Use `execute_without_auth()` for requests that
     /// don't need authentication (e.g., OAuth token endpoint calls).
     pub fn new(
+        config: HttpClientConfig,
+        retry_configs: HashMap<RequestCategory, RetryConfig>,
+    ) -> Result<Self> {
+        Self::with_revocation(config, retry_configs, None)
+    }
+
+    /// Like [`Self::new`], with a revocation policy applied to every connection this client
+    /// makes. The policy is kept outside [`TlsConfig`], so that struct keeps its published
+    /// shape.
+    pub(crate) fn with_revocation(
         mut config: HttpClientConfig,
         retry_configs: HashMap<RequestCategory, RetryConfig>,
+        revocation: Option<bool>,
     ) -> Result<Self> {
         // Fold any caller-supplied `User-Agent` custom header into the
         // effective UA, and remove it from `custom_headers` so it isn't
@@ -478,8 +524,13 @@ impl DatabricksHttpClient {
             })?;
         }
 
+        // `allow_self_signed` turns revocation off, so the effective mode is what this client
+        // stores and what the telemetry cache keys on. `build_reqwest_client` applies the same rule.
+        let revocation = revocation.filter(|_| config.tls.allow_self_signed != Some(true));
+
         // Follow redirects for normal traffic (reqwest's default policy).
-        let client = Self::build_reqwest_client(&config, reqwest::redirect::Policy::default())?;
+        let client =
+            Self::build_reqwest_client(&config, reqwest::redirect::Policy::default(), revocation)?;
 
         // Surface which TLS backend was compiled in so oncall debugging
         // a handshake / unknown-CA report can tell at a glance whether
@@ -502,6 +553,7 @@ impl DatabricksHttpClient {
             config,
             auth_provider: OnceLock::new(),
             retry_configs,
+            revocation,
         })
     }
 
@@ -514,7 +566,9 @@ impl DatabricksHttpClient {
     fn build_reqwest_client(
         config: &HttpClientConfig,
         redirect: reqwest::redirect::Policy,
+        revocation: Option<bool>,
     ) -> Result<Client> {
+        check_revocation_support(&config.tls, revocation)?;
         let mut builder = Client::builder()
             .connect_timeout(config.connect_timeout)
             // `read_timeout` is a historical name; reqwest applies this as
@@ -700,6 +754,18 @@ impl DatabricksHttpClient {
             debug!("HTTP client using default proxy behavior (env vars)");
         }
 
+        // With revocation on, the verifier replaces reqwest's trust roots and identity.
+        // Those were already validated above. `allow_self_signed` turns revocation off.
+        #[cfg(all(windows, feature = "tls-rustls"))]
+        if let Some(accept_undetermined) =
+            revocation.filter(|_| config.tls.allow_self_signed != Some(true))
+        {
+            builder = builder.use_preconfigured_tls(super::tls_revocation::client_config(
+                &config.tls,
+                accept_undetermined,
+            )?);
+        }
+
         builder.build().map_err(|e| {
             Error::invalid_argument().message(format!("Failed to create HTTP client: {e}"))
         })
@@ -729,6 +795,12 @@ impl DatabricksHttpClient {
     /// Returns the client configuration.
     pub fn config(&self) -> &HttpClientConfig {
         &self.config
+    }
+
+    /// The effective revocation mode: `None` when checking is off, including when
+    /// `allow_self_signed` disables it, otherwise `Some(accept_undetermined)`.
+    pub(crate) fn revocation(&self) -> Option<bool> {
+        self.revocation
     }
 
     /// Returns the underlying reqwest client for building requests.
@@ -805,7 +877,11 @@ impl DatabricksHttpClient {
     /// `azure_tenant_id` (which skips discovery entirely). A single hop is
     /// sufficient for discovery, so no retry is attempted here.
     pub async fn first_redirect_location(&self, url: &str) -> Result<Option<String>> {
-        let client = Self::build_reqwest_client(&self.config, reqwest::redirect::Policy::none())?;
+        let client = Self::build_reqwest_client(
+            &self.config,
+            reqwest::redirect::Policy::none(),
+            self.revocation,
+        )?;
         let response = client.get(url).send().await.map_err(|e| {
             Error::network_error().message(format!("Redirect-probe request to {url} failed: {e}"))
         })?;
@@ -1084,6 +1160,43 @@ impl DatabricksHttpClient {
 mod tls_tests;
 
 #[cfg(test)]
+mod revocation_support_tests {
+    use super::{revocation_unsupported_message, DatabricksHttpClient, HttpClientConfig};
+
+    #[test]
+    fn allow_self_signed_makes_the_effective_revocation_mode_off() {
+        // The requested mode is strict, but self-signed turns revocation off, so the stored
+        // (effective) mode is None. The telemetry cache keys on this value.
+        let mut config = HttpClientConfig::default();
+        config.tls.allow_self_signed = Some(true);
+        let retry = crate::client::retry::build_retry_configs(
+            &crate::client::retry::RetryConfig::default(),
+            &std::collections::HashMap::new(),
+        );
+        let client = DatabricksHttpClient::with_revocation(config, retry, Some(false))
+            .expect("self-signed with revocation builds a client");
+        assert_eq!(client.revocation(), None);
+    }
+
+    #[test]
+    fn revocation_message_covers_every_platform_and_backend() {
+        assert_eq!(revocation_unsupported_message(true, true), None);
+        assert_eq!(
+            revocation_unsupported_message(true, false),
+            Some("TLS certificate revocation checking requires the tls-rustls backend")
+        );
+        assert_eq!(
+            revocation_unsupported_message(false, true),
+            Some("TLS certificate revocation checking is supported only on Windows")
+        );
+        assert_eq!(
+            revocation_unsupported_message(false, false),
+            Some("TLS certificate revocation checking is supported only on Windows")
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::auth::PersonalAccessToken;
@@ -1091,6 +1204,42 @@ mod tests {
 
     fn default_retry_configs() -> HashMap<RequestCategory, RetryConfig> {
         build_retry_configs(&RetryConfig::default(), &HashMap::new())
+    }
+
+    #[test]
+    fn revocation_mode_maps_the_public_options() {
+        assert_eq!(revocation_mode(None, None), None);
+        assert_eq!(revocation_mode(Some(false), Some(true)), None);
+        assert_eq!(revocation_mode(Some(true), None), Some(false));
+        assert_eq!(revocation_mode(Some(true), Some(false)), Some(false));
+        assert_eq!(revocation_mode(Some(true), Some(true)), Some(true));
+    }
+
+    #[test]
+    fn revocation_request_is_refused_where_it_is_not_implemented() {
+        let tls = HttpClientConfig::default().tls;
+        check_revocation_support(&tls, None).expect("no request");
+        let mut self_signed = tls.clone();
+        self_signed.allow_self_signed = Some(true);
+        check_revocation_support(&self_signed, Some(false))
+            .expect("allow_self_signed turns revocation off");
+        if cfg!(all(windows, feature = "tls-rustls")) {
+            check_revocation_support(&tls, Some(false)).expect("implemented on this platform");
+        } else {
+            let error = check_revocation_support(&tls, Some(false))
+                .expect_err("revocation is refused off Windows with tls-rustls");
+            assert_eq!(
+                error.code,
+                crate::kernel_error::ErrorCode::InvalidArgument,
+                "{error}"
+            );
+            assert!(
+                error
+                    .message
+                    .contains("TLS certificate revocation checking"),
+                "{error}"
+            );
+        }
     }
 
     #[test]
@@ -1648,6 +1797,8 @@ lGrv15pBcePj
             skip_hostname_verification: true,
             client_cert_pem: Some(b"cert-bytes".to_vec()),
             client_key_pem: Some(b"key-bytes".to_vec()),
+            check_certificate_revocation: Some(true),
+            accept_undetermined_certificate_revocation: Some(true),
         };
         let internal = TlsConfig::from_public(&public);
         assert_eq!(internal.allow_self_signed, Some(true));

@@ -159,6 +159,14 @@ zeroize = "1.9"                                                                 
 jsonwebtoken = { version = "9", default-features = false, features = ["use_pem"] } # JWT signing (RS256/384/512, PS256/384/512, ES256/384); use_pem = PEM key loading (adds pem + simple_asn1, no TLS)
 pkcs8 = { version = "0.10", features = ["encryption", "pem", "std"] }            # PKCS#8 PEM parsing + PBES2 passphrase decryption
 
+# Windows CryptoAPI for TLS certificate revocation (`src/client/tls_revocation.rs`).
+# `windows-sys` is already in the lock file; no new packages.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
+# `tls-rustls` on Windows only. Loads the OS trust store for the revocation verifier (see
+# `src/client/tls_revocation.rs`), the same store reqwest's `rustls-tls-native-roots` loads.
+rustls-native-certs = { version = "0.8", optional = true }
+
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util"] }
 wiremock = "0.6"
@@ -226,6 +234,7 @@ tls-rustls = [
     "dep:rustls",
     "dep:rustls-webpki",
     "dep:webpki-roots",
+    "dep:rustls-native-certs",
 ]
 
 [lib]

@@ -230,7 +230,8 @@ enum CircuitBreakerState {
 
 /// Process-global registry of per-host circuit breakers.
 ///
-/// The `breakers` map is keyed by `(host, config)` and holds one entry per
+/// The `breakers` map is keyed by `(cache key, config)`, where the cache key is the host and the
+/// effective revocation mode from `telemetry_cache_key`, and holds one entry per
 /// distinct host a process talks to. Entries are never evicted, so the map
 /// grows monotonically for the process lifetime. This is intentional and
 /// bounded in practice: a kernel process connects to a small, stable set of
@@ -274,8 +275,11 @@ impl CircuitBreakerManager {
     }
 }
 
+/// Wraps `exporter` in the circuit breaker shared under `breaker_key` (the host plus the
+/// revocation mode). `host` is the plain host, used only in log messages.
 pub(super) fn maybe_wrap_exporter(
     host: &str,
+    breaker_key: &str,
     config: &TelemetryConfig,
     exporter: Arc<dyn TelemetryExporter>,
 ) -> Arc<dyn TelemetryExporter> {
@@ -283,9 +287,10 @@ pub(super) fn maybe_wrap_exporter(
         return exporter;
     };
 
-    Arc::new(CircuitBreakerTelemetryExporter::new(
+    Arc::new(CircuitBreakerTelemetryExporter::keyed(
         exporter,
         host,
+        breaker_key,
         circuit_config,
     ))
 }
@@ -297,11 +302,22 @@ struct CircuitBreakerTelemetryExporter {
 }
 
 impl CircuitBreakerTelemetryExporter {
+    #[cfg(test)]
     fn new(inner: Arc<dyn TelemetryExporter>, host: &str, config: CircuitBreakerConfig) -> Self {
+        Self::keyed(inner, host, host, config)
+    }
+
+    /// `host` is logged; `breaker_key` selects the shared breaker.
+    fn keyed(
+        inner: Arc<dyn TelemetryExporter>,
+        host: &str,
+        breaker_key: &str,
+        config: CircuitBreakerConfig,
+    ) -> Self {
         Self {
             inner,
             host: host.to_string(),
-            breaker: CircuitBreakerManager::global().get_or_create(host, config),
+            breaker: CircuitBreakerManager::global().get_or_create(breaker_key, config),
         }
     }
 }
@@ -545,6 +561,64 @@ mod tests {
         // The genuine probe then succeeds and recovery closes the circuit.
         probe.record_success();
         assert_eq!(breaker.state_for_test(), CircuitBreakerState::Closed);
+    }
+
+    #[test]
+    fn different_revocation_modes_get_different_breakers() {
+        // Sessions to one host with different revocation modes share no breaker, as they share
+        // no telemetry client.
+        use crate::telemetry::runtime::telemetry_cache_key;
+
+        let host = unique_host("revocation-modes");
+        let config = CircuitBreakerConfig::from_telemetry_config(&TelemetryConfig {
+            enabled: Some(true),
+            ..TelemetryConfig::default()
+        })
+        .expect("circuit breaker config");
+        let off =
+            CircuitBreakerManager::global().get_or_create(&telemetry_cache_key(host, None), config);
+        let strict = CircuitBreakerManager::global()
+            .get_or_create(&telemetry_cache_key(host, Some(false)), config);
+        let tolerant = CircuitBreakerManager::global()
+            .get_or_create(&telemetry_cache_key(host, Some(true)), config);
+        assert!(!Arc::ptr_eq(&off, &strict));
+        assert!(!Arc::ptr_eq(&strict, &tolerant));
+        // The same key still shares a breaker.
+        let again = CircuitBreakerManager::global()
+            .get_or_create(&telemetry_cache_key(host, Some(false)), config);
+        assert!(Arc::ptr_eq(&strict, &again));
+    }
+
+    #[test]
+    fn keyed_exporter_logs_the_plain_host_and_shares_the_keyed_breaker() {
+        use crate::telemetry::runtime::telemetry_cache_key;
+
+        let host = unique_host("keyed-log-host");
+        let key = telemetry_cache_key(host, Some(false));
+        let config = CircuitBreakerConfig {
+            failure_threshold: 1,
+            open_timeout: Duration::from_secs(60),
+        };
+        let first = CircuitBreakerTelemetryExporter::keyed(
+            Arc::new(CapturingExporter::default()),
+            host,
+            &key,
+            config,
+        );
+        let second = CircuitBreakerTelemetryExporter::keyed(
+            Arc::new(CapturingExporter::default()),
+            host,
+            &key,
+            config,
+        );
+        // Logs carry the real host, not the composite key.
+        assert_eq!(first.host, host);
+        // The breaker is still shared per key.
+        assert!(Arc::ptr_eq(&first.breaker, &second.breaker));
+        assert!(Arc::ptr_eq(
+            &first.breaker,
+            &CircuitBreakerManager::global().get_or_create(&key, config)
+        ));
     }
 
     #[tokio::test]

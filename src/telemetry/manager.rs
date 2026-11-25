@@ -252,6 +252,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn different_revocation_modes_get_different_clients() {
+        // A client holds the HTTP client of the session that created it. Two sessions to one
+        // host with different revocation settings must not share a client.
+        use crate::telemetry::runtime::telemetry_cache_key;
+
+        let manager = Box::leak(Box::new(TelemetryClientManager::default()));
+        let exporter: Arc<dyn TelemetryExporter> = Arc::new(CapturingTelemetryExporter::default());
+        let config = TelemetryConfig {
+            enabled: Some(true),
+            ..TelemetryConfig::default()
+        };
+
+        let off = manager.get_or_create_test(
+            &telemetry_cache_key("example.com", None),
+            &config,
+            exporter.clone(),
+            false,
+        );
+        let strict = manager.get_or_create_test(
+            &telemetry_cache_key("example.com", Some(false)),
+            &config,
+            exporter,
+            false,
+        );
+
+        assert!(!Arc::ptr_eq(off.client(), strict.client()));
+        assert_eq!(manager.tracked_client_count(), 2);
+        off.release().await;
+        strict.release().await;
+    }
+
+    #[tokio::test]
     async fn last_lease_drop_removes_host_client() {
         let manager = Box::leak(Box::new(TelemetryClientManager::default()));
         let exporter: Arc<dyn TelemetryExporter> = Arc::new(CapturingTelemetryExporter::default());

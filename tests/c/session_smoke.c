@@ -310,6 +310,25 @@ static void test_enable_geospatial_support_setter(void) {
         "set_enable_geospatial_support(NULL cfg) -> InvalidArgument");
 }
 
+/* TLS certificate-revocation setter: strict, accept-undetermined and off all
+ * succeed; a null config is rejected. */
+static void test_tls_certificate_revocation_setter(void) {
+  KernelSessionConfig* config = NULL;
+  (void)kernel_session_config_new(&config);
+  KernelStatusCode rc = kernel_session_config_set_tls_certificate_revocation(config, true, false);
+  CHECK(rc == KernelStatusCode_Success, "set_tls_certificate_revocation(check, strict) succeeds");
+  rc = kernel_session_config_set_tls_certificate_revocation(config, true, true);
+  CHECK(rc == KernelStatusCode_Success,
+        "set_tls_certificate_revocation(check, accept undetermined) succeeds");
+  rc = kernel_session_config_set_tls_certificate_revocation(config, false, false);
+  CHECK(rc == KernelStatusCode_Success, "set_tls_certificate_revocation(off) succeeds");
+  kernel_session_config_free(config);
+
+  rc = kernel_session_config_set_tls_certificate_revocation(NULL, true, false);
+  CHECK(rc == KernelStatusCode_InvalidArgument,
+        "set_tls_certificate_revocation(NULL cfg) -> InvalidArgument");
+}
+
 static void capture_log(const char* level, const char* target,
                         const char* message, void* user_data) {
   (void)level;
@@ -388,6 +407,7 @@ int main(void) {
   test_http_path_and_m2m_setters();
   test_setter_null_arg_rejected();
   test_proxy_and_tls_setters();
+  test_tls_certificate_revocation_setter();
   test_u2m_and_header_setters();
   test_identity_federation_client_id_setter();
   test_client_conf_setter();

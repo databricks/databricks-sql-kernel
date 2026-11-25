@@ -366,11 +366,19 @@ impl Session {
         // 1. HTTP client — built before auth so OAuth providers can use
         //    it for OIDC discovery / token endpoint calls.
         let http_client_config = build_http_client_config(&config, org_id);
+        // Checked before the client-construction wrapping below, so the
+        // configuration error keeps its InvalidArgument category.
+        let revocation = crate::client::http::revocation_mode(
+            config.tls.check_certificate_revocation,
+            config.tls.accept_undetermined_certificate_revocation,
+        );
+        crate::client::http::check_revocation_support(&http_client_config.tls, revocation)?;
         let retry_configs = build_retry_configs_for_session(&config);
         let http_client = Arc::new(
-            DatabricksHttpClient::new(http_client_config, retry_configs).map_err(|e| {
-                Error::network_error().message(format!("Failed to construct HTTP client: {e}"))
-            })?,
+            DatabricksHttpClient::with_revocation(http_client_config, retry_configs, revocation)
+                .map_err(|e| {
+                    Error::network_error().message(format!("Failed to construct HTTP client: {e}"))
+                })?,
         );
 
         // 2. Auth provider — async because OAuth flows hit the OIDC
@@ -451,6 +459,7 @@ impl Session {
             &telemetry_config,
             &config.connection,
             &config.auth,
+            &config.tls,
             config.driver_system_configuration.clone(),
             http_client,
             session_info.session_id.clone(),
@@ -3986,5 +3995,48 @@ mod is_open_tests {
                 ))
             })
         }
+    }
+}
+
+/// Revocation is refused at open everywhere except Windows with `tls-rustls`. The
+/// Windows success path is covered by the Windows-only verifier tests.
+#[cfg(all(test, not(all(windows, feature = "tls-rustls"))))]
+mod revocation_open_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn revocation_on_unsupported_platform_fails_open_as_invalid_argument() {
+        let config = SessionConfig {
+            connection: ConnectionConfig::new("https://workspace.invalid", "test_wh"),
+            defaults: None,
+            auth: AuthConfig::Pat {
+                token: "dapi-test".to_string(),
+                identity_federation_client_id: None,
+            },
+            driver_system_configuration: None,
+            session_conf: Default::default(),
+            geospatial_result_representation: None,
+            http: HttpConfig::default(),
+            proxy: None,
+            tls: TlsConfig {
+                check_certificate_revocation: Some(true),
+                ..TlsConfig::default()
+            },
+            result: ResultConfig::default(),
+            logging: LoggingConfig::default(),
+            telemetry: TelemetryConfig::default(),
+            transport: None,
+        };
+        let error = Session::open(config)
+            .await
+            .expect_err("revocation must be refused on this platform or backend");
+        assert_eq!(error.code, crate::kernel_error::ErrorCode::InvalidArgument);
+        assert!(
+            error
+                .message
+                .contains("TLS certificate revocation checking"),
+            "{}",
+            error.message
+        );
     }
 }

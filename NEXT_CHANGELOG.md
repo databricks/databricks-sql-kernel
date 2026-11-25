@@ -11,6 +11,19 @@ changes go in their respective binding's NEXT_CHANGELOG.
 
 ### Added
 
+- Opt-in TLS certificate revocation checking, off by default. It is supported
+  only on Windows with `tls-rustls`, where Windows CryptoAPI decides the status
+  after webpki has verified the chain. Requesting it anywhere else (including
+  `tls-native`) fails session open with `InvalidArgument`. Set it with
+  `TlsConfig::check_certificate_revocation` and
+  `TlsConfig::accept_undetermined_certificate_revocation`, or with
+  `kernel_session_config_set_tls_certificate_revocation`. CRL and OCSP fetches
+  use Windows' networking and proxy settings, and Windows caches their results.
+  The check is synchronous and runs inside the TLS handshake, so a connect or
+  operation timeout can be exceeded by up to the revocation budget (about 10 s
+  for CRL and OCSP retrieval in total). Session resumption is disabled while
+  revocation is on.
+
 ### Changed
 
 ### Updated

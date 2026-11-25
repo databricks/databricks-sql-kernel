@@ -497,6 +497,10 @@ mod tests {
             rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer),
             rustls::Error::InvalidCertificate(rustls::CertificateError::NotValidForName),
             rustls::Error::InvalidCertificate(rustls::CertificateError::Expired),
+            // What the Windows revocation verifier returns for a revoked or, in strict mode,
+            // undetermined status: both are permanent and never retried.
+            rustls::Error::InvalidCertificate(rustls::CertificateError::Revoked),
+            rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownRevocationStatus),
             rustls::Error::NoCertificatesPresented,
         ] {
             let error = std::io::Error::other(std::io::Error::other(error));

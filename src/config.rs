@@ -1041,6 +1041,47 @@ pub struct TlsConfig {
     /// [`Self::client_cert_pem`] for pairing rules and the
     /// backend-specific validation timing.
     pub client_key_pem: Option<Vec<u8>>,
+
+    /// Check the revocation status of the server certificate chain with Windows
+    /// CryptoAPI. Default off. Revoked certificates are always rejected.
+    ///
+    /// Supported only on Windows with the `tls-rustls` backend. Elsewhere, and on
+    /// `tls-native`, opening a session with this on fails with `InvalidArgument`.
+    /// Disabled by [`Self::accept_self_signed`].
+    ///
+    /// Trust, name and signatures are still decided by webpki, as with checking off.
+    /// CryptoAPI then checks every certificate in the chain it builds except the root.
+    /// Only the revocation bits are read. The trust bits are ignored. A trust anchor is not
+    /// revocation-checked, and neither are the certificates above it. A custom CA on the chain is
+    /// an anchor, including a self-signed server certificate configured as a custom CA and a custom
+    /// intermediate anchor, even when Windows can build past it to an installed root. This follows
+    /// RFC 5280, the JDK PKIX path validator and CryptoAPI's exclude-root flag. The leaf and the
+    /// certificates below an anchor are checked. A chain with an invalid signature on any
+    /// element is undetermined, never good. A non-empty stapled OCSP response from the server is
+    /// attached to the leaf, so CryptoAPI can use it without a fetch. rustls's client requests
+    /// OCSP stapling by default, and an empty or refused response is ignored. CRL and OCSP
+    /// retrieval uses Windows networking and proxy settings, not [`ProxyConfig`], and
+    /// Windows caches the results. The check is synchronous and runs inside the TLS
+    /// handshake, so it blocks the calling task until CryptoAPI returns, even on a
+    /// multi-thread runtime. A connect or operation timeout on that task can be exceeded
+    /// by up to the revocation budget (about 10 s for CRL and OCSP retrieval in total, shared
+    /// by the one or two chain builds of a handshake; AIA and other chain-building fetches are
+    /// bounded per URL, not in total). On a
+    /// `current_thread` runtime the whole runtime waits. Session resumption is disabled
+    /// while checking is on.
+    pub check_certificate_revocation: Option<bool>,
+
+    /// With [`Self::check_certificate_revocation`] on, accept a chain whose status
+    /// cannot be determined (a fetch failure or timeout, an offline status, a partial
+    /// chain). Default off. Matches Simba's strict and accept-undetermined modes.
+    ///
+    /// In strict mode (this option unset or false), an undetermined status is a
+    /// certificate error, and the kernel treats it as permanent: it is not retried.
+    /// That is by design, so a fetch outage fails the connection at once rather than
+    /// after retries. To tolerate transient revocation-service outages, set this option
+    /// (the ODBC driver's `AcceptUndeterminedRevocation=1`). A revoked status is
+    /// permanent in both modes.
+    pub accept_undetermined_certificate_revocation: Option<bool>,
 }
 
 impl std::fmt::Debug for TlsConfig {
@@ -1070,6 +1111,14 @@ impl std::fmt::Debug for TlsConfig {
             .field(
                 "client_key_pem",
                 &self.client_key_pem.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "check_certificate_revocation",
+                &self.check_certificate_revocation,
+            )
+            .field(
+                "accept_undetermined_certificate_revocation",
+                &self.accept_undetermined_certificate_revocation,
             )
             .finish()
     }
@@ -2208,6 +2257,24 @@ mod tests {
         assert!(
             s.contains("bytes>"),
             "expected cert byte-count summary, got: {s}"
+        );
+    }
+
+    #[test]
+    fn tls_config_debug_shows_revocation_policy() {
+        let tls = TlsConfig {
+            check_certificate_revocation: Some(true),
+            accept_undetermined_certificate_revocation: Some(false),
+            ..TlsConfig::default()
+        };
+        let s = format!("{tls:?}");
+        assert!(
+            s.contains("check_certificate_revocation: Some(true)"),
+            "revocation check missing from Debug: {s}"
+        );
+        assert!(
+            s.contains("accept_undetermined_certificate_revocation: Some(false)"),
+            "accept-undetermined missing from Debug: {s}"
         );
     }
 }
