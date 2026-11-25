@@ -224,7 +224,9 @@ pub(crate) fn fold_host_port(
             "credentials (userinfo) cannot be combined with a port",
         ));
     }
-    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    // `\` ends the authority too: URL parsers treat it as a path separator for http(s), so
+    // `https://h\path` would otherwise take the port after the path and connect to the default.
+    let authority_end = rest.find(['/', '?', '#', '\\']).unwrap_or(rest.len());
     let (authority, tail) = rest.split_at(authority_end);
     if authority.is_empty() {
         return Err(invalid_port(host, port, "a port needs a host"));
@@ -297,7 +299,10 @@ fn parse_embedded_port(text: &str) -> Option<u16> {
 /// in its authority, or the scheme's default when there is none.
 fn effective_port(host: &str) -> u16 {
     let (scheme, rest) = host.split_once("://").unwrap_or(("https", host));
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    let authority = rest.split(['/', '?', '#', '\\']).next().unwrap_or(rest);
+    // A default port leaves a host with userinfo unvalidated, and the userinfo may contain a `:`,
+    // so drop everything up to the last `@` before reading the port.
+    let authority = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
     let embedded = split_authority(authority).and_then(|(_, p)| p.and_then(parse_embedded_port));
     embedded.unwrap_or(if scheme.eq_ignore_ascii_case("http") {
         80
@@ -2378,6 +2383,9 @@ mod tests {
             ("https://h/", 8443),
             ("https://h?x=1", 8443),
             ("https://h#frag", 8443),
+            // `\` is a path separator for http(s) URL parsers.
+            ("https://h\\path", 8443),
+            ("http://h\\", 8080),
             // Userinfo anywhere in the host.
             ("https://user@h", 8443),
             ("https://user:pw@h", 8443),
@@ -2500,6 +2508,17 @@ mod tests {
             .expect("noop");
         assert_eq!(c.host, "https://h");
         assert_eq!(c.applied_port, Some(443));
+    }
+
+    #[test]
+    fn with_port_default_port_reads_the_host_port_past_userinfo() {
+        // A default port does not validate the host, so userinfo with a ":" stays; the reported
+        // port is still the host's own.
+        let c = ConnectionConfig::new("https://u:pw@h:9000", "abc")
+            .with_port(443)
+            .expect("noop");
+        assert_eq!(c.host, "https://u:pw@h:9000");
+        assert_eq!(c.applied_port, Some(9000));
     }
 
     #[test]

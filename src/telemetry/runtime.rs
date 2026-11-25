@@ -409,7 +409,7 @@ fn build_connection_params(
         mode: Some(DriverMode::Sea),
         host_info: Some(HostDetails {
             host_url: Some(connection.host.clone()),
-            // Only a port the caller applied via `with_port` (never a default).
+            // Only a port the caller applied explicitly via `with_port` (it may equal the default).
             port: connection.applied_port.map(i32::from),
             proxy_auth_type: None,
         }),

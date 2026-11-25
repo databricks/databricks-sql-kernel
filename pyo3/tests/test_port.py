@@ -42,6 +42,7 @@ def test_port_out_of_range_or_non_int_raises_value_error(bad):
 
 
 def test_port_with_credentials_is_rejected_without_leaking_them():
-    with pytest.raises(Exception) as excinfo:
+    with pytest.raises(k.KernelError) as excinfo:
         _open(8443, host="https://user:s3cret@x.databricks.com")
+    assert excinfo.value.code == "InvalidArgument", excinfo.value.code
     assert "s3cret" not in str(excinfo.value)
