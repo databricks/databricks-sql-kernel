@@ -384,6 +384,29 @@ fn constant_utf8(len: usize, value: Option<&str>) -> ArrayRef {
     Arc::new(StringArray::from(vec![v; len]))
 }
 
+fn table_type_column(batch: &RecordBatch) -> Result<ArrayRef> {
+    if column_index(batch.schema_ref(), "tableType").is_none() {
+        return Ok(Arc::new(StringArray::from(vec![
+            Some("TABLE");
+            batch.num_rows()
+        ])));
+    }
+    let column = utf8_column(batch, "tableType")?;
+    let values = column
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| Error::data_loss().message("tableType is not Utf8"))?;
+    Ok(Arc::new(StringArray::from_iter((0..values.len()).map(
+        |row| {
+            if values.is_null(row) || values.value(row).is_empty() {
+                Some("TABLE")
+            } else {
+                Some(values.value(row))
+            }
+        },
+    ))))
+}
+
 /// Return the named source column as an `Int32` array, casting from a
 /// related integer type if necessary. Returns an all-null `Int32`
 /// array when the column is absent — symmetric with [`utf8_column`].
@@ -567,13 +590,9 @@ pub(crate) fn reshape_tables(
     };
     let table_schem = utf8_column(batch, "namespace")?;
     let table_name = utf8_column(batch, "tableName")?;
-    let table_type = if column_index(batch.schema_ref(), "tableType").is_some() {
-        utf8_column(batch, "tableType")?
-    } else {
-        // Old DBR fallback: best-effort default. Matches the JDBC
-        // driver's behaviour when SHOW TABLES doesn't expose tableType.
-        Arc::new(StringArray::from(vec![Some("TABLE"); n]))
-    };
+    // Some server versions include tableType but leave individual values null or empty for legacy
+    // hive_metastore tables. Match JDBC by treating those values like a missing column.
+    let table_type = table_type_column(batch)?;
     // REMARKS is contractually nullable per the JDBC spec, but the Thrift
     // backend has historically emitted `""` for tables without a comment
     // and most string-handling consumers expect a `String`, not `null`.
@@ -1400,6 +1419,51 @@ mod tests {
             .downcast_ref::<StringArray>()
             .unwrap();
         assert!(type_cat.is_null(0));
+    }
+
+    #[test]
+    fn tables_defaults_missing_null_and_empty_table_types() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("namespace", DataType::Utf8, false),
+            Field::new("tableName", DataType::Utf8, false),
+            Field::new("tableType", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec!["s", "s", "s"])),
+                Arc::new(StringArray::from(vec!["empty", "null", "view"])),
+                Arc::new(StringArray::from(vec![Some(""), None, Some("VIEW")])),
+            ],
+        )
+        .unwrap();
+        let output = reshape_tables(&batch, Some("main"), None).unwrap();
+        let table_types = output
+            .column(3)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(
+            table_types.iter().collect::<Vec<_>>(),
+            vec![Some("TABLE"), Some("TABLE"), Some("VIEW")]
+        );
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("namespace", DataType::Utf8, false),
+            Field::new("tableName", DataType::Utf8, false),
+        ]));
+        let without_table_type =
+            RecordBatch::try_new(schema, batch.columns()[..2].to_vec()).unwrap();
+        let output = reshape_tables(&without_table_type, Some("main"), None).unwrap();
+        let table_types = output
+            .column(3)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(
+            table_types.iter().collect::<Vec<_>>(),
+            vec![Some("TABLE"); 3]
+        );
     }
 
     #[test]
