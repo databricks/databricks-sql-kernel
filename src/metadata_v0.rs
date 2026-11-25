@@ -167,6 +167,21 @@ fn normalize_native_metadata_batch(
                 })?
             };
 
+            if field.name() == "TABLE_TYPE" {
+                let values = column
+                    .as_any()
+                    .downcast_ref::<arrow_array::StringArray>()
+                    .ok_or_else(|| Error::data_loss().message("TABLE_TYPE is not Utf8"))?;
+                return Ok(
+                    Arc::new(arrow_array::StringArray::from_iter(values.iter().map(
+                        |value| match value {
+                            None | Some("") => Some("TABLE"),
+                            Some(value) => Some(value),
+                        },
+                    ))) as ArrayRef,
+                );
+            }
+
             if field.name() != "ORDINAL_POSITION" {
                 return Ok(column);
             }
@@ -1667,6 +1682,85 @@ mod tests {
         assert_eq!(ordinals.value(0), 1);
         assert_eq!(ordinals.value(1), 2);
         assert!(ordinals.is_null(2));
+    }
+
+    #[test]
+    fn native_metadata_defaults_null_and_empty_table_types() {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "TABLE_TYPE",
+                DataType::Utf8,
+                true,
+            )])),
+            vec![Arc::new(arrow_array::StringArray::from(vec![
+                Some(""),
+                None,
+                Some("VIEW"),
+            ]))],
+        )
+        .unwrap();
+        let public_schema = Arc::new(Schema::new(vec![Field::new(
+            "TABLE_TYPE",
+            DataType::Utf8,
+            false,
+        )]));
+
+        let normalized = normalize_native_metadata_batch(&batch, public_schema).unwrap();
+        let table_types = normalized.column(0).as_string::<i32>();
+
+        assert_eq!(
+            table_types.iter().collect::<Vec<_>>(),
+            vec![Some("TABLE"), Some("TABLE"), Some("VIEW")]
+        );
+    }
+
+    #[test]
+    fn native_tables_filter_defaults_null_and_empty_table_types() {
+        let mut fields = GET_TABLES_SCHEMA
+            .fields()
+            .iter()
+            .map(|field| field.as_ref().clone())
+            .collect::<Vec<_>>();
+        fields[3] = Field::new("TABLE_TYPE", DataType::Utf8, true);
+        let nulls = || Arc::new(arrow_array::StringArray::from(vec![None::<&str>; 3])) as ArrayRef;
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(fields)),
+            vec![
+                Arc::new(arrow_array::StringArray::from(vec!["main"; 3])),
+                Arc::new(arrow_array::StringArray::from(vec!["default"; 3])),
+                Arc::new(arrow_array::StringArray::from(vec![
+                    "empty", "null", "view",
+                ])),
+                Arc::new(arrow_array::StringArray::from(vec![
+                    Some(""),
+                    None,
+                    Some("VIEW"),
+                ])),
+                nulls(),
+                nulls(),
+                nulls(),
+                nulls(),
+                nulls(),
+                nulls(),
+            ],
+        )
+        .unwrap();
+
+        let normalized =
+            normalize_native_metadata_batch(&batch, GET_TABLES_SCHEMA.clone()).unwrap();
+        let tables =
+            thrift_shape::process_native_tables(&normalized, Some("main"), Some(&["TABLE"]))
+                .unwrap();
+
+        assert_eq!(tables.num_rows(), 2);
+        assert_eq!(
+            tables
+                .column(2)
+                .as_string::<i32>()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![Some("empty"), Some("null")]
+        );
     }
 
     #[test]
