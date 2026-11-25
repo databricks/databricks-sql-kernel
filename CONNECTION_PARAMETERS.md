@@ -53,7 +53,9 @@ A non-default port is rejected with `InvalidArgument` when:
 - the host already has an embedded port that is not `1` to `65535`.
 
 A port already embedded in the host (`host:N` or `[v6]:N`) is kept and wins
-over the requested port. The kernel logs a `WARN` when the two differ. A bare
+over the requested port. The kernel logs a `WARN` when a non-default requested
+port differs from it; a requested port equal to the scheme default is treated
+as unset, so it never warns. A bare
 IPv6 literal is bracketed, so `2001:db8::1` becomes `[2001:db8::1]:port`. Only
 `http` and `https` hosts are accepted. The applied port is reported as
 `host_info.port` in connection telemetry.

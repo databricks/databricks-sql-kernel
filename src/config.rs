@@ -169,7 +169,8 @@ impl ConnectionConfig {
 ///   and nothing (no path, query or fragment) may follow it.
 /// - An authority that already carries a port (`h:N` or `[v6]:N`) keeps it.
 ///   `N` must be `1..=65535`. The host is returned unchanged, and a
-///   `tracing::warn!` names both ports when `N != port`.
+///   `tracing::warn!` names both ports when `N != port`. A `port` equal to the
+///   scheme default returned unchanged under the first rule, so it never warns.
 /// - Otherwise a bare IPv6 literal is bracketed and the result is
 ///   `scheme://authority:port`.
 ///
@@ -2474,6 +2475,14 @@ mod tests {
             logged.contains("8443") && logged.contains("9000"),
             "{logged}"
         );
+    }
+
+    #[test]
+    fn host_with_port_default_port_never_warns_about_an_embedded_port() {
+        // The scheme default is treated as unset, so the host's own port is used silently.
+        let (result, logged) = capture_warnings(|| host_with_port("https://h:9000", 443));
+        assert_eq!(result.unwrap(), "https://h:9000");
+        assert!(logged.is_empty(), "unexpected log: {logged}");
     }
 
     #[test]
