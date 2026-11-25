@@ -13,6 +13,14 @@ changes go in the root `NEXT_CHANGELOG.md`.
 
 ### Added
 
+- `Session(host, http_path, port=...)`: an optional connection `port`
+  (`int`, default `None`). A non-default port is folded into the host by the
+  kernel. `0` and the scheme default (443 for `https`, 80 for `http`) change
+  nothing. The host must not have credentials, a path, a query or a fragment.
+  A port already in the host wins. A value outside `0..=65535`, or a non-int,
+  raises `ValueError`. A bad host/port combination raises the usual
+  `KernelError` (`InvalidArgument`).
+
 ### Changed
 
 ### Updated

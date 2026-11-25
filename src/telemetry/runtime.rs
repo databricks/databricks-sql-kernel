@@ -409,7 +409,8 @@ fn build_connection_params(
         mode: Some(DriverMode::Sea),
         host_info: Some(HostDetails {
             host_url: Some(connection.host.clone()),
-            port: None,
+            // Only a port the caller applied via `with_port` (never a default).
+            port: connection.applied_port.map(i32::from),
             proxy_auth_type: None,
         }),
         auth_mech: Some(auth_mech(auth)),
@@ -507,6 +508,34 @@ mod tests {
             auth_flow(&u2m),
             Some(DriverAuthFlow::BrowserBasedAuthentication)
         );
+    }
+
+    #[test]
+    fn connection_params_report_only_an_applied_port() {
+        let pat = AuthConfig::Pat {
+            token: "dapi-token".to_string(),
+            identity_federation_client_id: None,
+        };
+
+        // No port applied: host_info.port stays absent, as before.
+        let unset = ConnectionConfig::new("https://h", "abc")
+            .with_port(0)
+            .expect("noop");
+        assert_eq!(
+            build_connection_params(&unset, &pat)
+                .host_info
+                .unwrap()
+                .port,
+            None
+        );
+
+        // A port applied via with_port is reported as the effective port.
+        let folded = ConnectionConfig::new("https://h", "abc")
+            .with_port(8443)
+            .expect("fold");
+        let info = build_connection_params(&folded, &pat).host_info.unwrap();
+        assert_eq!(info.port, Some(8443));
+        assert_eq!(info.host_url.as_deref(), Some("https://h:8443"));
     }
 
     #[test]

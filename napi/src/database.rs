@@ -34,7 +34,7 @@ use napi::bindgen_prelude::Buffer;
 type Buffer = Vec<u8>;
 
 use databricks_sql_kernel::{
-    AuthConfig, DefaultOpts, DriverSystemConfiguration, Error as KernelError,
+    AuthConfig, ConnectionConfig, DefaultOpts, DriverSystemConfiguration, Error as KernelError,
     GeospatialResultRepresentation, HttpConfig, ProxyConfig, ResultConfig, Session,
     TelemetryConfig, TlsConfig, TokenCacheConfig,
 };
@@ -154,6 +154,13 @@ pub struct ConnectionOptions {
     /// JDBC-style HTTP path, e.g. `/sql/1.0/warehouses/abc123`. The
     /// kernel parses out the warehouse id.
     pub http_path: String,
+    /// Connection port. Omitted, `0`, or the scheme default (443 for
+    /// `https`, 80 for `http`) changes nothing. Any other port is folded
+    /// into the host by the kernel, so the connection goes to `host:port`.
+    /// The host must not carry credentials, a path, a query or a fragment,
+    /// and a port already in the host wins over this one. A value that is
+    /// not an integer in `0..=65535` is an `InvalidArgument` error.
+    pub port: Option<f64>,
     /// Authentication mode. Omitted ⇒ [`AuthMode::Pat`] (back-compat:
     /// existing PAT callers pass only `token`).
     pub auth_mode: Option<AuthMode>,
@@ -463,6 +470,33 @@ pub struct ConnectionOptions {
     /// serialises `u32` as JS `number`; the largest representable value
     /// (~49.7 days) far exceeds any sensible socket timeout.
     pub socket_timeout_ms: Option<u32>,
+}
+
+/// Build the kernel [`ConnectionConfig`] from `hostName`, `httpPath` and
+/// the optional `port`. The port is validated as a JS number, then folded
+/// into the host by the kernel ([`ConnectionConfig::with_port`]). Pure
+/// (borrows `options`) so it can be tested without opening a session.
+fn build_connection(options: &ConnectionOptions) -> napi::Result<ConnectionConfig> {
+    let port = port_from_js(options.port)?;
+    ConnectionConfig::from_http_path(options.host_name.clone(), &options.http_path)
+        .and_then(|connection| connection.with_port(port))
+        .map_err(napi_err_from_kernel)
+}
+
+/// Validate the JS `port` option. `undefined` / `null` means unset (`0`).
+/// Otherwise the value must be an integer in `0..=65535`. A JS number is
+/// read as `f64` so that a fraction, `NaN`, or an infinity is rejected
+/// rather than truncated or wrapped (as `u32` would do).
+fn port_from_js(port: Option<f64>) -> napi::Result<u16> {
+    let Some(value) = port else {
+        return Ok(0);
+    };
+    if !value.is_finite() || value.fract() != 0.0 || !(0.0..=65535.0).contains(&value) {
+        return Err(napi_err_from_kernel(
+            KernelError::invalid_argument().message("port must be an integer between 0 and 65535"),
+        ));
+    }
+    Ok(value as u16)
 }
 
 /// Map the JS `ConnectionOptions` auth fields onto the kernel
@@ -814,6 +848,9 @@ pub async fn open_session(mut options: ConnectionOptions) -> napi::Result<Connec
         // Resolve auth before the builder moves `host_name` / `http_path`
         // out of `options` (validation can fail fast, before any network).
         let auth_config = build_auth_config(&options)?;
+        // Resolve host + port + http path before the builder moves them out
+        // of `options`, so a bad port fails fast, before any network I/O.
+        let connection = build_connection(&options)?;
         // Build the TLS config before the builder moves fields out of
         // `options`. Always wired (even at defaults) because the
         // permissive-by-default stance needs the relaxation flags set —
@@ -830,12 +867,9 @@ pub async fn open_session(mut options: ConnectionOptions) -> napi::Result<Connec
 
         // SessionConfig is `#[non_exhaustive]` — go through the
         // builder, which is the only public path that constructs it.
-        // `http_path()` is the convenience setter that maps a bare
-        // hostname + `/sql/1.0/warehouses/{id}` path into the kernel's
-        // `ConnectionConfig`.
-        let mut builder = Session::builder()
-            .http_path(options.host_name, options.http_path)
-            .auth(auth_config);
+        // `connection` is the `ConnectionConfig` built (with the port
+        // folded in) by `build_connection` above.
+        let mut builder = Session::builder().connection(connection).auth(auth_config);
         // Only wire `DefaultOpts` when at least one of catalog / schema
         // was provided; otherwise leave the config's `defaults` field
         // `None` so the kernel can distinguish "no defaults" from
@@ -911,6 +945,7 @@ mod tests {
         ConnectionOptions {
             host_name: "adb-1.azuredatabricks.net".to_owned(),
             http_path: "/sql/1.0/warehouses/abc".to_owned(),
+            port: None,
             auth_mode: None,
             token: None,
             oauth_client_id: None,
@@ -1372,6 +1407,55 @@ mod tests {
         let tls = build_tls_config(&o);
         assert!(tls.accept_self_signed);
         assert!(tls.skip_hostname_verification);
+    }
+
+    #[test]
+    fn port_from_js_accepts_unset_and_integers_in_range() {
+        assert_eq!(port_from_js(None).unwrap(), 0);
+        assert_eq!(port_from_js(Some(0.0)).unwrap(), 0);
+        assert_eq!(port_from_js(Some(8443.0)).unwrap(), 8443);
+        assert_eq!(port_from_js(Some(65535.0)).unwrap(), 65535);
+    }
+
+    #[test]
+    fn port_from_js_rejects_non_integers_and_out_of_range() {
+        // A fraction would truncate and a negative would wrap under a u32
+        // read; both, plus NaN and infinities, must be InvalidArgument.
+        for bad in [
+            -1.0,
+            65536.0,
+            1e10,
+            0.5,
+            8443.25,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        ] {
+            let err = port_from_js(Some(bad)).unwrap_err();
+            assert_eq!(err.status, napi::Status::InvalidArg, "port={bad}");
+        }
+    }
+
+    #[test]
+    fn build_connection_folds_a_port_and_leaves_the_host_without_one() {
+        let c = build_connection(&base()).unwrap();
+        assert_eq!(c.host, "https://adb-1.azuredatabricks.net");
+
+        let mut o = base();
+        o.port = Some(8443.0);
+        let c = build_connection(&o).unwrap();
+        assert_eq!(c.host, "https://adb-1.azuredatabricks.net:8443");
+        assert_eq!(c.warehouse_id, "abc");
+    }
+
+    #[test]
+    fn build_connection_rejects_credentials_with_a_port_without_leaking_them() {
+        let mut o = base();
+        o.host_name = "https://u:s3cret@adb-1.azuredatabricks.net".to_owned();
+        o.port = Some(8443.0);
+        let err = build_connection(&o).unwrap_err();
+        assert_eq!(err.status, napi::Status::InvalidArg);
+        assert!(!err.reason.contains("s3cret"), "leaked: {}", err.reason);
     }
 
     #[test]

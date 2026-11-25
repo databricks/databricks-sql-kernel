@@ -136,6 +136,11 @@ enum AuthSpec {
 /// exists nor is needed.
 pub struct KernelSessionConfig {
     connection: Option<ConnectionSpec>,
+    /// Connection port set by `kernel_session_config_set_port` (`0` = unset).
+    /// Folded into the host at open via `ConnectionConfig::with_port`, and
+    /// checked against the host whenever either side changes, so a bad
+    /// combination is reported at config time.
+    port: u16,
     auth: Option<AuthSpec>,
     session_conf: HashMap<String, String>,
     /// Optional client-facing representation for GEOMETRY / GEOGRAPHY results.
@@ -281,6 +286,7 @@ pub unsafe extern "C" fn kernel_session_config_new(
     }
     let config = Box::new(KernelSessionConfig {
         connection: None,
+        port: 0,
         auth: None,
         session_conf: HashMap::new(),
         geospatial_result_representation: None,
@@ -334,8 +340,10 @@ pub unsafe extern "C" fn kernel_session_config_set_warehouse(
     warehouse_id: *const c_char,
 ) -> KernelStatusCode {
     set_on_config(config, |c| {
+        let host = required_str(host, "host")?;
+        check_port_fits_host(&host, c.port)?;
         c.connection = Some(ConnectionSpec::HostWarehouse {
-            host: required_str(host, "host")?,
+            host,
             warehouse_id: required_str(warehouse_id, "warehouse_id")?,
         });
         Ok(())
@@ -346,7 +354,8 @@ pub unsafe extern "C" fn kernel_session_config_set_warehouse(
 /// (`/sql/1.0/warehouses/{id}` with an optional `?o={org_id}`).
 /// Mutually exclusive with [`kernel_session_config_set_warehouse`] — the
 /// last one called wins. The path is parsed at [`kernel_session_open`]
-/// so a malformed path surfaces there as `InvalidArgument`.
+/// so a malformed path surfaces there as `InvalidArgument`. A port set with
+/// [`kernel_session_config_set_port`] is checked against this host here.
 ///
 /// # Safety
 /// `config` must be a live config handle; `host` / `http_path` must be
@@ -358,12 +367,78 @@ pub unsafe extern "C" fn kernel_session_config_set_http_path(
     http_path: *const c_char,
 ) -> KernelStatusCode {
     set_on_config(config, |c| {
+        let host = required_str(host, "host")?;
+        check_port_fits_host(&host, c.port)?;
         c.connection = Some(ConnectionSpec::HttpPath {
-            host: required_str(host, "host")?,
+            host,
             http_path: required_str(http_path, "http_path")?,
         });
         Ok(())
     })
+}
+
+/// Set the connection port, folded into the workspace host at
+/// [`kernel_session_open`]. The rules are those of
+/// `ConnectionConfig::with_port`:
+///
+/// - `0` means unset (the default). The scheme default (`443` for `https`,
+///   `80` for `http`) is accepted and changes nothing.
+/// - Any other port is written into the host, so the kernel connects to it.
+///   The host must have no userinfo, no path, query or fragment, and no
+///   other port. If it already carries a port, that port wins, and the
+///   kernel logs a warning when the two differ.
+///
+/// Validation is eager. The port is checked against the host set so far, and
+/// each later [`kernel_session_config_set_warehouse`] or
+/// [`kernel_session_config_set_http_path`] call checks it against its own
+/// host. A bad combination returns `InvalidArgument` at that call, and the
+/// config is left unchanged. The `port` may be set before or after the host.
+/// Last call wins, and setting `0` clears a port.
+///
+/// # Safety
+/// `config` must be a live config handle.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_session_config_set_port(
+    config: *mut KernelSessionConfig,
+    port: u16,
+) -> KernelStatusCode {
+    set_on_config(config, |c| {
+        if let Some(spec) = &c.connection {
+            check_port_fits_host(spec_host(spec), port)?;
+        }
+        c.port = port;
+        Ok(())
+    })
+}
+
+/// Build the kernel [`ConnectionConfig`] from the C-side spec, then fold the
+/// connection port into its host (a no-op for port `0`). Runs at
+/// `kernel_session_open`, so the transport dials the folded host.
+fn connection_config(spec: ConnectionSpec, port: u16) -> Result<ConnectionConfig, Error> {
+    let connection = match spec {
+        ConnectionSpec::HostWarehouse { host, warehouse_id } => {
+            ConnectionConfig::new(host, warehouse_id)
+        }
+        ConnectionSpec::HttpPath { host, http_path } => {
+            ConnectionConfig::from_http_path(host, &http_path)?
+        }
+    };
+    connection.with_port(port)
+}
+
+/// The host a connection spec carries, before normalisation.
+fn spec_host(spec: &ConnectionSpec) -> &str {
+    match spec {
+        ConnectionSpec::HostWarehouse { host, .. } | ConnectionSpec::HttpPath { host, .. } => host,
+    }
+}
+
+/// Check that `port` can be folded into `host`, using the kernel's own
+/// normalisation and folding rules, without logging. The config-time checks
+/// run this; the open-time fold runs the full rules and logs.
+fn check_port_fits_host(host: &str, port: u16) -> Result<(), Error> {
+    let normalised = crate::config::normalise_host(host.to_owned());
+    crate::config::fold_host_port(&normalised, port).map(|_| ())
 }
 
 /// Set PAT (personal access token) authentication. Mutually exclusive
@@ -1644,6 +1719,7 @@ fn auth_spec_to_config(
 fn build_session(config: KernelSessionConfig) -> Result<Session, KernelStatusCode> {
     let KernelSessionConfig {
         connection,
+        port,
         auth,
         session_conf,
         geospatial_result_representation,
@@ -1679,14 +1755,7 @@ fn build_session(config: KernelSessionConfig) -> Result<Session, KernelStatusCod
                 )
             })?;
 
-            let connection = match connection {
-                ConnectionSpec::HostWarehouse { host, warehouse_id } => {
-                    ConnectionConfig::new(host, warehouse_id)
-                }
-                ConnectionSpec::HttpPath { host, http_path } => {
-                    ConnectionConfig::from_http_path(host, &http_path)?
-                }
-            };
+            let connection = connection_config(connection, port)?;
 
             let auth = auth_spec_to_config(
                 auth,
@@ -2138,6 +2207,106 @@ mod tests {
                 "expected mTLS identity parser error, got: {message}"
             );
         }
+    }
+
+    #[test]
+    fn port_is_checked_against_the_host_in_either_order() {
+        unsafe {
+            let mut config: *mut KernelSessionConfig = std::ptr::null_mut();
+            assert_eq!(
+                kernel_session_config_new(&mut config),
+                KernelStatusCode::Success
+            );
+            let wh = CString::new("wh123").unwrap();
+
+            // Port first: a host with credentials is rejected at set_warehouse,
+            // the spec is not stored, and the error does not echo the password.
+            assert_eq!(
+                kernel_session_config_set_port(config, 8443),
+                KernelStatusCode::Success
+            );
+            let creds = CString::new("https://user:s3cret@h").unwrap();
+            assert_eq!(
+                kernel_session_config_set_warehouse(config, creds.as_ptr(), wh.as_ptr()),
+                KernelStatusCode::InvalidArgument
+            );
+            assert!(config.as_ref().unwrap().connection.is_none());
+            let mut out = std::mem::MaybeUninit::<crate::c_abi::error::KernelError>::uninit();
+            assert!(crate::c_abi::error::kernel_get_last_error(out.as_mut_ptr()));
+            let error = out.assume_init();
+            let message = std::ffi::CStr::from_ptr(error.message).to_str().unwrap();
+            assert!(!message.contains("s3cret"), "password leaked: {message}");
+            assert!(message.contains("<redacted>@"), "not redacted: {message}");
+
+            // Port set, then a host with a path: rejected at set_http_path.
+            let path_host = CString::new("https://h/path").unwrap();
+            let http_path = CString::new("/sql/1.0/warehouses/abc").unwrap();
+            assert_eq!(
+                kernel_session_config_set_http_path(config, path_host.as_ptr(), http_path.as_ptr()),
+                KernelStatusCode::InvalidArgument
+            );
+            assert!(config.as_ref().unwrap().connection.is_none());
+            assert_eq!(config.as_ref().unwrap().port, 8443);
+
+            // Port cleared: the same host is now accepted, since 0 is a no-op.
+            assert_eq!(
+                kernel_session_config_set_port(config, 0),
+                KernelStatusCode::Success
+            );
+            assert_eq!(
+                kernel_session_config_set_http_path(config, path_host.as_ptr(), http_path.as_ptr()),
+                KernelStatusCode::Success
+            );
+            // Setting a port that the stored host cannot take is rejected at
+            // set_port, and the previous port (0) is kept.
+            assert_eq!(
+                kernel_session_config_set_port(config, 8443),
+                KernelStatusCode::InvalidArgument
+            );
+            assert_eq!(config.as_ref().unwrap().port, 0);
+
+            // The scheme default changes nothing, so it is accepted even for a
+            // host with credentials.
+            assert_eq!(
+                kernel_session_config_set_port(config, 443),
+                KernelStatusCode::Success
+            );
+            assert_eq!(
+                kernel_session_config_set_warehouse(config, creds.as_ptr(), wh.as_ptr()),
+                KernelStatusCode::Success
+            );
+            kernel_session_config_free(config);
+        }
+    }
+
+    #[test]
+    fn connection_config_folds_the_port_for_both_connection_forms() {
+        let http_path = ConnectionSpec::HttpPath {
+            host: "workspace.databricks.com".to_string(),
+            http_path: "/sql/1.0/warehouses/abc".to_string(),
+        };
+        assert_eq!(
+            connection_config(http_path, 8443).unwrap().host,
+            "https://workspace.databricks.com:8443"
+        );
+
+        let warehouse = ConnectionSpec::HostWarehouse {
+            host: "https://[2001:db8::1]".to_string(),
+            warehouse_id: "abc".to_string(),
+        };
+        assert_eq!(
+            connection_config(warehouse, 8443).unwrap().host,
+            "https://[2001:db8::1]:8443"
+        );
+
+        // Port 0 leaves the host exactly as the spec gave it.
+        let unset = ConnectionSpec::HostWarehouse {
+            host: "https://h".to_string(),
+            warehouse_id: "abc".to_string(),
+        };
+        let c = connection_config(unset, 0).unwrap();
+        assert_eq!(c.host, "https://h");
+        assert_eq!(c.applied_port, None);
     }
 
     #[test]

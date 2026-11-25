@@ -51,6 +51,7 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
+use std::net::Ipv6Addr;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -80,6 +81,12 @@ pub struct ConnectionConfig {
     /// parameter when constructing via
     /// [`ConnectionConfig::from_http_path`].
     pub org_id: Option<String>,
+
+    /// The effective port applied by [`ConnectionConfig::with_port`]: the
+    /// requested port, or the port already embedded in the host when that
+    /// one wins. `None` when no port was applied. Crate-internal; connection
+    /// telemetry reports it as `host_info.port`.
+    pub(crate) applied_port: Option<u16>,
 }
 
 impl ConnectionConfig {
@@ -97,6 +104,7 @@ impl ConnectionConfig {
             host: normalise_host(host.into()),
             warehouse_id: warehouse_id.into(),
             org_id: None,
+            applied_port: None,
         }
     }
 
@@ -127,8 +135,195 @@ impl ConnectionConfig {
             host: normalise_host(host.into()),
             warehouse_id,
             org_id: parse_org_id(http_path),
+            applied_port: None,
         })
     }
+
+    /// Fold a connection `port` into [`Self::host`], so the transport
+    /// connects to it.
+    ///
+    /// `port` `0` means unset and is a no-op. A `port` equal to the
+    /// scheme's default (443 for `https`, 80 for `http`) leaves the host
+    /// unchanged and validates nothing. Any other port is written into the
+    /// host as `scheme://authority:port`. A host that already carries a
+    /// port keeps it, and that port is what the connection uses. The
+    /// `Err(ErrorCode::InvalidArgument)` cases cover userinfo, an empty
+    /// host, a path, query or fragment, and an out-of-range embedded port.
+    /// Error text never includes credentials.
+    pub fn with_port(mut self, port: u16) -> crate::kernel_error::Result<Self> {
+        let host = host_with_port(&self.host, port)?;
+        self.applied_port = (port != 0).then(|| effective_port(&host));
+        self.host = host;
+        Ok(self)
+    }
+}
+
+/// Fold `port` into a normalised `host` (`http` or `https` scheme, as
+/// [`normalise_host`] produces). Rules, in order:
+///
+/// - `port == 0`, or `port` equal to the scheme's default (443 for `https`,
+///   80 for `http`): `host` is returned unchanged, with no validation.
+/// - Otherwise the scheme must be `http` or `https`, and no `@` (userinfo)
+///   may appear anywhere in `host`. The authority is the text after
+///   `scheme://`, up to the first `/`, `?` or `#`. It must be non-empty,
+///   and nothing (no path, query or fragment) may follow it.
+/// - An authority that already carries a port (`h:N` or `[v6]:N`) keeps it.
+///   `N` must be `1..=65535`. The host is returned unchanged, and a
+///   `tracing::warn!` names both ports when `N != port`.
+/// - Otherwise a bare IPv6 literal is bracketed and the result is
+///   `scheme://authority:port`.
+///
+/// Every error is `InvalidArgument`. Its text, and the warning, show the
+/// host through [`redact_host`], so credentials never appear in them.
+///
+/// This is the logging wrapper over [`fold_host_port`], which holds the
+/// rules; the config-time check in the C ABI calls `fold_host_port` directly
+/// so that it does not log a warning the open-time fold would log again.
+pub(crate) fn host_with_port(host: &str, port: u16) -> crate::kernel_error::Result<String> {
+    let (folded, conflicting_port) = fold_host_port(host, port)?;
+    if let Some(embedded_port) = conflicting_port {
+        tracing::warn!(
+            "connection port {port} ignored: host {} already sets port {embedded_port}, \
+             and the host's port is used",
+            redact_host(host)
+        );
+    }
+    Ok(folded)
+}
+
+/// The rules of [`host_with_port`], without logging. Returns the folded host,
+/// and the host's own port when it differs from `port` (the caller warns).
+pub(crate) fn fold_host_port(
+    host: &str,
+    port: u16,
+) -> crate::kernel_error::Result<(String, Option<u16>)> {
+    if port == 0 {
+        return Ok((host.to_owned(), None));
+    }
+    let (scheme, rest) = match host.split_once("://") {
+        Some((s, rest)) if s.eq_ignore_ascii_case("https") => ("https", rest),
+        Some((s, rest)) if s.eq_ignore_ascii_case("http") => ("http", rest),
+        _ => {
+            return Err(invalid_port(
+                host,
+                port,
+                "the host must use an http or https scheme",
+            ))
+        }
+    };
+    let default_port = if scheme == "https" { 443 } else { 80 };
+    if port == default_port {
+        return Ok((host.to_owned(), None));
+    }
+    // Checked before the authority split: a password may contain `/`, `?`
+    // or `#`, which would otherwise be read as the end of the authority.
+    if host.contains('@') {
+        return Err(invalid_port(
+            host,
+            port,
+            "credentials (userinfo) cannot be combined with a port",
+        ));
+    }
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(authority_end);
+    if authority.is_empty() {
+        return Err(invalid_port(host, port, "a port needs a host"));
+    }
+    if !tail.is_empty() {
+        return Err(invalid_port(
+            host,
+            port,
+            "a port cannot be combined with a host that has a path, query or fragment",
+        ));
+    }
+    let Some((bare_host, embedded)) = split_authority(authority) else {
+        return Err(invalid_port(
+            host,
+            port,
+            "the host has a malformed port or IPv6 literal",
+        ));
+    };
+    if bare_host.is_empty() {
+        return Err(invalid_port(host, port, "a port needs a host"));
+    }
+    match embedded {
+        Some(text) => {
+            let embedded_port = parse_embedded_port(text).ok_or_else(|| {
+                invalid_port(host, port, "the port in the host must be 1 to 65535")
+            })?;
+            let conflicting = (embedded_port != port).then_some(embedded_port);
+            Ok((format!("{scheme}://{authority}"), conflicting))
+        }
+        None => Ok((format!("{scheme}://{bare_host}:{port}"), None)),
+    }
+}
+
+/// Split an authority into its host part and any embedded port text.
+/// A bare IPv6 literal (which parses as [`Ipv6Addr`]) is returned bracketed
+/// and carries no port. `None` means malformed: an unclosed or empty
+/// bracket, junk after `]`, or several colons that are not an IPv6 literal.
+fn split_authority(authority: &str) -> Option<(String, Option<&str>)> {
+    if let Some(after_open) = authority.strip_prefix('[') {
+        let (inner, after) = after_open.split_once(']')?;
+        if inner.is_empty() {
+            return None;
+        }
+        let bracketed = format!("[{inner}]");
+        return match after {
+            "" => Some((bracketed, None)),
+            _ => Some((bracketed, Some(after.strip_prefix(':')?))),
+        };
+    }
+    if authority.parse::<Ipv6Addr>().is_ok() {
+        return Some((format!("[{authority}]"), None));
+    }
+    match authority.rsplit_once(':') {
+        Some((h, p)) if !h.contains(':') => Some((h.to_owned(), Some(p))),
+        Some(_) => None,
+        None => Some((authority.to_owned(), None)),
+    }
+}
+
+/// Parse an embedded port written as decimal digits only (no sign, no
+/// whitespace). Returns `None` unless the value is `1..=65535`.
+fn parse_embedded_port(text: &str) -> Option<u16> {
+    if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    text.parse::<u16>().ok().filter(|&p| p != 0)
+}
+
+/// Effective port of a host that [`host_with_port`] has accepted: the port
+/// in its authority, or the scheme's default when there is none.
+fn effective_port(host: &str) -> u16 {
+    let (scheme, rest) = host.split_once("://").unwrap_or(("https", host));
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    let embedded = split_authority(authority).and_then(|(_, p)| p.and_then(parse_embedded_port));
+    embedded.unwrap_or(if scheme.eq_ignore_ascii_case("http") {
+        80
+    } else {
+        443
+    })
+}
+
+/// Redact credentials for error and log text: everything up to the last
+/// `@` becomes `<redacted>`, so `user:p/w@h` shows as `<redacted>@h`.
+/// Splitting at the last `@` (not parsing an authority) is deliberate,
+/// because a password may contain `/`, `?` or `#`.
+fn redact_host(host: &str) -> String {
+    match host.rfind('@') {
+        Some(at) => format!("<redacted>{}", &host[at..]),
+        None => host.to_owned(),
+    }
+}
+
+/// Build the `InvalidArgument` error for a rejected port, with the host
+/// redacted.
+fn invalid_port(host: &str, port: u16, reason: &str) -> crate::kernel_error::Error {
+    crate::kernel_error::Error::invalid_argument().message(format!(
+        "cannot apply connection port {port} to host {}: {reason}",
+        redact_host(host)
+    ))
 }
 
 /// Normalise a workspace host: prepend `https://` if no scheme is
@@ -136,7 +331,7 @@ impl ConnectionConfig {
 /// and strip any trailing `/`. Other explicit schemes are preserved so
 /// later configuration validation can reject them rather than disguising
 /// them as part of an HTTPS host.
-fn normalise_host(host: String) -> String {
+pub(crate) fn normalise_host(host: String) -> String {
     let with_scheme = match host.split_once("://") {
         Some((scheme, rest)) if scheme.eq_ignore_ascii_case("http") => {
             format!("http://{rest}")
@@ -2116,6 +2311,224 @@ mod tests {
         )
         .expect("parse");
         assert_eq!(c.host, "https://workspace.databricks.com");
+    }
+
+    // ─── Connection port folding ───────────────────────────────────
+
+    use crate::kernel_error::ErrorCode;
+
+    #[test]
+    fn host_with_port_accepts_and_folds() {
+        let cases: &[(&str, u16, &str)] = &[
+            // No port, or port 0: unchanged.
+            ("https://h", 0, "https://h"),
+            ("http://h:8080", 0, "http://h:8080"),
+            // The scheme default is unchanged, with no validation at all.
+            ("https://h", 443, "https://h"),
+            ("http://h", 80, "http://h"),
+            ("https://user:pw@h", 443, "https://user:pw@h"),
+            ("https://h/path?q#f", 443, "https://h/path?q#f"),
+            // A custom port folds in.
+            ("https://h", 8443, "https://h:8443"),
+            (
+                "https://workspace.databricks.com",
+                8443,
+                "https://workspace.databricks.com:8443",
+            ),
+            // Over http, 443 is not the default, so it folds; 80 is a no-op.
+            ("http://h", 443, "http://h:443"),
+            ("http://h", 8080, "http://h:8080"),
+            ("https://h", 80, "https://h:80"),
+            // IPv4.
+            ("https://10.0.0.1", 8443, "https://10.0.0.1:8443"),
+            ("http://127.0.0.1", 8080, "http://127.0.0.1:8080"),
+            // Bare IPv6 is bracketed; bracketed IPv6 is kept.
+            ("https://2001:db8::1", 8443, "https://[2001:db8::1]:8443"),
+            ("https://::1", 8443, "https://[::1]:8443"),
+            ("https://[2001:db8::1]", 8443, "https://[2001:db8::1]:8443"),
+            // Embedded port equal to the requested one: unchanged.
+            ("https://h:8443", 8443, "https://h:8443"),
+            // Embedded port differs: the host's port wins (and a warning is logged).
+            ("https://h:9000", 8443, "https://h:9000"),
+            ("https://h:443", 8443, "https://h:443"),
+            (
+                "https://[2001:db8::1]:9000",
+                8443,
+                "https://[2001:db8::1]:9000",
+            ),
+        ];
+        for &(host, port, want) in cases {
+            assert_eq!(
+                host_with_port(host, port).unwrap(),
+                want,
+                "host={host} port={port}"
+            );
+        }
+    }
+
+    #[test]
+    fn host_with_port_rejects_bad_combinations() {
+        let cases: &[(&str, u16)] = &[
+            // Empty host.
+            ("https://", 8443),
+            ("http://", 8080),
+            ("https://:8443", 8443),
+            // Path, query or fragment after the authority.
+            ("https://h/path", 8443),
+            ("https://h/", 8443),
+            ("https://h?x=1", 8443),
+            ("https://h#frag", 8443),
+            // Userinfo anywhere in the host.
+            ("https://user@h", 8443),
+            ("https://user:pw@h", 8443),
+            ("https://user:s3cret/pw@h", 8443),
+            ("https://user:s3cret?pw@h", 8443),
+            ("https://user:s3cret#pw@h", 8443),
+            // Embedded port out of range, or not digits.
+            ("https://h:0", 8443),
+            ("https://h:65536", 8443),
+            ("https://h:99999", 8443),
+            ("https://h:abc", 8443),
+            ("https://h:", 8443),
+            ("https://h:+80", 8443),
+            ("https://[2001:db8::1]:0", 8443),
+            // Malformed bracket or IPv6 forms.
+            ("https://[::1", 8443),
+            ("https://[]:8443", 8443),
+            ("https://[::1]x", 8443),
+            ("https://a:b:c", 8443),
+            // Scheme other than http(s), or no scheme.
+            ("ftp://h", 8443),
+            ("h", 8443),
+        ];
+        for &(host, port) in cases {
+            let err = host_with_port(host, port).unwrap_err();
+            assert_eq!(err.code, ErrorCode::InvalidArgument, "host={host}");
+        }
+    }
+
+    #[test]
+    fn host_with_port_error_text_never_has_credentials() {
+        for host in [
+            "https://user:s3cret@h",
+            "https://user:s3cret/pw@h",
+            "https://user:s3cret?pw@h",
+            "https://user:s3cret#pw@h",
+            "https://s3cret@h:99999",
+        ] {
+            let err = host_with_port(host, 8443).unwrap_err();
+            assert_eq!(err.code, ErrorCode::InvalidArgument, "host={host}");
+            assert!(!err.message.contains("s3cret"), "leaked: {}", err.message);
+            assert!(!err.message.contains("pw"), "leaked: {}", err.message);
+            assert!(
+                err.message.contains("<redacted>@"),
+                "not redacted: {}",
+                err.message
+            );
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct CapturedLogs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Run `f` under a thread-local WARN-level subscriber and return its
+    /// result with everything logged meanwhile.
+    fn capture_warnings<T>(f: impl FnOnce() -> T) -> (T, String) {
+        let sink = CapturedLogs::default();
+        let writer = sink.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        let out = tracing::subscriber::with_default(subscriber, f);
+        let logged = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+        (out, logged)
+    }
+
+    #[test]
+    fn host_with_port_warns_once_when_embedded_port_differs() {
+        let (result, logged) = capture_warnings(|| host_with_port("https://h:9000", 8443));
+        assert_eq!(result.unwrap(), "https://h:9000");
+        assert_eq!(logged.matches("connection port").count(), 1, "{logged}");
+        assert!(
+            logged.contains("8443") && logged.contains("9000"),
+            "{logged}"
+        );
+    }
+
+    #[test]
+    fn host_with_port_is_silent_when_embedded_port_matches() {
+        let (result, logged) = capture_warnings(|| host_with_port("https://h:8443", 8443));
+        assert_eq!(result.unwrap(), "https://h:8443");
+        assert!(logged.is_empty(), "unexpected log: {logged}");
+    }
+
+    #[test]
+    fn with_port_folds_and_records_effective_port() {
+        let c = ConnectionConfig::new("workspace.databricks.com", "abc")
+            .with_port(8443)
+            .expect("fold");
+        assert_eq!(c.host, "https://workspace.databricks.com:8443");
+        assert_eq!(c.applied_port, Some(8443));
+    }
+
+    #[test]
+    fn with_port_zero_is_a_noop() {
+        let c = ConnectionConfig::new("https://h", "abc")
+            .with_port(0)
+            .expect("noop");
+        assert_eq!(c.host, "https://h");
+        assert_eq!(c.applied_port, None);
+    }
+
+    #[test]
+    fn with_port_default_port_records_it_without_folding() {
+        let c = ConnectionConfig::new("https://h", "abc")
+            .with_port(443)
+            .expect("noop");
+        assert_eq!(c.host, "https://h");
+        assert_eq!(c.applied_port, Some(443));
+    }
+
+    #[test]
+    fn with_port_records_the_embedded_port_that_wins() {
+        let c = ConnectionConfig::new("https://[2001:db8::1]:9000", "abc")
+            .with_port(8443)
+            .expect("keep host port");
+        assert_eq!(c.host, "https://[2001:db8::1]:9000");
+        assert_eq!(c.applied_port, Some(9000));
+    }
+
+    #[test]
+    fn with_port_rejects_credentials_without_leaking_them() {
+        let err = ConnectionConfig::new("https://user:s3cret@h", "abc")
+            .with_port(8443)
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgument);
+        assert!(!err.message.contains("s3cret"), "leaked: {}", err.message);
+    }
+
+    #[test]
+    fn with_port_applies_after_from_http_path() {
+        let c = ConnectionConfig::from_http_path("h", "/sql/1.0/warehouses/abc123?o=42")
+            .expect("parse")
+            .with_port(8443)
+            .expect("fold");
+        assert_eq!(c.host, "https://h:8443");
+        assert_eq!(c.warehouse_id, "abc123");
+        assert_eq!(c.org_id, Some("42".to_string()));
     }
 
     // ─── AuthConfig Debug redaction ────────────────────────────────
