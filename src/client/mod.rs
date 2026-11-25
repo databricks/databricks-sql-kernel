@@ -32,6 +32,7 @@
 //! [`sea`]: self::sea
 
 pub mod http;
+mod pool;
 pub mod retry;
 pub mod sea;
 pub(crate) mod transport;

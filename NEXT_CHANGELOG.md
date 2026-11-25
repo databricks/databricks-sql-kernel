@@ -13,6 +13,8 @@ changes go in their respective binding's NEXT_CHANGELOG.
 
 ### Changed
 
+- Sessions reuse matching idle HTTP clients by default while keeping exclusive pools and independent idle-socket limits; the Rust-only `HttpConfig::reuse_client_across_sessions = false` opt-out preserves keep-alive within a session and currently has no corresponding Node.js, Python, C ABI or ADBC option. After the last HTTP wrapper drops, reuse retains idle sockets and TLS/proxy configuration for up to about 105 seconds while the runtime is driven (otherwise until the next cache access/shutdown), and a new session's system-trust snapshot can be up to 300 seconds old.
+
 ### Updated
 
 ### Fixed

@@ -193,7 +193,8 @@ async fn assert_certificate_failure(failure: CertificateFailure) {
                 )
                 .resolve("expected-host.invalid", address)
                 .build()
-                .unwrap();
+                .unwrap()
+                .into();
             format!("https://expected-host.invalid:{}", address.port())
         } else {
             format!("https://{address}")
@@ -395,7 +396,8 @@ async fn dns_failure_preserves_retryable_flag_without_http_retry() {
                 .no_proxy()
                 .dns_resolver(resolver.clone())
                 .build()
-                .unwrap();
+                .unwrap()
+                .into();
             let request = client
                 .inner()
                 .get("http://missing.invalid/")
@@ -472,7 +474,8 @@ async fn cloudfetch_recovers_after_dns_failure() {
             .no_proxy()
             .dns_resolver(resolver.clone())
             .build()
-            .unwrap();
+            .unwrap()
+            .into();
         let url = format!(
             "http://storage.invalid:{}/chunk.arrow",
             server.address().port()

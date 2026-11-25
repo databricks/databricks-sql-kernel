@@ -15,6 +15,8 @@ changes go in the root `NEXT_CHANGELOG.md`.
 
 ### Changed
 
+- Kernel sessions reuse idle HTTP clients by default, retaining sockets and TLS/proxy configuration for about 105 seconds after the last HTTP wrapper drops while the runtime is driven (otherwise until the next cache access/shutdown); a new session's system-trust snapshot can be up to 300 seconds old. The keep-alive-preserving opt-out, `HttpConfig::reuse_client_across_sessions = false`, is currently a kernel Rust setting with no Python option.
+
 ### Updated
 
 ### Fixed
