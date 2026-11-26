@@ -694,7 +694,10 @@ KernelStatusCode kernel_statement_set_sql(kernel_statement_t* stmt, const char* 
  * The caller selects eligible SQL; the server validates the parameter sets.
  * Scalar bindings and batch sets cannot be submitted together.
  * kernel_statement_set_sql clears all snapshots. Execute retains them.
- * num_modified_rows reports the aggregate affected count, or -1 if unavailable. */
+ * num_modified_rows reports the aggregate affected count, or -1 if unavailable.
+ *
+ * Count-reader errors are non-retryable because the batch may already have
+ * committed. */
 KernelStatusCode kernel_statement_add_parameter_set(kernel_statement_t* stmt);
 
 /* Typed positional parameter binding (1-based ordinal); the kernel infers the

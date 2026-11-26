@@ -254,6 +254,9 @@ impl StatementSpec {
     /// the scalar bindings. Execute sends all sets in one request. The caller
     /// selects eligible SQL; the server validates completeness and consistency.
     /// Scalar bindings left after the last snapshot are rejected at execution.
+    ///
+    /// Count-reader errors are non-retryable because the batch may already have
+    /// committed.
     pub fn add_parameter_set(&mut self) -> &mut Self {
         self.parameter_sets.push(BoundParameterSet {
             positional: std::mem::take(&mut self.positional_params),
