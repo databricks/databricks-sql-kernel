@@ -28,6 +28,76 @@ use databricks_sql_kernel::{
 };
 use std::env;
 
+#[tokio::test]
+#[ignore]
+async fn drained_async_close_releases_owner_and_server_statement() {
+    use databricks_sql_kernel::ErrorCode;
+    use std::time::Duration;
+
+    let observer = live_session().await;
+    for partial in [false, true] {
+        for _ in 0..3 {
+            let session = live_session().await;
+            let mut statement = session.statement();
+            statement
+                .spec()
+                .sql("SELECT id, IF(id % 2 = 0, NULL, id) FROM range(31) ORDER BY id")
+                .row_limit(Some(7));
+            let mut owner = statement.submit().await.expect("submit");
+            let statement_id = owner.statement_id().to_owned();
+            let reader = owner.reader().expect("reader");
+            let mut stream = owner.await_result().await.expect("await_result");
+            let mut values = Vec::new();
+            while stream.next_batch().await.expect("batch").is_some() {
+                while let Some(row) = stream.next_row_in_batch() {
+                    values.push((row.get_i64(0).unwrap(), row.get_i64(1).unwrap()));
+                }
+                if partial {
+                    break;
+                }
+            }
+            assert_eq!(
+                values,
+                (0..7)
+                    .map(|value| (Some(value), (value % 2 != 0).then_some(value)))
+                    .collect::<Vec<_>>()
+            );
+            databricks_sql_kernel::ExecutedAsyncStatement::close(&mut owner)
+                .await
+                .expect("close");
+            assert_eq!(
+                reader.status().await.unwrap_err().code,
+                ErrorCode::InvalidStatementHandle
+            );
+            drop(stream);
+            drop(reader);
+            drop(owner);
+            drop(statement);
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    match observer.attach_async_statement(&statement_id).await {
+                        Ok(attached) => match attached.status().await {
+                            Ok(StatementStatus::Closed) => break,
+                            Err(error) if error.code == ErrorCode::NotFound => break,
+                            Ok(status) => {
+                                assert!(matches!(status, StatementStatus::Succeeded));
+                                tokio::time::sleep(Duration::from_millis(50)).await;
+                            }
+                            Err(error) => panic!("status after close: {error}"),
+                        },
+                        Err(error) if error.code == ErrorCode::NotFound => break,
+                        Err(error) => panic!("attach after close: {error}"),
+                    }
+                }
+            })
+            .await
+            .expect("server statement must be closed");
+            session.close().await.expect("session close");
+        }
+    }
+    observer.close().await.expect("observer close");
+}
+
 fn env_var(key: &str) -> Option<String> {
     env::var(key).ok().filter(|v| !v.is_empty())
 }

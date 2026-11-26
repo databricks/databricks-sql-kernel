@@ -954,7 +954,10 @@ KernelStatusCode kernel_executed_async_statement_canceller_free(
     kernel_executed_async_statement_canceller_t* canceller);
 
 /* Close the server operation and consume the async handle. The handle is
- * consumed even when close returns an error. */
+ * consumed even when close returns an error. Once any result stream of this
+ * execution reaches successful EOF, cleanup runs in the background, even if
+ * another stream is unread or partly read. Background cleanup errors are not
+ * returned and do not trigger a Drop retry. */
 KernelStatusCode kernel_executed_async_statement_close(
     kernel_executed_async_statement_t* exec);
 

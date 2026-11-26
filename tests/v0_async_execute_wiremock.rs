@@ -1565,11 +1565,11 @@ async fn async_readers_preserve_session_routes() {
             .expect(1..)
             .mount(&server)
             .await;
-        Mock::given(method("DELETE"))
+        let close_mock = Mock::given(method("DELETE"))
             .and(path(format!("{session_prefix}/statements/stmt-result")))
             .respond_with(ResponseTemplate::new(200))
             .expect(1)
-            .mount(&server)
+            .mount_as_scoped(&server)
             .await;
         Mock::given(method("DELETE"))
             .and(path(if realtime {
@@ -1614,6 +1614,12 @@ async fn async_readers_preserve_session_routes() {
         drop(reader);
         drop(refetch);
         owned.close().await.expect("owned close");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            close_mock.wait_until_satisfied(),
+        )
+        .await
+        .expect("detached close must reach the server");
         session.close().await.expect("session close");
         server.verify().await;
     }
@@ -2430,4 +2436,187 @@ async fn owner_close_discards_cached_and_late_terminal_responses() {
             .count(),
         1
     );
+}
+
+#[tokio::test]
+async fn drained_async_close_detaches_once_and_invalidates_readers() {
+    use databricks_sql_kernel::TryNextBatch;
+    use std::time::Duration;
+
+    for mode in [
+        "next",
+        "try",
+        "owned",
+        "empty",
+        "fetch",
+        "reader",
+        "partial-owner",
+        "refetch",
+    ] {
+        let server = MockServer::start().await;
+        mount_create_session(&server).await;
+        mount_delete_session(&server).await;
+        mount_submit(&server, pending_body("stmt-drained")).await;
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, true)])),
+            vec![Arc::new(Int64Array::from(if mode == "empty" {
+                vec![]
+            } else {
+                vec![Some(71), None, Some(-19)]
+            }))],
+        )
+        .unwrap();
+        let mut response: serde_json::Value =
+            serde_json::from_str(&succeeded_inline_body("stmt-drained", &batch)).unwrap();
+        if mode == "empty" {
+            response["manifest"]["total_chunk_count"] = json!(0);
+        }
+        Mock::given(method("GET"))
+            .and(path("/api/2.0/sql/statements/stmt-drained"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(response))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/api/2.0/sql/statements/stmt-drained"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(1)))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let session = open_session(&server).await;
+        let mut statement = session.statement();
+        statement.spec().sql("SELECT n");
+        let mut owner = statement.submit().await.unwrap();
+        let reader = owner.reader().unwrap();
+        let mut partial_owner = if mode == "partial-owner" {
+            let mut stream = owner.await_result().await.unwrap();
+            assert!(stream.next_batch().await.unwrap().is_some());
+            assert_eq!(
+                stream.next_row_in_batch().unwrap().get_i64(0).unwrap(),
+                Some(71)
+            );
+            Some(stream)
+        } else {
+            None
+        };
+        let mut stream = if matches!(mode, "reader" | "partial-owner") {
+            reader.fetch_result().await.unwrap()
+        } else if mode == "fetch" {
+            owner.fetch_result().await.unwrap()
+        } else {
+            owner.await_result().await.unwrap()
+        };
+        let mut batches = Vec::new();
+        match mode {
+            "try" => loop {
+                match stream.try_next_batch().unwrap() {
+                    TryNextBatch::Ready(ResultBatch::Arrow(batch)) => batches.push(batch.clone()),
+                    TryNextBatch::Pending => tokio::task::yield_now().await,
+                    TryNextBatch::End => break,
+                    _ => panic!("unexpected batch"),
+                }
+            },
+            "owned" => {
+                batches = stream
+                    .into_owned_batches()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap()
+            }
+            _ => batches = drain(&mut stream).await,
+        }
+        if mode == "empty" {
+            assert!(batches.is_empty());
+        } else {
+            assert_eq!(batches.len(), 1, "{mode}");
+            assert_eq!(batches[0].columns(), batch.columns(), "{mode}");
+        }
+        if mode == "refetch" {
+            partial_owner = Some(owner.fetch_result().await.unwrap());
+        }
+        assert!(matches!(
+            reader.status().await.unwrap(),
+            StatementStatus::Succeeded
+        ));
+        tokio::time::timeout(
+            Duration::from_millis(150),
+            databricks_sql_kernel::ExecutedAsyncStatement::close(&mut owner),
+        )
+        .await
+        .expect("drained close must not await the one-second DELETE")
+        .unwrap();
+        assert_eq!(
+            reader.status().await.unwrap_err().code,
+            ErrorCode::InvalidStatementHandle
+        );
+        assert_eq!(
+            owner.reader().err().unwrap().code,
+            ErrorCode::InvalidStatementHandle
+        );
+        databricks_sql_kernel::ExecutedAsyncStatement::close(&mut owner)
+            .await
+            .unwrap();
+        drop(partial_owner);
+        drop(owner);
+        drop(statement);
+        assert_eq!(
+            wait_for_close_delete(&server, "stmt-drained", 1, Duration::from_secs(2)).await,
+            1
+        );
+        session.close().await.unwrap();
+        server.verify().await;
+    }
+}
+
+#[tokio::test]
+async fn partial_async_close_still_awaits() {
+    use std::time::Duration;
+
+    for read_batch in [false, true] {
+        let server = MockServer::start().await;
+        mount_create_session(&server).await;
+        mount_delete_session(&server).await;
+        mount_submit(&server, pending_body("stmt-partial")).await;
+        let batch = int64_batch("n", vec![31, 47]);
+        Mock::given(method("GET"))
+            .and(path("/api/2.0/sql/statements/stmt-partial"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(succeeded_inline_body("stmt-partial", &batch)),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/api/2.0/sql/statements/stmt-partial"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(400)))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let session = open_session(&server).await;
+        let mut statement = session.statement();
+        statement.spec().sql("SELECT n");
+        let mut owner = statement.submit().await.unwrap();
+        let mut stream = owner.await_result().await.unwrap();
+        if read_batch {
+            assert!(stream.next_batch().await.unwrap().is_some());
+        }
+        let reader = owner.reader().unwrap();
+        let mut closing = Box::pin(databricks_sql_kernel::ExecutedAsyncStatement::close(
+            &mut owner,
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut closing)
+                .await
+                .is_err(),
+            "partial close must still await its DELETE"
+        );
+        assert_eq!(
+            reader.status().await.unwrap_err().code,
+            ErrorCode::InvalidStatementHandle
+        );
+        closing.await.unwrap();
+        drop(stream);
+        drop(owner);
+        drop(statement);
+        session.close().await.unwrap();
+        server.verify().await;
+    }
 }

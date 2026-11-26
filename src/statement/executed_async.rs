@@ -46,7 +46,7 @@
 
 use crate::client::{ExecuteResponse, ExecutionTimeout, SessionAttribution};
 use crate::kernel_error::{Error, Result};
-use crate::klog::warn;
+use crate::klog::{debug, warn};
 use crate::result_stream::ResultStream;
 use crate::session::SessionInner;
 use crate::statement::handle::ExecutedStatementHandle;
@@ -178,9 +178,8 @@ pub struct ExecutedAsyncStatement {
     /// when the parent `Statement` is dropped. Reads short-circuit
     /// stale calls locally with no network round-trip.
     valid: ValidityFlag,
-    /// Flips to `true` after the first successful (or
-    /// short-circuited) `close()`. Tells `Drop` to skip its
-    /// fire-and-forget cleanup.
+    /// True after successful awaited close, server auto-close, or dispatch of
+    /// background cleanup. Background failures are not returned or retried by Drop.
     closed: Arc<AtomicBool>,
     /// Server auto-close can retain results, so owner release has a separate flag.
     owner_released: Arc<AtomicBool>,
@@ -227,6 +226,7 @@ pub struct ExecutedAsyncStatement {
     /// Set once result materialisation hands success finalization to
     /// the returned `ResultStream`.
     result_stream_owns_success_telemetry: AtomicBool,
+    result_drained: Arc<AtomicBool>,
     /// Absolute execution deadline retained across caller-driven polls.
     client_deadline: Option<std::time::Instant>,
     /// When `true`, the caller explicitly disabled the client timeout
@@ -337,6 +337,7 @@ impl ExecutedAsyncStatement {
             pending_result: std::sync::Mutex::new(None),
             statement_telemetry,
             result_stream_owns_success_telemetry: AtomicBool::new(false),
+            result_drained: Arc::new(AtomicBool::new(false)),
             client_deadline,
             poll_timeout_disabled,
             client_timeout_expired: AtomicBool::new(false),
@@ -371,6 +372,7 @@ impl ExecutedAsyncStatement {
             statement_id,
             ValidityFlag::new(),
             Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
             SessionAttribution::Detached,
             initial_status,
         )
@@ -381,6 +383,7 @@ impl ExecutedAsyncStatement {
         statement_id: String,
         valid: ValidityFlag,
         owner_released: Arc<AtomicBool>,
+        result_drained: Arc<AtomicBool>,
         session_attribution: SessionAttribution,
         initial_status: crate::types::sea::StatementStatus,
     ) -> Self {
@@ -397,6 +400,7 @@ impl ExecutedAsyncStatement {
             pending_result: std::sync::Mutex::new(None),
             statement_telemetry: StatementTelemetry::noop(),
             result_stream_owns_success_telemetry: AtomicBool::new(false),
+            result_drained,
             client_deadline: None,
             poll_timeout_disabled: false,
             client_timeout_expired: AtomicBool::new(false),
@@ -419,6 +423,7 @@ impl ExecutedAsyncStatement {
                 self.statement_id.clone(),
                 self.valid.clone(),
                 Arc::clone(&self.owner_released),
+                Arc::clone(&self.result_drained),
                 self.session_attribution,
                 status,
             ),
@@ -942,6 +947,7 @@ impl ExecutedAsyncStatement {
                 }
                 let mut stream = ResultStream::from_reader(result.reader).await?;
                 stream.attach_telemetry(self.statement_telemetry.clone());
+                stream.attach_drain_signal(Arc::clone(&self.result_drained));
                 // SEA carries no row count on the async status either; for a
                 // DML the count rides in the result set. Derive it once
                 // (non-consuming) and record it onto the latest status so
@@ -1109,6 +1115,12 @@ impl ExecutedAsyncStatement {
     /// async statement is the binding-visible lifecycle boundary, though, so finalize
     /// here as a deterministic backstop for partial-fetch callers that keep the stream
     /// alive past session close.
+    ///
+    /// Once any result stream of this execution reaches successful EOF, server
+    /// cleanup runs in the background, even if another stream is unread or partly
+    /// read. Ownership is released before returning; cleanup errors are not returned
+    /// and do not trigger a Drop retry. Without a successful drain, close awaits
+    /// cleanup. Background cleanup is best-effort if the runtime shuts down.
     pub async fn close(&mut self) -> Result<()> {
         self.statement_telemetry.finalize(None);
         self.close_server_statement().await
@@ -1119,27 +1131,13 @@ impl ExecutedAsyncStatement {
             self.owner_released.store(true, Ordering::Release);
             self.clear_pending_result();
         }
-        // Idempotent on success: a prior successful close sets
-        // `closed=true` and subsequent calls short-circuit.
-        //
-        // On wire failure we deliberately keep `closed=false` so that
-        // `Drop`'s fire-and-forget retry path runs as a fallback —
-        // otherwise a transient close failure would silently leak the
-        // server-side statement until session expiry. Mirrors
-        // `Session::close` and the sibling `ExecutedStatement::close`.
-        //
-        // The `&self` signature allows two callers to race and both
-        // hit the wire. The server-side close is idempotent (it
-        // returns the same Ok for duplicate close_statement calls),
-        // so the only cost of the race is one redundant RPC — far
-        // better than dropping the retry contract.
-        //
-        // Note: today's SEA transport at `src/client/sea.rs::
-        // close_statement` swallows wire errors and always returns
-        // `Ok(())`, so the retry-on-failure branch is reachable only
-        // once the transport is changed to surface real errors. The
-        // load-then-store-on-success shape is the forward-prep for
-        // that change.
+        if self.result_drained.load(Ordering::Acquire) {
+            self.spawn_close_if_open(true);
+            return Ok(());
+        }
+        // Awaited closes report wire errors and leave closed=false for Drop's
+        // fallback. Drained closes above mark cleanup dispatched before returning
+        // and neither report background failures nor retry them on Drop.
         async {
             if self.closed.load(Ordering::Acquire) {
                 return Ok(());
@@ -1177,6 +1175,45 @@ impl ExecutedAsyncStatement {
             // canceller.
             owning: self.owning,
         }
+    }
+
+    fn spawn_close_if_open(&self, drained_close: bool) {
+        if self.closed.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let transport = Arc::clone(self.session.transport());
+        let runtime = self.session.runtime_handle().clone();
+        let stmt_id = self.statement_id.clone();
+        let session_closed = self.session.closed_flag();
+        runtime.spawn(
+            async move {
+                if drained_close {
+                    if let Err(error) = transport.close_statement_in_background(&stmt_id).await {
+                        if session_closed.load(Ordering::Acquire) {
+                            debug!(
+                                statement_id = %stmt_id,
+                                error = %error,
+                                "background close_statement after drained async close failed after session closure"
+                            );
+                        } else {
+                            warn!(
+                                statement_id = %stmt_id,
+                                error = %error,
+                                "background close_statement after drained async close failed; no Drop retry will run"
+                            );
+                        }
+                    }
+                } else if let Err(e) = transport.close_statement(&stmt_id).await {
+                    warn!(
+                        statement_id = %stmt_id,
+                        error = %e,
+                        "fire-and-forget close_statement on ExecutedAsyncStatement::Drop failed; \
+                         server-side resource reclaimed when the session closes"
+                    );
+                }
+            }
+            .instrument(self.session.log_span().clone()),
+        );
     }
 }
 
@@ -1260,26 +1297,7 @@ impl Drop for ExecutedAsyncStatement {
         // parent `Statement::last_closed` — reflects that Drop is now
         // handling cleanup, preventing a duplicate `CloseStatement`
         // from `invalidate_prior` on the next `execute()` / `submit()`.
-        if self.closed.swap(true, Ordering::AcqRel) {
-            return;
-        }
-        // Fire-and-forget close on the session's runtime — mirrors
-        // ExecutedStatement::Drop. Errors are swallowed by design;
-        // Drop must not panic and the server reclaims the statement
-        // when the session closes anyway.
-        let transport = Arc::clone(self.session.transport());
-        let runtime = self.session.runtime_handle().clone();
-        let stmt_id = self.statement_id.clone();
-        runtime.spawn(async move {
-            if let Err(e) = transport.close_statement(&stmt_id).await {
-                warn!(
-                    statement_id = %stmt_id,
-                    error = %e,
-                    "fire-and-forget close_statement on ExecutedAsyncStatement::Drop failed; \
-                     server-side resource reclaimed when the session closes"
-                );
-            }
-        });
+        self.spawn_close_if_open(false);
     }
 }
 
