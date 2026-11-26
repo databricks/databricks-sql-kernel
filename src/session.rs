@@ -79,6 +79,16 @@ use tracing::{info_span, Instrument, Span};
 
 const TELEMETRY_ENABLED_FEATURE_FLAG: &str =
     "databricks.partnerplatform.clientConfigsFeatureFlags.enableTelemetryForKernel";
+const CLOUDFETCH_DOWNLOAD_AHEAD_FEATURE_FLAG: &str =
+    "databricks.partnerplatform.clientConfigsFeatureFlags.cloudFetchDownloadAheadForKernel";
+
+fn cloudfetch_download_ahead(result: &ResultConfig, feature_flag: Option<i32>) -> usize {
+    result
+        .cloudfetch_download_ahead
+        .or_else(|| feature_flag.and_then(|lead| usize::try_from(lead).ok()))
+        .unwrap_or(0)
+        .min(16)
+}
 
 fn telemetry_enabled(config: &TelemetryConfig, feature_flag: Option<bool>) -> bool {
     config.enabled.or(feature_flag).unwrap_or(false)
@@ -399,10 +409,29 @@ impl Session {
             warehouse_id.clone(),
             transport_config,
         ));
+        let feature_flags = config
+            .driver_system_configuration
+            .as_ref()
+            .and_then(ClientIdentity::from_driver_system_configuration)
+            .map(|identity| FeatureFlagResolver::new(&host, Arc::clone(&http_client), identity));
+        if let Some(feature_flags) = &feature_flags {
+            feature_flags.prepare_for_session_open().await;
+        }
+        let download_ahead_flag = match &feature_flags {
+            Some(flags) if config.result.cloudfetch_download_ahead.is_none() => {
+                flags
+                    .get_int32(CLOUDFETCH_DOWNLOAD_AHEAD_FEATURE_FLAG)
+                    .await
+            }
+            _ => None,
+        };
+        let mut cloudfetch_config = result_to_cloudfetch_config(&config.result);
+        cloudfetch_config.download_ahead =
+            cloudfetch_download_ahead(&config.result, download_ahead_flag);
         let reader_factory = ResultReaderFactory::new(
             Arc::<SeaRestTransport>::downgrade(&sea),
             http_client.clone(),
-            result_to_cloudfetch_config(&config.result),
+            cloudfetch_config,
             result_to_post_process_options(&config.result),
             geospatial_result_representation,
             runtime_handle.clone(),
@@ -419,17 +448,6 @@ impl Session {
 
         // The kernel synthesises no geospatial session-conf entry;
         // caller-supplied server-bound entries pass through unchanged.
-        // Resolve connector-service flags after authentication and immediately
-        // before CreateSession. The resolver populates the process-wide
-        // workspace cache; the session retains no private snapshot.
-        let feature_flags = config
-            .driver_system_configuration
-            .as_ref()
-            .and_then(ClientIdentity::from_driver_system_configuration)
-            .map(|identity| FeatureFlagResolver::new(&host, Arc::clone(&http_client), identity));
-        if let Some(feature_flags) = &feature_flags {
-            feature_flags.prepare_for_session_open().await;
-        }
         let mut telemetry_config = config.telemetry.clone();
         let telemetry_feature_flag = match &feature_flags {
             Some(flags) => flags.get_bool(TELEMETRY_ENABLED_FEATURE_FLAG).await,
@@ -1300,6 +1318,7 @@ fn result_to_cloudfetch_config(
         enabled: result.cloudfetch_enabled,
         link_prefetch_window: result.cloudfetch_link_prefetch_window,
         max_chunks_in_memory: result.cloudfetch_max_chunks_in_memory,
+        download_ahead: cloudfetch_download_ahead(result, None),
         inline_max_chunks_in_memory: result.inline_max_chunks_in_memory,
         // Share one budget with the CloudFetch HTTP category
         // (see CLOUDFETCH_DOWNLOAD_BUDGET) so the provider retry loop and
@@ -1697,6 +1716,20 @@ mod retry_config_tests {
     use crate::client::retry::RequestCategory;
     use std::time::Duration;
 
+    #[test]
+    fn download_ahead_client_override_wins_and_missing_flag_is_disabled() {
+        let mut result = ResultConfig::default();
+        assert_eq!(cloudfetch_download_ahead(&result, None), 0);
+        assert_eq!(cloudfetch_download_ahead(&result, Some(8)), 8);
+        assert_eq!(cloudfetch_download_ahead(&result, Some(-1)), 0);
+        assert_eq!(cloudfetch_download_ahead(&result, Some(100)), 16);
+        for lead in [0, 4, 16] {
+            result.cloudfetch_download_ahead = Some(lead);
+            assert_eq!(cloudfetch_download_ahead(&result, Some(8)), lead);
+            assert_eq!(result_to_cloudfetch_config(&result).download_ahead, lead);
+        }
+    }
+
     /// Build a minimal `SessionConfig` with the given `HttpConfig` for
     /// exercising `build_retry_configs_for_session` in isolation.
     fn config_with_http(http: HttpConfig) -> SessionConfig {
@@ -2086,6 +2119,10 @@ mod retry_config_tests {
                 "9".to_string(),
             ),
             (
+                K::CloudfetchDownloadAhead.as_str().to_string(),
+                "8".to_string(),
+            ),
+            (
                 K::InlineMaxChunksInMemory.as_str().to_string(),
                 "3".to_string(),
             ),
@@ -2104,6 +2141,7 @@ mod retry_config_tests {
         assert!(!cfg.result.cloudfetch_enabled);
         assert_eq!(cfg.result.cloudfetch_link_prefetch_window, 7);
         assert_eq!(cfg.result.cloudfetch_max_chunks_in_memory, 9);
+        assert_eq!(cfg.result.cloudfetch_download_ahead, Some(8));
         assert_eq!(cfg.result.inline_max_chunks_in_memory, 3);
         assert!(cfg.result.complex_types_as_json);
         assert!(cfg.result.intervals_as_string);

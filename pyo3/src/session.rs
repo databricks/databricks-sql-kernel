@@ -333,7 +333,11 @@ impl Session {
     /// which always take precedence; a caller header for either of those
     /// names is ignored.
     ///
-    /// `session_conf` is the server-bound session configuration map
+    /// `session_conf` also accepts `cloudfetch_download_ahead` (integer 0..16).
+    /// This client-only knob is stripped before transmission. Explicit zero
+    /// disables request-ahead; unspecified defers to the server flag (default 0).
+    /// Extra GETs consume socket memory without enlarging the decoded window.
+    /// `session_conf` is otherwise the server-bound session configuration map
     /// — passed through to SEA `session_confs` verbatim. Use for
     /// `ANSI_MODE`, `TIMEZONE`, `STATEMENT_TIMEOUT`, query-tag
     /// presets, etc. The kernel does not validate keys; the server

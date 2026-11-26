@@ -30,6 +30,22 @@ use reqwest::Method;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+pub(crate) struct PreparedDownload {
+    response: reqwest::Response,
+    link: CloudFetchLink,
+    started: Instant,
+    headers_elapsed: Duration,
+    timeout: Duration,
+}
+
+impl PreparedDownload {
+    pub(crate) fn matches(&self, link: &CloudFetchLink) -> bool {
+        self.link.url == link.url
+            && self.link.http_headers == link.http_headers
+            && self.started.elapsed() < self.timeout
+    }
+}
+
 /// Downloads Arrow data from cloud storage presigned URLs.
 ///
 /// Handles:
@@ -86,6 +102,20 @@ impl ChunkDownloader {
         link: &CloudFetchLink,
         attempt_timeout: Option<Duration>,
     ) -> Result<Vec<RecordBatch>> {
+        let prepared = self.prepare(link, attempt_timeout).await?;
+        let elapsed = prepared.headers_elapsed;
+        let start = Instant::now();
+        let bytes = prepared.response.bytes().await.map_err(|error| {
+            Error::io().message(format!("Failed to read download response: {}", error))
+        })?;
+        self.decode(link, &bytes, elapsed + start.elapsed())
+    }
+
+    pub(crate) async fn prepare(
+        &self,
+        link: &CloudFetchLink,
+        attempt_timeout: Option<Duration>,
+    ) -> Result<PreparedDownload> {
         let start = Instant::now();
 
         debug!(
@@ -123,13 +153,45 @@ impl ChunkDownloader {
             .execute_without_auth(request, RequestType::CloudFetchDownload)
             .await?;
 
-        // Read response body
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|e| Error::io().message(format!("Failed to read download response: {}", e)))?;
+        Ok(PreparedDownload {
+            response,
+            link: link.clone(),
+            started: start,
+            headers_elapsed: start.elapsed(),
+            timeout: attempt_timeout
+                .unwrap_or(self.http_client.config().read_timeout)
+                .min(self.http_client.config().read_timeout),
+        })
+    }
 
-        let elapsed = start.elapsed();
+    pub(crate) async fn download_prepared(
+        &self,
+        link: &CloudFetchLink,
+        prepared: PreparedDownload,
+        attempt_timeout: Option<Duration>,
+    ) -> Result<(Vec<RecordBatch>, Duration)> {
+        let headers_elapsed = prepared.headers_elapsed;
+        let start = Instant::now();
+        match prepared.response.bytes().await {
+            Ok(bytes) => self
+                .decode(link, &bytes, headers_elapsed + start.elapsed())
+                .map(|batches| (batches, headers_elapsed)),
+            Err(_) => self
+                .download(
+                    link,
+                    attempt_timeout.map(|timeout| timeout.saturating_sub(start.elapsed())),
+                )
+                .await
+                .map(|batches| (batches, Duration::ZERO)),
+        }
+    }
+
+    fn decode(
+        &self,
+        link: &CloudFetchLink,
+        bytes: &[u8],
+        elapsed: Duration,
+    ) -> Result<Vec<RecordBatch>> {
         let size_mb = bytes.len() as f64 / 1024.0 / 1024.0;
         let speed_mbps = size_mb / elapsed.as_secs_f64();
 
@@ -149,7 +211,7 @@ impl ChunkDownloader {
         }
 
         // Parse Arrow IPC data
-        let batches = parse_arrow_ipc(&bytes, self.compression)?;
+        let batches = parse_arrow_ipc(bytes, self.compression)?;
 
         debug!(
             "Parsed chunk {}: {} batches, {} total rows",

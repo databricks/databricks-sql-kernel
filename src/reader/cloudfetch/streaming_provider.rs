@@ -22,7 +22,7 @@
 
 use crate::kernel_error::{Error, ErrorCode, Result};
 use crate::klog::{debug, error, info, warn};
-use crate::reader::cloudfetch::chunk_downloader::ChunkDownloader;
+use crate::reader::cloudfetch::chunk_downloader::{ChunkDownloader, PreparedDownload};
 use crate::reader::cloudfetch::link_fetcher::ChunkLinkFetcher;
 use crate::reader::ResultReaderMetrics;
 use crate::types::cloudfetch::{
@@ -120,7 +120,9 @@ pub struct StreamingCloudFetchProvider {
     schema: OnceLock<SchemaRef>,
 
     // Consumer state
-    current_chunk_index: AtomicI64,
+    current_chunk_index: Arc<AtomicI64>,
+    admission_changed: Arc<Notify>,
+    download_ahead: usize,
     current_batch_buffer: Mutex<VecDeque<RecordBatch>>,
 
     // Download scheduling state
@@ -219,6 +221,7 @@ struct RefreshCoordinator {
 /// `CancellationToken` / `Copy`.
 #[derive(Clone)]
 struct DownloadCtx {
+    admission: Option<Arc<DownloadAdmission>>,
     downloader: Arc<ChunkDownloader>,
     link_fetcher: Arc<dyn ChunkLinkFetcher>,
     chunks: Arc<DashMap<i64, ChunkEntry>>,
@@ -233,6 +236,31 @@ struct DownloadCtx {
     /// See [`CloudFetchConfig::download_timeout`]. Enforced in
     /// [`StreamingCloudFetchProvider::download_chunk_with_retry`].
     download_timeout: std::time::Duration,
+}
+
+struct DownloadAdmission {
+    current: Arc<AtomicI64>,
+    changed: Arc<Notify>,
+    window: usize,
+}
+
+struct AheadDownload {
+    link: crate::types::cloudfetch::CloudFetchLink,
+    request: futures::future::BoxFuture<'static, Result<PreparedDownload>>,
+}
+
+impl DownloadAdmission {
+    async fn wait(&self, index: i64) {
+        loop {
+            let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if index < self.current.load(Ordering::Acquire) + self.window as i64 {
+                return;
+            }
+            notified.await;
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -374,12 +402,21 @@ impl StreamingCloudFetchProvider {
         runtime_handle: tokio::runtime::Handle,
     ) -> Arc<Self> {
         let statement_id = link_fetcher.statement_id().map(Arc::from);
+        let current_chunk_index = Arc::new(AtomicI64::new(0));
+        let admission_changed = Arc::new(Notify::new());
+        let cancel_token = CancellationToken::new();
+        let download_ahead = config
+            .download_ahead
+            .min(config.max_chunks_in_memory)
+            .min(16);
         let provider = Arc::new(Self {
             link_fetcher,
             chunk_downloader,
             config: config.clone(),
             schema: OnceLock::new(),
-            current_chunk_index: AtomicI64::new(0),
+            current_chunk_index,
+            admission_changed,
+            download_ahead,
             current_batch_buffer: Mutex::new(VecDeque::new()),
             next_download_index: AtomicI64::new(0),
             end_of_stream: AtomicBool::new(false),
@@ -388,7 +425,7 @@ impl StreamingCloudFetchProvider {
             max_chunks_in_memory: config.max_chunks_in_memory,
             chunk_state_changed: Arc::new(Notify::new()),
             terminal_error: Mutex::new(None),
-            cancel_token: CancellationToken::new(),
+            cancel_token,
             runtime_handle,
             statement_id,
             refresh_coordinator: Arc::new(RefreshCoordinator::default()),
@@ -423,7 +460,9 @@ impl StreamingCloudFetchProvider {
             max_chunks_in_memory: config.max_chunks_in_memory,
             config,
             schema: OnceLock::new(),
-            current_chunk_index: AtomicI64::new(0),
+            current_chunk_index: Arc::new(AtomicI64::new(0)),
+            admission_changed: Arc::new(Notify::new()),
+            download_ahead: 0,
             current_batch_buffer: Mutex::new(VecDeque::new()),
             next_download_index: AtomicI64::new(0),
             end_of_stream: AtomicBool::new(end_of_stream),
@@ -663,6 +702,7 @@ impl StreamingCloudFetchProvider {
     fn advance_chunk(&self) -> (usize, i64) {
         let new_count = self.chunks_in_memory.fetch_sub(1, Ordering::Release) - 1;
         let next_chunk = self.current_chunk_index.fetch_add(1, Ordering::Release) + 1;
+        self.admission_changed.notify_waiters();
         self.metrics.record_chunk_iterated();
         (new_count, next_chunk)
     }
@@ -743,7 +783,7 @@ impl StreamingCloudFetchProvider {
         loop {
             // Check if we have room for more downloads
             let current_in_memory = self.chunks_in_memory.load(Ordering::Acquire);
-            if current_in_memory >= self.max_chunks_in_memory {
+            if current_in_memory >= self.max_chunks_in_memory + self.download_ahead {
                 debug!(
                     "Memory limit reached: {}/{} chunks in memory, pausing downloads",
                     current_in_memory, self.max_chunks_in_memory
@@ -858,6 +898,13 @@ impl StreamingCloudFetchProvider {
             // stays clean.
             let chunk_index = next_index;
             let ctx = DownloadCtx {
+                admission: (self.download_ahead > 0).then(|| {
+                    Arc::new(DownloadAdmission {
+                        current: self.current_chunk_index.clone(),
+                        changed: self.admission_changed.clone(),
+                        window: self.max_chunks_in_memory,
+                    })
+                }),
                 downloader: Arc::clone(&self.chunk_downloader),
                 link_fetcher: Arc::clone(&self.link_fetcher),
                 chunks: self.chunks.clone(),
@@ -882,11 +929,20 @@ impl StreamingCloudFetchProvider {
             // forever and wedging the whole stream. Surfacing the panic as a
             // download error lets the reader fail cleanly instead of hanging.
             let rt = self.runtime_handle.clone();
+            let cancel_token = self.cancel_token.clone();
             self.runtime_handle.spawn(async move {
                 let result = join_download_task(&rt, async move {
                     Self::download_chunk_with_retry(chunk_index, &ctx).await
                 })
                 .await;
+
+                if cancel_token.is_cancelled() {
+                    if let Some(mut entry) = chunks.get_mut(&chunk_index) {
+                        entry.state = ChunkState::Cancelled;
+                    }
+                    chunk_state_changed.notify_one();
+                    return;
+                }
 
                 match result {
                     Ok(batches) => {
@@ -957,6 +1013,7 @@ impl StreamingCloudFetchProvider {
         ctx: &DownloadCtx,
     ) -> Result<Vec<RecordBatch>> {
         let mut attempts = 0;
+        let mut prepared = Self::prepare_ahead(chunk_index, ctx).await?;
 
         // Absolute end-to-end deadline for this chunk. Bounds the whole
         // retry loop — every HTTP attempt, link refresh, and backoff sleep
@@ -1130,13 +1187,55 @@ impl StreamingCloudFetchProvider {
             // deadline is configured.
             let download_started = std::time::Instant::now();
             let attempt_timeout = deadline.map(|d| d.saturating_duration_since(download_started));
-            match ctx.downloader.download(&link, attempt_timeout).await {
-                Ok(batches) => {
-                    ctx.metrics
-                        .record_chunk_download(chunk_index, download_started.elapsed());
+            let download = async {
+                let response = match prepared.take().filter(|ahead| {
+                    ahead.link.url == link.url && ahead.link.http_headers == link.http_headers
+                }) {
+                    Some(ahead) => ahead
+                        .request
+                        .await
+                        .ok()
+                        .filter(|response| response.matches(&link)),
+                    None => None,
+                };
+                match response {
+                    Some(response) => {
+                        ctx.downloader
+                            .download_prepared(&link, response, attempt_timeout)
+                            .await
+                    }
+                    None => ctx
+                        .downloader
+                        .download(&link, attempt_timeout)
+                        .await
+                        .map(|batches| (batches, std::time::Duration::ZERO)),
+                }
+            };
+            let result = tokio::select! {
+                biased;
+                _ = ctx.cancel_token.cancelled() => {
+                    return Err(Error::invalid_state().message("Download cancelled"));
+                }
+                result = async {
+                    match attempt_timeout {
+                        Some(timeout) => tokio::time::timeout(timeout, download).await
+                            .unwrap_or_else(|_| Err(Self::download_deadline_error(chunk_index, ctx.download_timeout))),
+                        None => download.await,
+                    }
+                } => result,
+            };
+            match result {
+                Ok((batches, headers_elapsed)) => {
+                    ctx.metrics.record_chunk_download(
+                        chunk_index,
+                        download_started.elapsed() + headers_elapsed,
+                    );
                     return Ok(batches);
                 }
                 Err(e) => {
+                    if ctx.cancel_token.is_cancelled() {
+                        return Err(e);
+                    }
                     // Refreshing a signed URL cannot repair certificate verification failures.
                     if e.code == ErrorCode::NetworkError && !e.retryable {
                         return Err(e);
@@ -1231,6 +1330,45 @@ impl StreamingCloudFetchProvider {
                         None => ctx.retry_delay,
                     };
                     tokio::time::sleep(sleep_for).await;
+                }
+            }
+        }
+    }
+
+    async fn prepare_ahead(chunk_index: i64, ctx: &DownloadCtx) -> Result<Option<AheadDownload>> {
+        let Some(admission) = &ctx.admission else {
+            return Ok(None);
+        };
+        let link = ctx
+            .chunks
+            .get(&chunk_index)
+            .and_then(|entry| entry.link.clone());
+        let mut ahead = link.filter(|link| !link.is_expired()).map(|link| {
+            let downloader = ctx.downloader.clone();
+            let request_link = link.clone();
+            let timeout = (!ctx.download_timeout.is_zero()).then_some(ctx.download_timeout);
+            AheadDownload {
+                link,
+                request: Box::pin(async move { downloader.prepare(&request_link, timeout).await }),
+            }
+        });
+        tokio::select! {
+            biased;
+            _ = ctx.cancel_token.cancelled() => Err(Error::invalid_state().message("Download cancelled")),
+            _ = admission.wait(chunk_index) => Ok(ahead),
+            response = async {
+                match &mut ahead {
+                    Some(ahead) => ahead.request.as_mut().await,
+                    None => futures::future::pending().await,
+                }
+            } => {
+                if let Some(ahead) = &mut ahead {
+                    ahead.request = Box::pin(std::future::ready(response));
+                }
+                tokio::select! {
+                    biased;
+                    _ = ctx.cancel_token.cancelled() => Err(Error::invalid_state().message("Download cancelled")),
+                    _ = admission.wait(chunk_index) => Ok(ahead),
                 }
             }
         }
@@ -1914,70 +2052,97 @@ mod tests {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        let server = MockServer::start().await;
-        let mut fetcher = MockLinkFetcher::new(8);
-        for i in 0..8 {
-            let batch = make_batch(&[i as i32]);
-            let mut bytes = Vec::new();
-            {
-                let mut writer = StreamWriter::try_new(&mut bytes, &batch.schema()).unwrap();
-                writer.write(&batch).unwrap();
-                writer.finish().unwrap();
+        for lead in [0, 2] {
+            let server = MockServer::start().await;
+            let mut fetcher = MockLinkFetcher::new(8);
+            for i in 0..8 {
+                let batch = make_batch(&[i as i32]);
+                let mut bytes = Vec::new();
+                {
+                    let mut writer = StreamWriter::try_new(&mut bytes, &batch.schema()).unwrap();
+                    writer.write(&batch).unwrap();
+                    writer.finish().unwrap();
+                }
+                let route = format!("/chunk-{i}");
+                Mock::given(method("GET"))
+                    .and(path(&route))
+                    .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+                fetcher.links_by_index.get_mut(&i).unwrap().url =
+                    format!("{}{route}", server.uri());
             }
-            let route = format!("/chunk-{i}");
-            Mock::given(method("GET"))
-                .and(path(&route))
-                .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
-                .expect(1)
-                .mount(&server)
-                .await;
-            fetcher.links_by_index.get_mut(&i).unwrap().url = format!("{}{route}", server.uri());
-        }
-        let fetcher = Arc::new(fetcher);
-        let client = DatabricksHttpClient::new(
-            HttpClientConfig::default(),
-            build_retry_configs(
-                &RetryConfig {
-                    max_retries: 0,
-                    ..RetryConfig::default()
+            let fetcher = Arc::new(fetcher);
+            let client = DatabricksHttpClient::new(
+                HttpClientConfig::default(),
+                build_retry_configs(
+                    &RetryConfig {
+                        max_retries: 0,
+                        ..RetryConfig::default()
+                    },
+                    &HashMap::new(),
+                ),
+            )
+            .unwrap();
+            let provider = StreamingCloudFetchProvider::new(
+                CloudFetchConfig {
+                    max_chunks_in_memory: 2,
+                    download_ahead: lead,
+                    ..CloudFetchConfig::default()
                 },
-                &HashMap::new(),
-            ),
-        )
-        .unwrap();
-        let provider = StreamingCloudFetchProvider::new(
-            CloudFetchConfig {
-                max_chunks_in_memory: 2,
-                ..CloudFetchConfig::default()
-            },
-            fetcher.clone(),
-            Arc::new(ChunkDownloader::new(
-                Arc::new(client),
-                CompressionCodec::None,
-                0.1,
-            )),
-            Some(8),
-            tokio::runtime::Handle::current(),
-        );
-        let mut values = Vec::new();
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while let Some(batch) = provider.next_batch().await.unwrap() {
-                let ids = batch
-                    .column(0)
-                    .as_any()
-                    .downcast_ref::<Int32Array>()
-                    .unwrap();
-                values.extend_from_slice(ids.values());
-                assert!(provider.chunks_in_memory.load(Ordering::Acquire) <= 2);
-            }
-        })
-        .await
-        .expect("all eight chunks must drain with a two-chunk window");
-        assert_eq!(values, (0..8).collect::<Vec<i32>>());
-        assert_eq!(
-            *fetcher.scheduled.lock().unwrap(),
-            (0..8).collect::<Vec<i64>>()
-        );
+                fetcher.clone(),
+                Arc::new(ChunkDownloader::new(
+                    Arc::new(client),
+                    CompressionCodec::None,
+                    0.1,
+                )),
+                Some(8),
+                tokio::runtime::Handle::current(),
+            );
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while server.received_requests().await.unwrap().len() < 2 + lead {
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("request-ahead must start GETs before the consumer releases a chunk");
+            assert!(
+                provider
+                    .chunks
+                    .iter()
+                    .filter(|entry| entry.batches.is_some())
+                    .count()
+                    <= 2
+            );
+            let mut values = Vec::new();
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while let Some(batch) = provider.next_batch().await.unwrap() {
+                    let ids = batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .unwrap();
+                    values.extend_from_slice(ids.values());
+                    assert!(provider.chunks_in_memory.load(Ordering::Acquire) <= 2 + lead);
+                    assert!(
+                        provider
+                            .chunks
+                            .iter()
+                            .filter(|entry| entry.batches.is_some())
+                            .count()
+                            <= 2
+                    );
+                }
+            })
+            .await
+            .expect("all eight chunks must drain with a two-chunk window");
+            assert_eq!(values, (0..8).collect::<Vec<i32>>());
+            assert_eq!(
+                *fetcher.scheduled.lock().unwrap(),
+                (0..8).collect::<Vec<i64>>()
+            );
+        }
     }
 
     /// Regression (PECOBLR-4026): a panicking download task must surface as an
@@ -2084,6 +2249,7 @@ mod tests {
         let chunks = Arc::new(DashMap::new());
         chunks.insert(0, entry_with_state(fetcher.link(), ChunkState::Downloading));
         let ctx = DownloadCtx {
+            admission: None,
             downloader,
             link_fetcher: fetcher,
             chunks,
@@ -2200,6 +2366,7 @@ mod tests {
             let chunks = Arc::new(DashMap::new());
             chunks.insert(0, entry_with_state(fetcher.link(), ChunkState::Downloading));
             DownloadCtx {
+                admission: None,
                 downloader,
                 link_fetcher: fetcher,
                 chunks,
@@ -2219,6 +2386,302 @@ mod tests {
         /// must be cut off by the deadline, not the static request_timeout.
         /// Without the per-attempt cap this hangs for the client's
         /// `request_timeout` (default 120s) per attempt.
+        fn ahead_ctx(
+            server: &MockServer,
+            timeout: Duration,
+        ) -> (DownloadCtx, Arc<DownloadAdmission>) {
+            let mut ctx = ctx_for(server, timeout, CancellationToken::new());
+            let admission = Arc::new(DownloadAdmission {
+                current: Arc::new(AtomicI64::new(-1)),
+                changed: Arc::new(Notify::new()),
+                window: 1,
+            });
+            ctx.admission = Some(admission.clone());
+            (ctx, admission)
+        }
+
+        fn nullable_payload() -> (Vec<u8>, RecordBatch) {
+            use arrow_array::{ArrayRef, BooleanArray, Float32Array, Float64Array, Int64Array};
+            use arrow_ipc::writer::StreamWriter;
+            let batch = RecordBatch::try_from_iter(vec![
+                (
+                    "integer",
+                    Arc::new(Int64Array::from(vec![Some(4), None, Some(-9)])) as ArrayRef,
+                ),
+                (
+                    "boolean",
+                    Arc::new(BooleanArray::from(vec![Some(true), None, Some(false)])) as ArrayRef,
+                ),
+                (
+                    "float",
+                    Arc::new(Float32Array::from(vec![Some(1.25), None, Some(-4.5)])) as ArrayRef,
+                ),
+                (
+                    "double",
+                    Arc::new(Float64Array::from(vec![Some(1.125), None, Some(-8.25)])) as ArrayRef,
+                ),
+            ])
+            .unwrap();
+            let mut bytes = Vec::new();
+            {
+                let mut writer = StreamWriter::try_new(&mut bytes, &batch.schema()).unwrap();
+                writer.write(&batch).unwrap();
+                writer.finish().unwrap();
+            }
+            (bytes, batch)
+        }
+
+        async fn wait_for_request(server: &MockServer) {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while server.received_requests().await.unwrap().is_empty() {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+
+        #[tokio::test]
+        async fn ahead_wait_does_not_spend_download_budget() {
+            let server = MockServer::start().await;
+            let (bytes, expected) = nullable_payload();
+            Mock::given(method("GET"))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
+                .expect(2)
+                .mount(&server)
+                .await;
+            let (mut ctx, admission) = ahead_ctx(&server, Duration::from_millis(100));
+            ctx.chunks
+                .get_mut(&0)
+                .unwrap()
+                .link
+                .as_mut()
+                .unwrap()
+                .row_count = 3;
+            ctx.max_retries = 1;
+            let task = tokio::spawn(async move {
+                StreamingCloudFetchProvider::download_chunk_with_retry(0, &ctx).await
+            });
+            wait_for_request(&server).await;
+            tokio::time::sleep(Duration::from_millis(220)).await;
+            assert!(
+                !task.is_finished(),
+                "a waiting chunk must not decode or exhaust its budget"
+            );
+            admission.current.store(0, Ordering::Release);
+            admission.changed.notify_waiters();
+            let batches = tokio::time::timeout(Duration::from_secs(2), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(batches, vec![expected]);
+        }
+
+        #[tokio::test]
+        async fn ahead_retains_pending_headers_when_admitted() {
+            let server = MockServer::start().await;
+            let (bytes, expected) = nullable_payload();
+            Mock::given(method("GET"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_bytes(bytes)
+                        .set_delay(Duration::from_millis(120)),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            let (ctx, admission) = ahead_ctx(&server, Duration::from_secs(2));
+            ctx.chunks
+                .get_mut(&0)
+                .unwrap()
+                .link
+                .as_mut()
+                .unwrap()
+                .row_count = 2;
+            let task = tokio::spawn(async move {
+                StreamingCloudFetchProvider::download_chunk_with_retry(0, &ctx).await
+            });
+            wait_for_request(&server).await;
+            assert!(!task.is_finished());
+            admission.current.store(0, Ordering::Release);
+            admission.changed.notify_waiters();
+            let batches = tokio::time::timeout(Duration::from_secs(2), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(batches, vec![expected.slice(0, 2)]);
+        }
+
+        #[tokio::test]
+        async fn ahead_refreshes_link_changed_while_waiting() {
+            let server = MockServer::start().await;
+            let (bytes, expected) = nullable_payload();
+            Mock::given(method("GET"))
+                .and(path("/chunk-0.arrow"))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(b"not arrow".to_vec()))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/fresh"))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let (ctx, admission) = ahead_ctx(&server, Duration::from_secs(2));
+            let chunks = ctx.chunks.clone();
+            let task = tokio::spawn(async move {
+                StreamingCloudFetchProvider::download_chunk_with_retry(0, &ctx).await
+            });
+            wait_for_request(&server).await;
+            {
+                let mut entry = chunks.get_mut(&0).unwrap();
+                let link = entry.link.as_mut().unwrap();
+                link.url = format!("{}/fresh", server.uri());
+                link.row_count = 3;
+            }
+            admission.current.store(0, Ordering::Release);
+            admission.changed.notify_waiters();
+            assert_eq!(task.await.unwrap().unwrap(), vec![expected]);
+        }
+
+        #[tokio::test]
+        async fn ahead_cancel_releases_parked_response() {
+            let server = MockServer::start().await;
+            let (bytes, _) = nullable_payload();
+            Mock::given(method("GET"))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let (ctx, _) = ahead_ctx(&server, Duration::from_secs(2));
+            let cancel = ctx.cancel_token.clone();
+            let metrics = ctx.metrics.clone();
+            let task = tokio::spawn(async move {
+                StreamingCloudFetchProvider::download_chunk_with_retry(0, &ctx).await
+            });
+            wait_for_request(&server).await;
+            cancel.cancel();
+            let error = tokio::time::timeout(Duration::from_millis(200), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap_err();
+            assert!(error.message.contains("cancelled"));
+            assert_eq!(metrics.chunks_downloaded.load(Ordering::Acquire), 0);
+        }
+
+        #[tokio::test]
+        async fn ahead_expired_link_is_refreshed_after_admission() {
+            #[derive(Debug)]
+            struct FreshLink(CloudFetchLink, Arc<AtomicUsize>);
+            #[async_trait::async_trait]
+            impl ChunkLinkFetcher for FreshLink {
+                async fn fetch_links(&self, _: i64, _: i64) -> Result<ChunkLinkFetchResult> {
+                    unreachable!()
+                }
+                async fn refetch_link(&self, _: i64, _: i64) -> Result<CloudFetchLink> {
+                    unreachable!()
+                }
+                async fn refetch_links_from(&self, _: i64, _: i64) -> Result<Vec<CloudFetchLink>> {
+                    self.1.fetch_add(1, Ordering::AcqRel);
+                    Ok(vec![self.0.clone()])
+                }
+            }
+            let server = MockServer::start().await;
+            let (bytes, expected) = nullable_payload();
+            Mock::given(method("GET"))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
+                .expect(2)
+                .mount(&server)
+                .await;
+            let (mut ctx, admission) = ahead_ctx(&server, Duration::from_secs(2));
+            let mut fresh = create_test_link(0);
+            fresh.url = format!("{}/fresh", server.uri());
+            fresh.row_count = 3;
+            let refreshes = Arc::new(AtomicUsize::new(0));
+            ctx.link_fetcher = Arc::new(FreshLink(fresh, refreshes.clone()));
+            let chunks = ctx.chunks.clone();
+            let task = tokio::spawn(async move {
+                StreamingCloudFetchProvider::download_chunk_with_retry(0, &ctx).await
+            });
+            wait_for_request(&server).await;
+            chunks
+                .get_mut(&0)
+                .unwrap()
+                .link
+                .as_mut()
+                .unwrap()
+                .expiration = chrono::Utc::now();
+            admission.current.store(0, Ordering::Release);
+            admission.changed.notify_waiters();
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(2), task)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap(),
+                vec![expected]
+            );
+            assert_eq!(refreshes.load(Ordering::Acquire), 1);
+        }
+
+        #[tokio::test]
+        async fn ahead_closed_idle_body_falls_back_without_retry_budget() {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let server = MockServer::start().await;
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let (bytes, expected) = nullable_payload();
+            let (ready, received) = tokio::sync::oneshot::channel();
+            let serving = tokio::spawn(async move {
+                let mut ready = Some(ready);
+                for attempt in 0..2 {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut request = [0; 4096];
+                    socket.read(&mut request).await.unwrap();
+                    let length = bytes.len() + usize::from(attempt == 0);
+                    let mut response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n"
+                    )
+                    .into_bytes();
+                    response.extend_from_slice(&bytes);
+                    socket.write_all(&response).await.unwrap();
+                    socket.shutdown().await.unwrap();
+                    if let Some(ready) = ready.take() {
+                        ready.send(()).unwrap();
+                    }
+                }
+            });
+            let (mut ctx, admission) = ahead_ctx(&server, Duration::from_secs(2));
+            {
+                let mut entry = ctx.chunks.get_mut(&0).unwrap();
+                let link = entry.link.as_mut().unwrap();
+                link.url = format!("http://{address}/chunk");
+                link.row_count = 3;
+            }
+            ctx.max_retries = 1;
+            let task = tokio::spawn(async move {
+                StreamingCloudFetchProvider::download_chunk_with_retry(0, &ctx).await
+            });
+            received.await.unwrap();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            assert!(!task.is_finished());
+            admission.current.store(0, Ordering::Release);
+            admission.changed.notify_waiters();
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(2), task)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap(),
+                vec![expected]
+            );
+            serving.await.unwrap();
+        }
+
         #[tokio::test]
         async fn stalled_body_is_bounded_by_deadline() {
             let server = MockServer::start().await;
