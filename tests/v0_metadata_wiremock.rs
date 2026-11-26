@@ -42,7 +42,9 @@ use databricks_sql_kernel::{
 };
 use serde_json::json;
 use std::sync::Arc;
-use wiremock::matchers::{body_partial_json, body_string_contains, header, method, path};
+use wiremock::matchers::{
+    body_partial_json, body_string_contains, header, method, path, path_regex,
+};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 // ─── Helpers ────────────────────────────────────────────────────────
@@ -982,6 +984,1190 @@ async fn list_tables_wildcard_catalog_fans_out_per_matching_catalog() {
         .collect();
     cats.sort();
     assert_eq!(cats, vec!["comp-x".to_owned(), "comp_tests".to_owned()]);
+}
+
+#[tokio::test]
+async fn list_tables_speculation_preserves_catalog_matches_types_and_values() {
+    let cases = [
+        (
+            "bench_name",
+            "bench_name",
+            vec!["bench_name"],
+            vec!["bench_name"],
+            2,
+        ),
+        (
+            "bench%name",
+            "bench%name",
+            vec!["bench%name"],
+            vec!["bench%name"],
+            2,
+        ),
+        (
+            "bench_name",
+            "bench_name",
+            vec!["bench_name", "benchXname"],
+            vec!["bench_name", "benchXname"],
+            3,
+        ),
+        (
+            "bench_name",
+            "bench_name",
+            vec!["benchXname", "bench_name"],
+            vec!["benchXname", "bench_name"],
+            3,
+        ),
+        (
+            "bench_name",
+            "bench_name",
+            vec!["bench_name", "bench_name"],
+            vec!["bench_name", "bench_name"],
+            3,
+        ),
+        (
+            "c_",
+            "c_",
+            vec!["c0", "c1", "c2", "c3", "c4", "c5", "c6", "c7", "c8", "c_"],
+            vec!["c0", "c1", "c2", "c3", "c4", "c5", "c6", "c7", "c8", "c_"],
+            11,
+        ),
+        (
+            "bench_name",
+            "bench_name",
+            vec!["benchXname"],
+            vec!["benchXname"],
+            3,
+        ),
+        ("bench_name", "bench_name", vec!["other"], vec![], 2),
+        (
+            "BENCH_NAME",
+            "BENCH_NAME",
+            vec!["bench_name"],
+            vec!["bench_name"],
+            2,
+        ),
+        (
+            r"bench\_name%",
+            "bench_name%",
+            vec!["bench_name"],
+            vec!["bench_name"],
+            2,
+        ),
+        (
+            r"bench\%name_",
+            "bench%name_",
+            vec!["bench%name_"],
+            vec!["bench%name_"],
+            2,
+        ),
+        ("absent_", "absent_", vec!["bench_name"], vec![], 2),
+        ("*", "*", vec!["bench_name"], vec![], 1),
+    ];
+    let filters: [Option<&[&str]>; 5] = [
+        None,
+        Some(&[]),
+        Some(&["TABLE"]),
+        Some(&["VIEW"]),
+        Some(&["view"]),
+    ];
+    let columns = [
+        "TABLE_CAT",
+        "TABLE_SCHEM",
+        "TABLE_NAME",
+        "TABLE_TYPE",
+        "REMARKS",
+        "TYPE_CAT",
+        "TYPE_SCHEM",
+        "TYPE_NAME",
+        "SELF_REFERENCING_COL_NAME",
+        "REF_GENERATION",
+    ];
+    for native in [false, true] {
+        for (pattern, literal, catalogs, matched, count) in &cases {
+            for filter in filters {
+                let server = MockServer::builder().start().await;
+                mount_create_session(&server).await;
+                mount_delete_session(&server).await;
+                let catalog_batch = string_batch(vec![(
+                    "catalog",
+                    catalogs.iter().map(|name| Some(*name)).collect(),
+                )]);
+                mount_execute_expecting_sql(
+                    &server,
+                    "SHOW CATALOGS",
+                    closed_inline_response_body(&catalog_batch),
+                )
+                .await;
+                let mut scopes = catalogs.clone();
+                if !scopes.contains(literal) {
+                    scopes.push(literal);
+                }
+                for scope in scopes {
+                    let canonical = catalogs
+                        .iter()
+                        .find(|name| name.eq_ignore_ascii_case(scope));
+                    let body = if let Some(canonical) = canonical {
+                        let batch = if native {
+                            string_batch(vec![
+                                ("TABLE_CAT", vec![Some(*canonical); 2]),
+                                ("TABLE_SCHEM", vec![Some("default"); 2]),
+                                ("TABLE_NAME", vec![Some("v"), Some("t")]),
+                                ("TABLE_TYPE", vec![Some("VIEW"), Some("TABLE")]),
+                                ("REMARKS", vec![None, Some("table comment")]),
+                                ("TYPE_CAT", vec![None; 2]),
+                                ("TYPE_SCHEM", vec![None; 2]),
+                                ("TYPE_NAME", vec![None; 2]),
+                                ("SELF_REFERENCING_COL_NAME", vec![None; 2]),
+                                ("REF_GENERATION", vec![None; 2]),
+                            ])
+                        } else {
+                            string_batch(vec![
+                                ("namespace", vec![Some("default"); 2]),
+                                ("tableName", vec![Some("v"), Some("t")]),
+                                ("tableType", vec![Some("VIEW"), Some("TABLE")]),
+                                ("remarks", vec![None, Some("table comment")]),
+                            ])
+                        };
+                        let mut body: serde_json::Value =
+                            serde_json::from_str(&closed_inline_response_body(&batch)).unwrap();
+                        body["manifest"]["is_native_metadata_result"] = json!(native);
+                        body.to_string()
+                    } else {
+                        failed_response_body("42704", "CATALOG_NOT_FOUND")
+                    };
+                    mount_execute_expecting_sql(&server, &format!("IN CATALOG `{scope}`"), body)
+                        .await;
+                }
+                Mock::given(method("DELETE"))
+                    .and(path("/api/2.0/sql/statements/stmt-test"))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+                    .mount(&server)
+                    .await;
+                let session = open_session(&server).await;
+                let mut stream = session
+                    .metadata()
+                    .list_tables(
+                        Some(LikePattern::new(pattern).unwrap()),
+                        Some(LikePattern::new("default").unwrap()),
+                        Some(LikePattern::new("%").unwrap()),
+                        filter,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(col_names(&stream.schema()), columns);
+                let batches = drain_stream(&mut stream).await;
+                let rows: Vec<Vec<Option<String>>> = batches
+                    .iter()
+                    .flat_map(|batch| {
+                        (0..batch.num_rows()).map(|row| {
+                            batch
+                                .columns()
+                                .iter()
+                                .map(|column| {
+                                    let values = column.as_string::<i32>();
+                                    (!values.is_null(row)).then(|| values.value(row).to_owned())
+                                })
+                                .collect()
+                        })
+                    })
+                    .collect();
+                let mut matched = matched.clone();
+                matched.sort();
+                let mut expected = Vec::new();
+                for table_type in ["TABLE", "VIEW"] {
+                    if filter.is_some_and(|types| !types.contains(&table_type)) {
+                        continue;
+                    }
+                    for catalog in &matched {
+                        expected.push(vec![
+                            Some((*catalog).to_owned()),
+                            Some("default".to_owned()),
+                            Some(if table_type == "TABLE" { "t" } else { "v" }.to_owned()),
+                            Some(table_type.to_owned()),
+                            if table_type == "TABLE" {
+                                Some("table comment".to_owned())
+                            } else if native {
+                                None
+                            } else {
+                                Some(String::new())
+                            },
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                        ]);
+                    }
+                }
+                assert_eq!(
+                    rows, expected,
+                    "pattern={pattern}, native={native}, types={filter:?}"
+                );
+                // Unmatched speculation may finish after the typed empty result.
+                let statements = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                    loop {
+                        let statements = server
+                            .received_requests()
+                            .await
+                            .unwrap()
+                            .iter()
+                            .filter(|request| {
+                                request.method == "POST"
+                                    && request.url.path() == "/api/2.0/sql/statements"
+                            })
+                            .count();
+                        if statements >= *count {
+                            break statements;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .expect("all expected catalog executes must eventually be submitted");
+                assert_eq!(
+                    statements, *count,
+                    "pattern={pattern}, matched={matched:?}, native={native}, types={filter:?}"
+                );
+                if *count == matched.len() + 2 {
+                    assert_eq!(
+                        wait_for_close_delete(&server, 1, std::time::Duration::from_secs(2)).await,
+                        1,
+                        "unused failed speculation must close before fixture teardown"
+                    );
+                }
+                session.close().await.unwrap();
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn list_tables_speculative_slot_keeps_eight_table_executions_in_flight() {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    let server = MockServer::builder().start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+    let catalogs = [
+        "c_t", "c0t", "c1t", "c2t", "c3t", "c4t", "c5t", "c6t", "c7t",
+    ];
+    let catalog_batch = string_batch(vec![(
+        "catalog",
+        catalogs.iter().copied().map(Some).collect(),
+    )]);
+    mount_execute_expecting_sql(
+        &server,
+        "SHOW CATALOGS",
+        closed_inline_response_body(&catalog_batch),
+    )
+    .await;
+    let started = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&started);
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .and(body_string_contains("IN CATALOG `"))
+        .respond_with(move |request: &wiremock::Request| {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            let catalog = body["statement"]
+                .as_str()
+                .unwrap()
+                .split("IN CATALOG `")
+                .nth(1)
+                .unwrap()
+                .split('`')
+                .next()
+                .unwrap();
+            counter.fetch_add(1, Ordering::SeqCst);
+            ResponseTemplate::new(200).set_body_json(json!({
+                "statement_id": format!("budget-{catalog}"), "status": {"state": "RUNNING"}
+            }))
+        })
+        .expect(9)
+        .mount(&server)
+        .await;
+    let responses: HashMap<_, _> = catalogs
+        .iter()
+        .map(|catalog| {
+            let batch = string_batch(vec![
+                ("namespace", vec![Some("default")]),
+                ("tableName", vec![Some("t")]),
+                ("catalogName", vec![Some(*catalog)]),
+                ("tableType", vec![Some("TABLE")]),
+            ]);
+            let id = format!("budget-{catalog}");
+            let response = closed_inline_response_body(&batch).replace("stmt-test", &id);
+            (id, response)
+        })
+        .collect();
+    let released = Arc::new(AtomicBool::new(false));
+    let gate = Arc::clone(&released);
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/api/2\.0/sql/statements/budget-"))
+        .respond_with(move |request: &wiremock::Request| {
+            let id = request.url.path().rsplit('/').next().unwrap();
+            if gate.load(Ordering::SeqCst) {
+                ResponseTemplate::new(200).set_body_string(responses[id].clone())
+            } else {
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "statement_id": id, "status": {"state": "RUNNING"}
+                }))
+            }
+        })
+        .mount(&server)
+        .await;
+    let session = open_session(&server).await;
+    let metadata = session.metadata();
+    let mut future =
+        Box::pin(metadata.list_tables(Some(LikePattern::new("c_t").unwrap()), None, None, None));
+    let sample = async {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while started.load(Ordering::SeqCst) < 8 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("eight table executions must start while the gate is closed");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        started.load(Ordering::SeqCst)
+    };
+    let in_flight = tokio::select! {
+        result = &mut future => panic!("table executions must remain gated: {:?}", result.err()),
+        observed = sample => observed,
+    };
+    released.store(true, Ordering::SeqCst);
+    let mut stream = tokio::time::timeout(Duration::from_secs(10), future)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        drain_stream(&mut stream)
+            .await
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum::<usize>(),
+        9
+    );
+    session.close().await.unwrap();
+    server.verify().await;
+    assert_eq!(
+        in_flight, 8,
+        "the speculative literal must reserve one of eight table slots"
+    );
+}
+
+#[tokio::test]
+async fn list_tables_speculation_starts_before_catalog_lookup_finishes() {
+    use std::time::Duration;
+
+    let server = MockServer::builder().start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+    let catalogs = string_batch(vec![("catalog", vec![Some("bench_name")])]);
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .and(body_string_contains("SHOW CATALOGS"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(closed_inline_response_body(&catalogs))
+                .set_delay(Duration::from_secs(1)),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let table = string_batch(vec![
+        ("namespace", vec![Some("default")]),
+        ("tableName", vec![Some("t")]),
+        ("tableType", vec![Some("TABLE")]),
+    ]);
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .and(body_string_contains("IN CATALOG `bench_name`"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(closed_inline_response_body(&table)),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let session = open_session(&server).await;
+    let metadata = session.metadata();
+    let future = metadata.list_tables(
+        Some(LikePattern::new("bench_name").unwrap()),
+        None,
+        None,
+        None,
+    );
+    tokio::pin!(future);
+    let both_started = async {
+        loop {
+            let count = server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|request| {
+                    request.method == "POST" && request.url.path() == "/api/2.0/sql/statements"
+                })
+                .count();
+            if count == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::select! {
+        _ = &mut future => panic!("metadata completed before delayed catalog lookup"),
+        result = tokio::time::timeout(Duration::from_millis(500), both_started) => {
+            result.expect("table request must overlap delayed catalog lookup");
+        }
+    }
+    let mut stream = tokio::time::timeout(Duration::from_secs(3), future)
+        .await
+        .unwrap()
+        .unwrap();
+    let batches = drain_stream(&mut stream).await;
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+    session.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn list_tables_not_found_speculation_retries_after_catalog_confirmation() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let sql_state = "42704";
+    let server = MockServer::builder().start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+    let catalogs = string_batch(vec![("catalog", vec![Some("bench_name")])]);
+    mount_execute_expecting_sql(
+        &server,
+        "SHOW CATALOGS",
+        closed_inline_response_body(&catalogs),
+    )
+    .await;
+    let table = string_batch(vec![
+        ("namespace", vec![Some("default")]),
+        ("tableName", vec![Some("t")]),
+        ("tableType", vec![Some("TABLE")]),
+    ]);
+    let success = closed_inline_response_body(&table);
+    let failure = failed_response_body(sql_state, "speculative failure");
+    let executions = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&executions);
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .and(body_string_contains("IN CATALOG `bench_name`"))
+        .respond_with(move |_: &wiremock::Request| {
+            let body = if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                &failure
+            } else {
+                &success
+            };
+            ResponseTemplate::new(200).set_body_string(body)
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/2.0/sql/statements/stmt-test"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let session = open_session(&server).await;
+    let mut stream = session
+        .metadata()
+        .list_tables(
+            Some(LikePattern::new("bench_name").unwrap()),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        drain_stream(&mut stream)
+            .await
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum::<usize>(),
+        1
+    );
+    assert_eq!(executions.load(Ordering::SeqCst), 2);
+    session.close().await.unwrap();
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn list_tables_read_phase_not_found_errors_propagate_without_retry() {
+    for native in [false, true] {
+        for (pattern, catalog) in [("c%", "c2"), ("c_", "c_")] {
+            for error_code in [
+                "INVALID_PARAMETER_VALUE",
+                "SCHEMA_NOT_FOUND",
+                "TABLE_OR_VIEW_NOT_FOUND",
+                "NO_SUCH_CATALOG_EXCEPTION",
+            ] {
+                let server = MockServer::builder().start().await;
+                mount_create_session(&server).await;
+                mount_delete_session(&server).await;
+                let catalogs = string_batch(vec![("catalog", vec![Some("c1"), Some(catalog)])]);
+                mount_execute_expecting_sql(
+                    &server,
+                    "SHOW CATALOGS",
+                    closed_inline_response_body(&catalogs),
+                )
+                .await;
+                let table = string_batch(vec![
+                    ("namespace", vec![Some("default")]),
+                    ("tableName", vec![Some("t")]),
+                    ("tableType", vec![Some("TABLE")]),
+                ]);
+                mount_execute_expecting_sql(
+                    &server,
+                    "IN CATALOG `c1`",
+                    closed_inline_response_body(&table),
+                )
+                .await;
+                let batch = if native {
+                    string_batch(vec![
+                        ("TABLE_CAT", vec![Some(catalog)]),
+                        ("TABLE_SCHEM", vec![Some("default")]),
+                        ("TABLE_NAME", vec![Some("t")]),
+                        ("TABLE_TYPE", vec![Some("TABLE")]),
+                        ("REMARKS", vec![None]),
+                        ("TYPE_CAT", vec![None]),
+                        ("TYPE_SCHEM", vec![None]),
+                        ("TYPE_NAME", vec![None]),
+                        ("SELF_REFERENCING_COL_NAME", vec![None]),
+                        ("REF_GENERATION", vec![None]),
+                    ])
+                } else {
+                    table
+                };
+                let mut body: serde_json::Value =
+                    serde_json::from_str(&succeeded_inline_response_body(&batch)).unwrap();
+                body["statement_id"] = json!("read-error");
+                body["manifest"]["is_native_metadata_result"] = json!(native);
+                body["manifest"]["total_chunk_count"] = json!(2);
+                body["manifest"]["total_row_count"] = json!(2);
+                body["result"]["next_chunk_index"] = json!(1);
+                Mock::given(method("POST"))
+                    .and(path("/api/2.0/sql/statements"))
+                    .and(body_string_contains(format!("IN CATALOG `{catalog}`")))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+                Mock::given(method("GET"))
+                    .and(path("/api/2.0/sql/statements/read-error/result/chunks/1"))
+                    .respond_with(
+                        ResponseTemplate::new(400).set_body_json(json!({"error_code": error_code})),
+                    )
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+                Mock::given(method("DELETE"))
+                    .and(path("/api/2.0/sql/statements/read-error"))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+                let session = open_session(&server).await;
+                let error = session
+                    .metadata()
+                    .list_tables(Some(LikePattern::new(pattern).unwrap()), None, None, None)
+                    .await
+                    .err()
+                    .expect("a read error must not return silently partial catalog rows");
+                assert!(error.to_string().contains(error_code), "{error}");
+                session.close().await.unwrap();
+                server.verify().await;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn list_tables_confirmed_speculative_errors_do_not_repeat_the_query() {
+    for sql_state in ["42501", "HY000"] {
+        for catalogs in [vec!["bench_name"], vec!["benchXname", "bench_name"]] {
+            let server = MockServer::builder().start().await;
+            mount_create_session(&server).await;
+            mount_delete_session(&server).await;
+            let catalogs =
+                string_batch(vec![("catalog", catalogs.into_iter().map(Some).collect())]);
+            mount_execute_expecting_sql(
+                &server,
+                "SHOW CATALOGS",
+                closed_inline_response_body(&catalogs),
+            )
+            .await;
+            let other_table = string_batch(vec![
+                ("namespace", vec![Some("default")]),
+                ("tableName", vec![Some("other")]),
+                ("tableType", vec![Some("TABLE")]),
+            ]);
+            mount_execute_expecting_sql(
+                &server,
+                "IN CATALOG `benchXname`",
+                closed_inline_response_body(&other_table),
+            )
+            .await;
+            Mock::given(method("POST"))
+                .and(path("/api/2.0/sql/statements"))
+                .and(body_string_contains("IN CATALOG `bench_name`"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_string(failed_response_body(
+                        sql_state,
+                        "confirmed speculative error",
+                    )),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("DELETE"))
+                .and(path("/api/2.0/sql/statements/stmt-test"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let session = open_session(&server).await;
+            let error = session
+                .metadata()
+                .list_tables(
+                    Some(LikePattern::new("bench_name").unwrap()),
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .err()
+                .expect("confirmed error must propagate");
+            assert_eq!(error.sql_state.as_deref(), Some(sql_state));
+            assert!(error.to_string().contains("confirmed speculative error"));
+            session.close().await.unwrap();
+            server.verify().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn list_tables_unmatched_speculative_error_does_not_fail_other_catalogs() {
+    let server = MockServer::builder().start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+    let catalogs = string_batch(vec![("catalog", vec![Some("benchXname")])]);
+    mount_execute_expecting_sql(
+        &server,
+        "SHOW CATALOGS",
+        closed_inline_response_body(&catalogs),
+    )
+    .await;
+    mount_execute_expecting_sql(
+        &server,
+        "IN CATALOG `bench_name`",
+        failed_response_body("42501", "unmatched speculative error"),
+    )
+    .await;
+    let table = string_batch(vec![
+        ("namespace", vec![Some("default")]),
+        ("tableName", vec![Some("t")]),
+        ("catalogName", vec![Some("benchXname")]),
+        ("tableType", vec![Some("TABLE")]),
+    ]);
+    mount_execute_expecting_sql(
+        &server,
+        "IN CATALOG `benchXname`",
+        closed_inline_response_body(&table),
+    )
+    .await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/2.0/sql/statements/stmt-test"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let session = open_session(&server).await;
+    let mut stream = session
+        .metadata()
+        .list_tables(
+            Some(LikePattern::new("bench_name").unwrap()),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let batches = drain_stream(&mut stream).await;
+    assert_eq!(batches[0].num_rows(), 1);
+    assert_eq!(
+        batches[0].column(0).as_string::<i32>().value(0),
+        "benchXname"
+    );
+    assert_eq!(
+        wait_for_close_delete(&server, 1, std::time::Duration::from_secs(2)).await,
+        1
+    );
+    session.close().await.unwrap();
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn list_tables_ineligible_patterns_skip_slow_unusable_speculation() {
+    use std::time::Duration;
+
+    let cases = [
+        ("%ai%", "%ai%", "main"),
+        (
+            "metadata_benchmark%",
+            "metadata_benchmark%",
+            "metadata_benchmarking",
+        ),
+        (
+            r"%\_benchmarking%",
+            "%_benchmarking%",
+            "metadata_benchmarking",
+        ),
+        (r"\%%", "%%", "%real"),
+        (r"bench\%name_", "bench%name_", "bench%nameX"),
+        ("bench*_name", "bench*_name", "bench*Xname"),
+        ("BENCH_NAME", "BENCH_NAME", "bench_name"),
+        ("Bench_name", "Bench_name", "bench_name"),
+    ];
+    for (pattern, literal, matched) in cases {
+        let server = MockServer::builder().start().await;
+        mount_create_session(&server).await;
+        mount_delete_session(&server).await;
+        let catalogs = string_batch(vec![("catalog", vec![Some(matched)])]);
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/statements"))
+            .and(body_string_contains("SHOW CATALOGS"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(closed_inline_response_body(&catalogs))
+                    .set_delay(Duration::from_millis(50)),
+            )
+            .mount(&server)
+            .await;
+        let table = string_batch(vec![
+            ("namespace", vec![Some("default")]),
+            ("tableName", vec![Some("t")]),
+            ("catalogName", vec![Some(matched)]),
+            ("tableType", vec![Some("TABLE")]),
+        ]);
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/statements"))
+            .and(body_string_contains(format!("IN CATALOG `{literal}`")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(closed_inline_response_body(&table))
+                    .set_delay(Duration::from_secs(2)),
+            )
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/statements"))
+            .and(body_string_contains(format!("IN CATALOG `{matched}`")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(closed_inline_response_body(&table))
+                    .set_delay(Duration::from_millis(50)),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let session = open_session(&server).await;
+        let metadata = session.metadata();
+        let mut stream = tokio::time::timeout(
+            Duration::from_secs(1),
+            metadata.list_tables(Some(LikePattern::new(pattern).unwrap()), None, None, None),
+        )
+        .await
+        .expect("broad patterns must not wait for an unusable speculative scan")
+        .unwrap();
+        let batches = drain_stream(&mut stream).await;
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+        let statements = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| {
+                request.method == "POST" && request.url.path() == "/api/2.0/sql/statements"
+            })
+            .count();
+        assert_eq!(statements, 2, "pattern={pattern}");
+        session.close().await.unwrap();
+        server.verify().await;
+    }
+}
+
+#[tokio::test]
+async fn list_tables_slow_literal_in_multi_match_is_fetched_only_once() {
+    use std::time::Duration;
+
+    let server = MockServer::builder().start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+    let catalogs = string_batch(vec![("catalog", vec![Some("c-t"), Some("c_t")])]);
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .and(body_string_contains("SHOW CATALOGS"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(closed_inline_response_body(&catalogs))
+                .set_delay(Duration::from_millis(50)),
+        )
+        .mount(&server)
+        .await;
+    for catalog in ["c-t", "c_t"] {
+        let table = string_batch(vec![
+            ("namespace", vec![Some("default")]),
+            ("tableName", vec![Some("t")]),
+            ("catalogName", vec![Some(catalog)]),
+            ("tableType", vec![Some("TABLE")]),
+        ]);
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/statements"))
+            .and(body_string_contains(format!("IN CATALOG `{catalog}`")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(closed_inline_response_body(&table))
+                    .set_delay(Duration::from_millis(500)),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+    let session = open_session(&server).await;
+    let metadata = session.metadata();
+    let mut stream = tokio::time::timeout(
+        Duration::from_millis(800),
+        metadata.list_tables(Some(LikePattern::new("c_t").unwrap()), None, None, None),
+    )
+    .await
+    .expect("other matched catalogs must not wait for the speculative listing")
+    .unwrap();
+    let batches = drain_stream(&mut stream).await;
+    let catalogs: Vec<_> = batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_string::<i32>()
+                .iter()
+                .map(|value| value.unwrap().to_owned())
+        })
+        .collect();
+    assert_eq!(catalogs, vec!["c-t", "c_t"]);
+    session.close().await.unwrap();
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn list_tables_speculation_closes_result_when_catalog_lookup_fails() {
+    use std::time::Duration;
+
+    let server = MockServer::builder().start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .and(body_string_contains("SHOW CATALOGS"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(
+                    failed_response_body("42501", "catalog lookup failure")
+                        .replace("stmt-test", "failed-catalog-lookup"),
+                )
+                .set_delay(Duration::from_millis(50)),
+        )
+        .mount(&server)
+        .await;
+    let table = string_batch(vec![
+        ("namespace", vec![Some("default")]),
+        ("tableName", vec![Some("t")]),
+        ("tableType", vec![Some("TABLE")]),
+    ]);
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .and(body_string_contains("IN CATALOG `bench_name`"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(
+                    succeeded_inline_response_body(&table)
+                        .replace("stmt-test", "unused-speculation"),
+                )
+                .set_delay(Duration::from_secs(2)),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    for statement_id in ["failed-catalog-lookup", "unused-speculation"] {
+        Mock::given(method("DELETE"))
+            .and(path(format!("/api/2.0/sql/statements/{statement_id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+    let session = open_session(&server).await;
+    let metadata = session.metadata();
+    let result = tokio::time::timeout(
+        Duration::from_millis(500),
+        metadata.list_tables(
+            Some(LikePattern::new("bench_name").unwrap()),
+            None,
+            None,
+            None,
+        ),
+    )
+    .await
+    .expect("lookup failure must not wait for speculative execution");
+    let error = result.err().expect("catalog lookup failure must propagate");
+    assert!(error.to_string().contains("catalog lookup failure"));
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .any(|request| {
+                    request.method == "DELETE"
+                        && request.url.path() == "/api/2.0/sql/statements/unused-speculation"
+                })
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("detached execution must eventually close its known statement");
+    server.verify().await;
+    session.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn list_tables_unused_execution_is_released_before_other_catalogs_finish() {
+    use std::time::Duration;
+
+    let server = MockServer::builder().start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+    let catalogs = string_batch(vec![("catalog", vec![Some("benchXname")])]);
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .and(body_string_contains("SHOW CATALOGS"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(closed_inline_response_body(&catalogs))
+                .set_delay(Duration::from_millis(50)),
+        )
+        .mount(&server)
+        .await;
+    let table = string_batch(vec![
+        ("namespace", vec![Some("default")]),
+        ("tableName", vec![Some("t")]),
+        ("tableType", vec![Some("TABLE")]),
+    ]);
+    mount_execute_expecting_sql(
+        &server,
+        "IN CATALOG `bench_name`",
+        succeeded_inline_response_body(&table),
+    )
+    .await;
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .and(body_string_contains("IN CATALOG `benchXname`"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(closed_inline_response_body(&table))
+                .set_delay(Duration::from_millis(500)),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/2.0/sql/statements/stmt-test"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let session = open_session(&server).await;
+    let metadata = session.metadata();
+    let mut future = Box::pin(metadata.list_tables(
+        Some(LikePattern::new("bench_name").unwrap()),
+        None,
+        None,
+        None,
+    ));
+    tokio::select! {
+        _ = &mut future => panic!("the other catalog must still be pending"),
+        count = wait_for_close_delete(&server, 1, Duration::from_millis(300)) => {
+            assert_eq!(count, 1, "unused execution must be released after discovery");
+        }
+    }
+    let mut stream = future.await.unwrap();
+    let batches = drain_stream(&mut stream).await;
+    assert_eq!(batches[0].num_rows(), 1);
+    assert_eq!(
+        batches[0].column(0).as_string::<i32>().value(0),
+        "benchXname"
+    );
+    session.close().await.unwrap();
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn list_tables_canceled_pending_speculation_closes_after_execute() {
+    use std::time::Duration;
+
+    let server = MockServer::builder().start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+    let catalogs = string_batch(vec![("catalog", vec![Some("bench_name")])]);
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .and(body_string_contains("SHOW CATALOGS"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(closed_inline_response_body(&catalogs))
+                .set_delay(Duration::from_secs(2)),
+        )
+        .mount(&server)
+        .await;
+    let table = string_batch(vec![
+        ("namespace", vec![Some("default")]),
+        ("tableName", vec![Some("t")]),
+        ("tableType", vec![Some("TABLE")]),
+    ]);
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .and(body_string_contains("IN CATALOG `bench_name`"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(succeeded_inline_response_body(&table))
+                .set_delay(Duration::from_millis(200)),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/2.0/sql/statements/stmt-test"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let session = open_session(&server).await;
+    let metadata = session.metadata();
+    let mut future = Box::pin(metadata.list_tables(
+        Some(LikePattern::new("bench_name").unwrap()),
+        None,
+        None,
+        None,
+    ));
+    let executing = async {
+        loop {
+            if server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .any(|request| {
+                    String::from_utf8_lossy(&request.body).contains("IN CATALOG `bench_name`")
+                })
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::select! {
+        _ = &mut future => panic!("discovery must still be pending"),
+        result = tokio::time::timeout(Duration::from_secs(1), executing) => result.unwrap(),
+    }
+    drop(future);
+    assert_eq!(
+        wait_for_close_delete(&server, 1, Duration::from_secs(2)).await,
+        1
+    );
+    session.close().await.unwrap();
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn list_tables_canceled_speculation_completes_one_close() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    let server = MockServer::builder().start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+    let catalogs = string_batch(vec![("catalog", vec![Some("bench_name")])]);
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .and(body_string_contains("SHOW CATALOGS"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(closed_inline_response_body(&catalogs)),
+        )
+        .mount(&server)
+        .await;
+    let table = string_batch(vec![
+        ("namespace", vec![Some("default")]),
+        ("tableName", vec![Some("t")]),
+        ("tableType", vec![Some("TABLE")]),
+    ]);
+    mount_execute_expecting_sql(
+        &server,
+        "IN CATALOG `bench_name`",
+        succeeded_inline_response_body(&table).replace("stmt-test", "canceled-speculation"),
+    )
+    .await;
+    let closes = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&closes);
+    Mock::given(method("DELETE"))
+        .and(path("/api/2.0/sql/statements/canceled-speculation"))
+        .respond_with(move |_: &wiremock::Request| {
+            let response = ResponseTemplate::new(200).set_body_json(json!({}));
+            if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                response.set_delay(Duration::from_millis(150))
+            } else {
+                ResponseTemplate::new(404)
+                    .set_body_json(json!({ "error_code": "STATEMENT_NOT_FOUND" }))
+            }
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+    let session = open_session(&server).await;
+    let metadata = session.metadata();
+    let mut future = Box::pin(metadata.list_tables(
+        Some(LikePattern::new("bench_name").unwrap()),
+        None,
+        None,
+        None,
+    ));
+    let closing = async {
+        while closes.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::select! {
+        _ = &mut future => panic!("delayed statement close must still be pending"),
+        result = tokio::time::timeout(Duration::from_secs(2), closing) => {
+            result.expect("speculation must start closing its statement");
+        }
+    }
+    drop(future);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(closes.load(Ordering::SeqCst), 1);
+    server.verify().await;
+    session.close().await.unwrap();
 }
 
 #[tokio::test]

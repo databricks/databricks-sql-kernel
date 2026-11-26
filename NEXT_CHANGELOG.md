@@ -13,6 +13,8 @@ changes go in their respective binding's NEXT_CHANGELOG.
 
 ### Changed
 
+- Table metadata overlaps catalog discovery with a scoped query for lowercase underscore patterns without percent or star characters in the literal scope, reusing the matching catalog's response while other matches run concurrently. A miss may add one statement, which finishes and closes independently when unused.
+
 ### Updated
 
 ### Fixed

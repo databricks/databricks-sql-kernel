@@ -500,6 +500,43 @@ pub struct Metadata {
     session: Arc<SessionInner>,
 }
 
+struct TablesExecution {
+    raw: ExecuteResult,
+    close_guard: Option<TablesCloseGuard>,
+}
+
+type TablesExecutionTask = tokio::task::JoinHandle<Result<Option<TablesExecution>>>;
+
+struct TablesCloseGuard {
+    session: Arc<SessionInner>,
+    statement_id: String,
+}
+
+impl TablesCloseGuard {
+    fn start_close(&mut self) -> Option<tokio::task::JoinHandle<()>> {
+        let statement_id = std::mem::take(&mut self.statement_id);
+        if statement_id.is_empty() {
+            return None;
+        }
+        let transport = Arc::clone(self.session.transport());
+        let span = self.session.log_span().clone();
+        Some(
+            self.session.runtime_handle().spawn(
+                async move {
+                    transport.close_statement(&statement_id).await.ok();
+                }
+                .instrument(span),
+            ),
+        )
+    }
+}
+
+impl Drop for TablesCloseGuard {
+    fn drop(&mut self) {
+        drop(self.start_close());
+    }
+}
+
 impl Metadata {
     pub(crate) fn new(session: Arc<SessionInner>) -> Self {
         Self { session }
@@ -878,13 +915,10 @@ impl Metadata {
         Self::finish_metadata_call(telemetry, result)
     }
 
-    /// Enumerate catalogs, keep those matching `pattern`
-    /// (case-insensitive ODBC/JDBC LIKE), and fan out one scoped
-    /// `SHOW TABLES IN CATALOG <name>` per match — reproducing Thrift's
-    /// catalog wildcarding without the whole-workspace scan of
-    /// `SHOW TABLES IN ALL CATALOGS`. The per-catalog queries run with
-    /// bounded parallelism; their reshaped rows are concatenated and
-    /// re-sorted into the JDBC row order.
+    /// Resolve wildcard catalogs while speculating a narrow literal scope.
+    /// Reuse its result for the byte-identical matched catalog, if present;
+    /// use bounded fan-out for the other catalogs. Concatenate and re-sort
+    /// the reshaped rows into JDBC order without a whole-workspace table scan.
     async fn list_tables_matching_catalogs(
         &self,
         pattern: &str,
@@ -895,28 +929,68 @@ impl Metadata {
     ) -> Result<ResultStream> {
         use futures::stream::{FuturesUnordered, StreamExt};
 
-        // 1. Enumerate + filter catalog names client-side.
-        let matcher = LikeMatcher::new(pattern);
-        let noop = StatementTelemetry::noop();
-        let mut catalogs = self.list_catalogs_uninstrumented(&noop).await?;
-        let mut names: Vec<String> = Vec::new();
-        let mut enumerated = 0usize;
-        while let Some(batch) = catalogs.next_batch().await? {
-            let ResultBatch::Arrow(rb) = batch;
-            // GET_CATALOGS_SCHEMA is a single `TABLE_CAT: Utf8` column.
-            let col = rb
-                .column(0)
-                .as_any()
-                .downcast_ref::<arrow_array::StringArray>()
-                .ok_or_else(|| Error::data_loss().message("TABLE_CAT is not Utf8"))?;
-            for i in 0..col.len() {
-                enumerated += 1;
-                if !col.is_null(i) && matcher.matches(col.value(i)) {
-                    names.push(col.value(i).to_owned());
+        let schema_str = schema_pattern.as_ref().map(|p| p.as_str().to_owned());
+        let table_str = table_pattern.as_ref().map(|p| p.as_str().to_owned());
+        let types_owned: Option<Vec<String>> =
+            table_types.map(|s| s.iter().map(|t| (*t).to_owned()).collect());
+        let literal = SqlCommandBuilder::strip_jdbc_escapes(pattern);
+        let lookup = async {
+            let matcher = LikeMatcher::new(pattern);
+            let noop = StatementTelemetry::noop();
+            let mut catalogs = self.list_catalogs_uninstrumented(&noop).await?;
+            let mut names: Vec<String> = Vec::new();
+            let mut enumerated = 0usize;
+            while let Some(batch) = catalogs.next_batch().await? {
+                let ResultBatch::Arrow(rb) = batch;
+                // GET_CATALOGS_SCHEMA is a single `TABLE_CAT: Utf8` column.
+                let col = rb
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow_array::StringArray>()
+                    .ok_or_else(|| Error::data_loss().message("TABLE_CAT is not Utf8"))?;
+                for i in 0..col.len() {
+                    enumerated += 1;
+                    if !col.is_null(i) && matcher.matches(col.value(i)) {
+                        names.push(col.value(i).to_owned());
+                    }
                 }
             }
-        }
-        catalogs.close();
+            catalogs.close();
+            Ok::<_, Error>((names, enumerated))
+        };
+        let mut speculative = if SqlCommandBuilder::pattern_has_wildcards(pattern)
+            && !literal.contains(['%', '*'])
+            && !literal.chars().any(char::is_uppercase)
+        {
+            let metadata = Self::new(Arc::clone(&self.session));
+            let catalog = literal.clone();
+            let schema = schema_str.clone();
+            let table = table_str.clone();
+            let types = types_owned.clone();
+            // Detaching keeps an in-flight execute alive until its known ID
+            // can be closed, without retaining unused result batches.
+            Some(
+                self.session.runtime_handle().spawn(
+                    async move {
+                        let types_ref: Option<Vec<&str>> = types
+                            .as_ref()
+                            .map(|v| v.iter().map(String::as_str).collect());
+                        metadata
+                            .execute_tables_for_catalog(
+                                &catalog,
+                                schema.as_deref(),
+                                table.as_deref(),
+                                types_ref.as_deref(),
+                            )
+                            .await
+                    }
+                    .instrument(tracing::Span::current()),
+                ),
+            )
+        } else {
+            None
+        };
+        let (mut names, enumerated) = lookup.await?;
         // One correlatable line tying the fan-out back to its cause: how
         // many catalogs a wildcard `list_tables` matched (and will query),
         // vs how many exist. Lets on-call spot fan-out amplification (a
@@ -929,8 +1003,8 @@ impl Metadata {
             "list_tables catalog wildcard fan-out"
         );
 
-        // No catalog matched → typed empty result, no further wire calls.
         if names.is_empty() {
+            drop(speculative);
             Self::observe_inline_result(telemetry);
             return ResultStream::from_reader(Box::new(EmptyReader::new(
                 GET_TABLES_SCHEMA.clone(),
@@ -943,22 +1017,37 @@ impl Metadata {
         // be hit with an unbounded burst when a loose pattern matches many
         // catalogs.
         const MAX_INFLIGHT: usize = 8;
-        let schema_str = schema_pattern.as_ref().map(|p| p.as_str().to_owned());
-        let table_str = table_pattern.as_ref().map(|p| p.as_str().to_owned());
-        let types_owned: Option<Vec<String>> =
-            table_types.map(|s| s.iter().map(|t| (*t).to_owned()).collect());
 
+        let mut all_batches: Vec<arrow_array::RecordBatch> = Vec::new();
+        let literal_speculation = names
+            .iter()
+            .position(|name| name == &literal)
+            .and_then(|index| speculative.take().map(|task| (names.remove(index), task)));
+        // Release completed unused responses now; pending executes finish
+        // and close on the session runtime without gating matched catalogs.
+        drop(speculative);
         let mut inflight = FuturesUnordered::new();
         let mut remaining = names.into_iter();
-        for name in remaining.by_ref().take(MAX_INFLIGHT) {
+        let ordinary_slots = MAX_INFLIGHT - usize::from(literal_speculation.is_some());
+        for name in remaining.by_ref().take(ordinary_slots) {
             inflight.push(self.fetch_tables_for_catalog(
                 name,
                 schema_str.clone(),
                 table_str.clone(),
                 types_owned.clone(),
+                None,
             ));
         }
-        let mut all_batches: Vec<arrow_array::RecordBatch> = Vec::new();
+        // Start other executes before draining an already-ready literal response.
+        if let Some((name, task)) = literal_speculation {
+            inflight.push(self.fetch_tables_for_catalog(
+                name,
+                schema_str.clone(),
+                table_str.clone(),
+                types_owned.clone(),
+                Some(task),
+            ));
+        }
         while let Some(result) = inflight.next().await {
             all_batches.extend(result?);
             if let Some(name) = remaining.next() {
@@ -967,6 +1056,7 @@ impl Metadata {
                     schema_str.clone(),
                     table_str.clone(),
                     types_owned.clone(),
+                    None,
                 ));
             }
         }
@@ -995,48 +1085,57 @@ impl Metadata {
     }
 
     /// Fetch + reshape `SHOW TABLES IN CATALOG <catalog>` into JDBC-shape
-    /// batches. An object-not-found error (catalog dropped between
-    /// enumeration and this call) collapses to zero rows, matching the
-    /// JDBC empty-result contract. Used by the fan-out path.
+    /// batches. Only execute-phase not-found collapses to zero rows;
+    /// read and reshape errors always propagate. A speculative execute
+    /// that found no catalog is retried after discovery confirms it.
     async fn fetch_tables_for_catalog(
         &self,
         catalog: String,
         schema_pattern: Option<String>,
         table_pattern: Option<String>,
         table_types: Option<Vec<String>>,
+        speculative: Option<TablesExecutionTask>,
     ) -> Result<Vec<arrow_array::RecordBatch>> {
         let types_ref: Option<Vec<&str>> = table_types
             .as_ref()
             .map(|v| v.iter().map(String::as_str).collect());
-        let raw = match self
-            .session
-            .transport()
-            .list_tables(
-                self.session.session_id(),
-                Some(catalog.as_str()),
-                schema_pattern.as_deref(),
-                table_pattern.as_deref(),
-                types_ref.as_deref(),
-            )
-            .await
-        {
-            Ok(r) => r,
-            // Catalog vanished mid-enumeration → contribute no rows.
-            Err(e) if thrift_shape::is_object_not_found(&e) => return Ok(Vec::new()),
-            Err(e) => return Err(e),
+        let execution = match speculative {
+            Some(task) => task.await.map_err(|error| {
+                Error::internal().message(format!("Table metadata execution task failed: {error}"))
+            })??,
+            None => None,
+        };
+        let execution = match execution {
+            Some(execution) => Some(execution),
+            None => {
+                self.execute_tables_for_catalog(
+                    &catalog,
+                    schema_pattern.as_deref(),
+                    table_pattern.as_deref(),
+                    types_ref.as_deref(),
+                )
+                .await?
+            }
+        };
+        let Some(TablesExecution {
+            raw,
+            mut close_guard,
+        }) = execution
+        else {
+            return Ok(Vec::new());
         };
         // Read + reshape into `out`. Capture the result rather than `?`-ing
         // out early: the fan-out opens one statement per catalog and
         // `ExecuteResult` has no Drop-based close, so a mid-stream read
-        // error must still close this statement or it leaks server-side
-        // (unlike the streaming paths, which close via a StatementCloseGuard).
+        // error must still close this statement or it leaks server-side.
+        // TablesCloseGuard also reaps it if this future is dropped mid-read;
+        // an already-started close finishes independently of its awaiter.
         //
         // `close_id` returns an empty id when the server already reported
         // `status.state == Closed` (statement reaped server-side); skip the
         // redundant CloseStatement DELETE in that case, mirroring the
         // streaming metadata paths and the regular-query path in
         // `statement/mutable.rs`.
-        let stmt_id = close_id(&raw);
         let native = is_native_metadata_result(&raw);
         let mut reader = raw.reader;
         let read: Result<Vec<arrow_array::RecordBatch>> = async {
@@ -1063,14 +1162,42 @@ impl Metadata {
         .await;
         // Best-effort close on every exit (success or error), unless the
         // statement was already closed server-side.
-        if !stmt_id.is_empty() {
-            self.session
-                .transport()
-                .close_statement(&stmt_id)
-                .await
-                .ok();
+        let close_task = close_guard.as_mut().and_then(TablesCloseGuard::start_close);
+        if let Some(close_task) = close_task {
+            close_task.await.ok();
         }
         read
+    }
+
+    async fn execute_tables_for_catalog(
+        &self,
+        catalog: &str,
+        schema_pattern: Option<&str>,
+        table_pattern: Option<&str>,
+        table_types: Option<&[&str]>,
+    ) -> Result<Option<TablesExecution>> {
+        let raw = match self
+            .session
+            .transport()
+            .list_tables(
+                self.session.session_id(),
+                Some(catalog),
+                schema_pattern,
+                table_pattern,
+                table_types,
+            )
+            .await
+        {
+            Ok(raw) => raw,
+            Err(error) if thrift_shape::is_object_not_found(&error) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let statement_id = close_id(&raw);
+        let close_guard = (!statement_id.is_empty()).then(|| TablesCloseGuard {
+            session: Arc::clone(&self.session),
+            statement_id,
+        });
+        Ok(Some(TablesExecution { raw, close_guard }))
     }
 
     /// `SHOW TABLES IN CATALOG <catalog>` (or `IN ALL CATALOGS` when

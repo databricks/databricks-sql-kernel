@@ -125,11 +125,10 @@ impl SqlCommandBuilder {
     /// Unescape an ODBC/JDBC pattern into a literal identifier: `\%` →
     /// `%`, `\_` → `_`, `\\` → `\`. A lone trailing backslash is kept.
     ///
-    /// Only valid to call on a pattern with no *active* wildcards (see
-    /// [`pattern_has_wildcards`](Self::pattern_has_wildcards)); such a
-    /// pattern denotes an exact catalog name, and the escapes must be
-    /// removed before it goes into a backtick-quoted `IN CATALOG`
-    /// identifier. Mirrors the JDBC driver's `WildcardUtil.stripJdbcEscapes`.
+    /// A pattern without active wildcards denotes an exact catalog name.
+    /// Active wildcards remain literal characters in the returned identifier;
+    /// speculative callers must confirm the catalog match before reusing it.
+    /// Mirrors the JDBC driver's `WildcardUtil.stripJdbcEscapes`.
     pub fn strip_jdbc_escapes(pattern: &str) -> String {
         let mut result = String::with_capacity(pattern.len());
         let mut chars = pattern.chars().peekable();
