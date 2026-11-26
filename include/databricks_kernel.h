@@ -404,7 +404,8 @@ KernelStatusCode kernel_init_logging(const char* level, const char* file_path);
  * that kernel operation. Hosts that need asynchronous logging can copy the
  * record into their own bounded queue and return. Strings are valid only during
  * the callback. Calls may be concurrent; copy retained strings and synchronize
- * the destination. `user_data` is the pointer supplied at initialization. */
+ * the destination. `user_data` is the pointer supplied at initialization.
+ * Kernel threads run with SIGPIPE blocked; callbacks must not unblock it. */
 typedef void (*KernelLogCallback)(const char* level, const char* target,
                                   const char* message, void* user_data);
 

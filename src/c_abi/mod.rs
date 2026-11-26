@@ -62,7 +62,8 @@ use std::sync::OnceLock;
 /// synchronous on the emitting thread, and callbacks may run concurrently on
 /// multiple kernel threads. Consumers must return promptly, copy any strings
 /// they retain, and synchronize their sink. A consumer that needs asynchronous
-/// delivery can enqueue its own owned record before returning.
+/// delivery can enqueue its own owned record before returning. Kernel threads
+/// run with SIGPIPE blocked, and callbacks must not unblock it.
 pub type KernelLogCallback = unsafe extern "C" fn(
     level: *const c_char,
     target: *const c_char,
@@ -566,5 +567,67 @@ mod tests {
     fn c_abi_runtime_threads_block_sigpipe() {
         let rt = runtime().expect("C-ABI runtime");
         crate::util::runtime::assert_runtime_threads_block_sigpipe(rt.handle());
+    }
+
+    #[cfg(target_os = "linux")]
+    const SIGPIPE_CHILD: &str = "DATABRICKS_KERNEL_SIGPIPE_CHILD";
+
+    /// With SIGPIPE at its default action, as in a Go host, a write after a peer
+    /// reset on a C-ABI worker must fail with EPIPE instead of killing the process.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn c_abi_write_after_peer_reset_returns_epipe() {
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "c_abi::tests::c_abi_write_after_peer_reset_child",
+                "--nocapture",
+            ])
+            .env(SIGPIPE_CHILD, "1")
+            .output()
+            .expect("launch SIGPIPE subprocess");
+
+        assert!(
+            output.status.success(),
+            "write after peer reset failed (status {}):\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn c_abi_write_after_peer_reset_child() {
+        if std::env::var_os(SIGPIPE_CHILD).is_none() {
+            return;
+        }
+        // SAFETY: sets the process-wide default action; no handler is involved.
+        unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
+        let kind = block_on_ffi(write_after_peer_reset).expect("C-ABI probe");
+        assert_eq!(kind, std::io::ErrorKind::BrokenPipe);
+    }
+
+    /// Reads ECONNRESET from a peer that reset the connection, then writes with
+    /// `write_vectored` (a plain `writev`) and returns the write's error kind.
+    #[cfg(target_os = "linux")]
+    #[allow(deprecated)] // `set_linger`: a zero linger resets on close without blocking
+    async fn write_after_peer_reset() -> crate::kernel_error::Result<std::io::ErrorKind> {
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::{TcpListener, TcpStream};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let (peer, _) = listener.accept().await.unwrap();
+        peer.set_linger(Some(Duration::ZERO)).unwrap();
+        drop(peer);
+
+        let read = client.read(&mut [0u8; 1]).await.unwrap_err();
+        assert_eq!(read.kind(), std::io::ErrorKind::ConnectionReset);
+        let bufs = [std::io::IoSlice::new(b"x")];
+        let write = client.write_vectored(&bufs).await.unwrap_err();
+        Ok(write.kind())
     }
 }
