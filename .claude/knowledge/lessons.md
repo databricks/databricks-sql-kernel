@@ -1,6 +1,6 @@
 # Lessons
 
-<!-- distilled-through: 2026-11-18 -->
+<!-- distilled-through: 2026-11-26 -->
 
 ## Public API and bindings
 - L-0001 (4×, #250 #184 #372): Preserve public Rust compatibility: non-exhaustive structs need external builders, public enums need fallback arms, and breaking 1.x type changes require a major release.
@@ -78,12 +78,13 @@
 - L-0065 (3×, #291 #353 #393): Client-side catalog/schema/table identifier filters use eq_ignore_ascii_case; table_types filters are case-sensitive. Preserve Databricks Thrift type-info flags, including CASE_SENSITIVE: STRING=true, CHAR/VARCHAR=false.
 - L-0066 (1×, #355): Translate JDBC patterns separately from SQL literal escaping; translate wildcards first and escape exactly once where the result enters SQL.
 - L-0067 (3×, #355 #364): Normalize native metadata values per operation/schema, not bare column names or position alone. Native GetColumns ordinals need +1; SHOW fallback is already one-based.
-- L-0068 (2×, #369 #381): In metadata fallback reshapes, preserve optional server columns when present and tolerate missing/uncastable ones as null; test native, fallback and empty-result schemas.
+- L-0068 (3×, #506 #381 #369): Apply metadata normalization/filter changes and tests to both native (thrift-native-metadata) and SHOW fallback paths; preserve optional server columns, tolerate missing ones as null, and default nulls before rebuilding non-nullable public schemas.
 - L-0069 (2×, #369 #379): Resolve current catalog/schema live after USE operations. Do not backfill current schema independently when an explicit different catalog was supplied.
 - L-0070 (1×, #365): The SEA manifest defines logical types; arrow_schema describes physical attachments. Use consistent logical-schema fallback on broken attachment schemas for empty and streaming results.
 - L-0071 (1×, #360): Numeric-to-text conversions need reference parity tests for fractional, huge and tiny values; integer cases miss precision, trailing-zero and scientific-notation drift.
 - L-0072 (3×, #391 #390 #396): Match server Arrow conventions literally: ARRAY child name element and Thrift Spark:DataType:* metadata keys. Assert literal wire strings, not only shared constants.
 - L-0073 (3×, #361 #410): Nested Arrow conversion must honor ancestor validity/offsets before parsing. Verify physical nulls before tightening nullability, and test default transforms against null-bearing and real server data.
+- L-0115 (1×, #506): table_types filters keep rows whose TABLE_TYPE is null/empty (emitted as "") like Thrift/JDBC, exact-match known types, and return nothing for an explicit empty filter; default "TABLE" only when the column is absent.
 
 ## Telemetry and logging
 - L-0074 (2×, #255 #266 #256): Mirror each telemetry field meaning and JSON type: proto int64 fields are strings while wrapper numbers stay numeric; stack_trace must not contain unrelated status codes.
@@ -109,6 +110,8 @@
 - L-0092 (2×, #333 #429): Keep required checks always present. Compute path changes from BASE...HEAD with full history and include standalone workspaces plus their root path dependencies.
 - L-0093 (1×, #429): repository_dispatch 204 only acknowledges delivery. Sender-owned checks need cancellation/failure completion and stale-check expiry; list check runs with filter: all.
 - L-0094 (2×, #411 #412 #473): Regenerate dependency pins on the normal toolchain with a healthy registry. Inspect every lockfile for unrelated downgrades/checksum drift and validate locked builds.
+- L-0116 (1×, #502): Copy upstream Apache-2.0 NOTICE text verbatim into every shipped NOTICE (§4(d)); guard per-crate LICENSE/NOTICE copies with CI cmp against root, cargo package --list checks per manifest, and path filters.
+- L-0117 (1×, #503): When condensing user docs, keep security warnings, per-binding limitations and an option-key reference (or link one); private-const keys may have no other public reference.
 
 ## Review follow-up [phase=review,followup]
 - L-0095 (1×, #257): Before claiming a review finding is already fixed or a symbol exists, reread HEAD and cite its current lines; remembered or partial source reads waste review rounds.
