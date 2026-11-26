@@ -3599,6 +3599,72 @@ async fn native_batch_transport_and_result_failures_do_not_replay() {
 }
 
 #[tokio::test]
+async fn async_native_batch_cloudfetch_failure_is_not_retryable() {
+    for native in [false, true] {
+        let server = MockServer::start().await;
+        mount_create_session(&server).await;
+        mount_close_any_statement(&server).await;
+
+        let statement_id = "stmt-async-cloudfetch";
+        let chunk_path = "/cloud-fetch/stmt-async-cloudfetch/chunk-0.arrow";
+        let batch = if native {
+            native_batch_counts(vec![Some(1)], Some(vec![Some(2)]))
+        } else {
+            int64_batch("n", vec![1])
+        };
+        let mut body: serde_json::Value =
+            serde_json::from_str(&succeeded_inline_body(statement_id, &batch)).unwrap();
+        body["result"] = json!({
+            "external_links": [{
+                "external_link": format!("{}{chunk_path}", server.uri()),
+                "expiration": "2099-01-01T00:00:00.000Z",
+                "chunk_index": 0,
+                "row_offset": 0,
+                "row_count": 1,
+                "byte_count": body["manifest"]["total_byte_count"],
+            }],
+        });
+        mount_execute(&server, running_body(statement_id)).await;
+        mount_status(&server, statement_id, body.to_string()).await;
+        Mock::given(method("GET"))
+            .and(path(chunk_path))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+
+        let mut http = HttpConfig::default();
+        http.retry_max_retries = 0;
+        let session = open_session_with_http(&server, http).await;
+        let mut stmt = session.statement();
+        if native {
+            stmt.spec().sql("INSERT INTO t VALUES (?)");
+            for value in [1, 2] {
+                stmt.spec()
+                    .param(1, TypedValue::Int64(value))
+                    .unwrap()
+                    .add_parameter_set();
+            }
+        } else {
+            stmt.spec().sql("SELECT 1 AS n");
+        }
+        let submitted = stmt.submit().await.unwrap();
+        let error = submitted
+            .await_result()
+            .await
+            .err()
+            .expect("chunk 0 download must fail");
+        assert_eq!(error.http_status, Some(503));
+        assert_eq!(error.retryable, !native, "native={native}: {error:?}");
+        if native {
+            assert_eq!(error.query_id.as_deref(), Some(statement_id));
+        }
+        let requests = native_batch_requests(&server).await;
+        assert_eq!(requests.len(), 1, "no replay for native={native}");
+        assert_eq!(requests[0].get("parameter_sets").is_some(), native);
+    }
+}
+
+#[tokio::test]
 async fn native_batch_direct_and_async_use_aggregate_counts() {
     let server = MockServer::start().await;
     mount_create_session(&server).await;

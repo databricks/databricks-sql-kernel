@@ -928,11 +928,25 @@ impl ExecutedAsyncStatement {
             StatementState::Running => "Running",
             _ => "non-terminal",
         };
+        let completed_batch = self.parameter_set_count != 0
+            && matches!(
+                response.status.state,
+                StatementState::Succeeded | StatementState::Closed
+            );
         let result = self
             .session
             .transport()
             .completed_result(response, self.session_attribution)
-            .await?;
+            .await
+            .map_err(|error| {
+                if completed_batch {
+                    error
+                        .with_query_id(&self.statement_id)
+                        .with_retryable(false)
+                } else {
+                    error
+                }
+            })?;
         self.check_read_validity()?;
         match result {
             Some(result) => {
