@@ -58,6 +58,7 @@ use arrow_array::types::{
 use arrow_array::{Array, RecordBatch};
 use arrow_schema::{DataType, Schema, TimeUnit};
 use chrono::{NaiveDate, NaiveDateTime};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 /// Cheap-clone reference to a result schema. The kernel hands one
@@ -493,6 +494,7 @@ pub struct ResultStream {
     close_guard: Option<StatementCloseGuard>,
 
     telemetry: Option<ResultStreamTelemetry>,
+    drained: Option<Arc<AtomicBool>>,
 }
 
 struct ResultStreamTelemetry {
@@ -607,6 +609,7 @@ impl ResultStream {
             current_row_idx: 0,
             exhausted: false,
             close_guard: None,
+            drained: None,
             telemetry: None,
         })
     }
@@ -642,6 +645,10 @@ impl ResultStream {
         self.telemetry = Some(ResultStreamTelemetry::new(telemetry));
     }
 
+    pub(crate) fn attach_drain_signal(&mut self, drained: Arc<AtomicBool>) {
+        self.drained = Some(drained);
+    }
+
     fn reader_metrics(&self) -> Option<ResultReaderMetrics> {
         self.reader.as_ref().and_then(|reader| reader.metrics())
     }
@@ -668,6 +675,11 @@ impl ResultStream {
         let metrics = self.reader_metrics();
         if let Some(telemetry) = &mut self.telemetry {
             telemetry.finish(metrics, error, true);
+        }
+        if self.exhausted && error.is_none() {
+            if let Some(drained) = self.drained.take() {
+                drained.store(true, Ordering::Release);
+            }
         }
     }
 
@@ -930,6 +942,7 @@ impl ResultStream {
                 .expect("ResultStream reader is present until into_owned_batches consumes it"),
             prefetched,
             telemetry: self.telemetry.take(),
+            drained: self.drained.take(),
             done: false,
         }
     }
@@ -959,6 +972,7 @@ pub struct OwnedBatchIter {
     reader: Box<dyn ResultReader>,
     prefetched: Prefetched<RecordBatch>,
     telemetry: Option<ResultStreamTelemetry>,
+    drained: Option<Arc<AtomicBool>>,
     done: bool,
 }
 
@@ -1003,6 +1017,9 @@ impl Iterator for OwnedBatchIter {
                 // consumed, so stamp consumption latency.
                 if let Some(telemetry) = &mut self.telemetry {
                     telemetry.finish(self.reader.metrics(), None, true);
+                }
+                if let Some(drained) = self.drained.take() {
+                    drained.store(true, Ordering::Release);
                 }
                 None
             }
@@ -1413,6 +1430,69 @@ mod tests {
         assert_eq!(second.num_rows(), 1);
         assert!(iter.next().is_none(), "exhausted iterator returns None");
         assert!(iter.next().is_none(), "still None on subsequent calls");
+    }
+
+    #[tokio::test]
+    async fn drain_signal_requires_successful_exhaustion() {
+        for mode in ["next", "try", "owned", "drop", "error", "peek-empty"] {
+            let signal = Arc::new(AtomicBool::new(false));
+            let batch = RecordBatch::try_new(
+                schema_for(vec![Field::new("n", DataType::Int64, true)]),
+                vec![Arc::new(Int64Array::from(vec![Some(71), None, Some(-19)]))],
+            )
+            .unwrap();
+            let mut stream = if mode == "error" {
+                stream_with_one_shot_error().await
+            } else if mode == "peek-empty" {
+                ResultStream::from_reader(Box::new(InMemoryReader::new(batch.schema(), vec![])))
+                    .await
+                    .unwrap()
+            } else {
+                stream_with(batch.clone()).await
+            };
+            stream.attach_drain_signal(Arc::clone(&signal));
+            assert!(!signal.load(Ordering::Acquire));
+            match mode {
+                "next" => {
+                    assert!(stream.next_batch().await.unwrap().is_some());
+                    assert!(!signal.load(Ordering::Acquire));
+                    assert!(stream.next_batch().await.unwrap().is_none());
+                }
+                "try" => {
+                    assert!(matches!(
+                        stream.try_next_batch().unwrap(),
+                        TryNextBatch::Ready(_)
+                    ));
+                    assert!(!signal.load(Ordering::Acquire));
+                    assert!(matches!(
+                        stream.try_next_batch().unwrap(),
+                        TryNextBatch::End
+                    ));
+                }
+                "owned" => {
+                    let mut batches = stream.into_owned_batches();
+                    assert_eq!(batches.next().unwrap().unwrap(), batch);
+                    assert!(!signal.load(Ordering::Acquire));
+                    assert!(batches.next().is_none());
+                }
+                "peek-empty" => {
+                    assert!(stream.peek_first_batch().await.unwrap().is_none());
+                    assert!(!signal.load(Ordering::Acquire));
+                    assert!(stream.next_batch().await.unwrap().is_none());
+                }
+                "error" => {
+                    assert!(stream.next_batch().await.is_err());
+                    drop(stream);
+                }
+                "drop" => drop(stream),
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                signal.load(Ordering::Acquire),
+                !matches!(mode, "drop" | "error"),
+                "{mode}"
+            );
+        }
     }
 
     #[tokio::test]

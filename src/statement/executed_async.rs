@@ -227,6 +227,7 @@ pub struct ExecutedAsyncStatement {
     /// Set once result materialisation hands success finalization to
     /// the returned `ResultStream`.
     result_stream_owns_success_telemetry: AtomicBool,
+    result_drained: Arc<AtomicBool>,
     /// Absolute execution deadline retained across caller-driven polls.
     client_deadline: Option<std::time::Instant>,
     /// When `true`, the caller explicitly disabled the client timeout
@@ -337,6 +338,7 @@ impl ExecutedAsyncStatement {
             pending_result: std::sync::Mutex::new(None),
             statement_telemetry,
             result_stream_owns_success_telemetry: AtomicBool::new(false),
+            result_drained: Arc::new(AtomicBool::new(false)),
             client_deadline,
             poll_timeout_disabled,
             client_timeout_expired: AtomicBool::new(false),
@@ -371,6 +373,7 @@ impl ExecutedAsyncStatement {
             statement_id,
             ValidityFlag::new(),
             Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
             SessionAttribution::Detached,
             initial_status,
         )
@@ -381,6 +384,7 @@ impl ExecutedAsyncStatement {
         statement_id: String,
         valid: ValidityFlag,
         owner_released: Arc<AtomicBool>,
+        result_drained: Arc<AtomicBool>,
         session_attribution: SessionAttribution,
         initial_status: crate::types::sea::StatementStatus,
     ) -> Self {
@@ -397,6 +401,7 @@ impl ExecutedAsyncStatement {
             pending_result: std::sync::Mutex::new(None),
             statement_telemetry: StatementTelemetry::noop(),
             result_stream_owns_success_telemetry: AtomicBool::new(false),
+            result_drained,
             client_deadline: None,
             poll_timeout_disabled: false,
             client_timeout_expired: AtomicBool::new(false),
@@ -419,6 +424,7 @@ impl ExecutedAsyncStatement {
                 self.statement_id.clone(),
                 self.valid.clone(),
                 Arc::clone(&self.owner_released),
+                Arc::clone(&self.result_drained),
                 self.session_attribution,
                 status,
             ),
@@ -942,6 +948,7 @@ impl ExecutedAsyncStatement {
                 }
                 let mut stream = ResultStream::from_reader(result.reader).await?;
                 stream.attach_telemetry(self.statement_telemetry.clone());
+                stream.attach_drain_signal(Arc::clone(&self.result_drained));
                 // SEA carries no row count on the async status either; for a
                 // DML the count rides in the result set. Derive it once
                 // (non-consuming) and record it onto the latest status so
@@ -1109,6 +1116,11 @@ impl ExecutedAsyncStatement {
     /// async statement is the binding-visible lifecycle boundary, though, so finalize
     /// here as a deterministic backstop for partial-fetch callers that keep the stream
     /// alive past session close.
+    ///
+    /// After successful result exhaustion, server cleanup runs in the background,
+    /// as it does for drained synchronous statements. Ownership is released before
+    /// returning. Partial-result closes still await server cleanup. Background
+    /// cleanup is best-effort if the runtime shuts down before the RPC completes.
     pub async fn close(&mut self) -> Result<()> {
         self.statement_telemetry.finalize(None);
         self.close_server_statement().await
@@ -1118,6 +1130,10 @@ impl ExecutedAsyncStatement {
         if self.owning {
             self.owner_released.store(true, Ordering::Release);
             self.clear_pending_result();
+        }
+        if self.result_drained.load(Ordering::Acquire) {
+            self.spawn_close_if_open();
+            return Ok(());
         }
         // Idempotent on success: a prior successful close sets
         // `closed=true` and subsequent calls short-circuit.
@@ -1177,6 +1193,28 @@ impl ExecutedAsyncStatement {
             // canceller.
             owning: self.owning,
         }
+    }
+
+    fn spawn_close_if_open(&self) {
+        if self.closed.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let transport = Arc::clone(self.session.transport());
+        let runtime = self.session.runtime_handle().clone();
+        let stmt_id = self.statement_id.clone();
+        runtime.spawn(
+            async move {
+                if let Err(e) = transport.close_statement(&stmt_id).await {
+                    warn!(
+                        statement_id = %stmt_id,
+                        error = %e,
+                        "fire-and-forget close_statement on ExecutedAsyncStatement::Drop failed; \
+                         server-side resource reclaimed when the session closes"
+                    );
+                }
+            }
+            .instrument(self.session.log_span().clone()),
+        );
     }
 }
 
@@ -1260,26 +1298,7 @@ impl Drop for ExecutedAsyncStatement {
         // parent `Statement::last_closed` — reflects that Drop is now
         // handling cleanup, preventing a duplicate `CloseStatement`
         // from `invalidate_prior` on the next `execute()` / `submit()`.
-        if self.closed.swap(true, Ordering::AcqRel) {
-            return;
-        }
-        // Fire-and-forget close on the session's runtime — mirrors
-        // ExecutedStatement::Drop. Errors are swallowed by design;
-        // Drop must not panic and the server reclaims the statement
-        // when the session closes anyway.
-        let transport = Arc::clone(self.session.transport());
-        let runtime = self.session.runtime_handle().clone();
-        let stmt_id = self.statement_id.clone();
-        runtime.spawn(async move {
-            if let Err(e) = transport.close_statement(&stmt_id).await {
-                warn!(
-                    statement_id = %stmt_id,
-                    error = %e,
-                    "fire-and-forget close_statement on ExecutedAsyncStatement::Drop failed; \
-                     server-side resource reclaimed when the session closes"
-                );
-            }
-        });
+        self.spawn_close_if_open();
     }
 }
 

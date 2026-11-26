@@ -13,6 +13,8 @@ changes go in their respective binding's NEXT_CHANGELOG.
 
 ### Changed
 
+Closing a fully drained asynchronous statement releases ownership immediately and cleans up the server statement in the background. Closing a partial result still waits for server cleanup.
+
 ### Updated
 
 ### Fixed
