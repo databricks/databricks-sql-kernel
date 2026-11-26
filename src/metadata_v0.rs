@@ -167,6 +167,16 @@ fn normalize_native_metadata_batch(
                 })?
             };
 
+            if field.name() == "TABLE_TYPE" {
+                let values = column
+                    .as_any()
+                    .downcast_ref::<arrow_array::StringArray>()
+                    .ok_or_else(|| Error::data_loss().message("TABLE_TYPE is not Utf8"))?;
+                return Ok(Arc::new(arrow_array::StringArray::from_iter(
+                    values.iter().map(|value| Some(value.unwrap_or(""))),
+                )) as ArrayRef);
+            }
+
             if field.name() != "ORDINAL_POSITION" {
                 return Ok(column);
             }
@@ -769,9 +779,9 @@ impl Metadata {
     /// "must not contain a search pattern", so catalog wildcarding is a
     /// `getTables`-only behaviour.
     ///
-    /// `table_types`, when `Some(non-empty)`, filters the result to
-    /// rows whose `TABLE_TYPE` matches one of the listed strings —
-    /// matches `java.sql.DatabaseMetaData.getTables` behaviour.
+    /// `table_types`, when `Some(non-empty)`, keeps rows whose known
+    /// `TABLE_TYPE` matches one of the listed strings. Rows whose type is
+    /// null or empty also pass through, matching legacy Thrift behaviour.
     /// Databricks `SHOW TABLES` itself does not accept a type filter,
     /// so the filter is applied kernel-side after reshape.
     pub async fn list_tables(
@@ -1667,6 +1677,85 @@ mod tests {
         assert_eq!(ordinals.value(0), 1);
         assert_eq!(ordinals.value(1), 2);
         assert!(ordinals.is_null(2));
+    }
+
+    #[test]
+    fn native_metadata_preserves_null_and_empty_table_types_as_empty() {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "TABLE_TYPE",
+                DataType::Utf8,
+                true,
+            )])),
+            vec![Arc::new(arrow_array::StringArray::from(vec![
+                Some(""),
+                None,
+                Some("VIEW"),
+            ]))],
+        )
+        .unwrap();
+        let public_schema = Arc::new(Schema::new(vec![Field::new(
+            "TABLE_TYPE",
+            DataType::Utf8,
+            false,
+        )]));
+
+        let normalized = normalize_native_metadata_batch(&batch, public_schema).unwrap();
+        let table_types = normalized.column(0).as_string::<i32>();
+
+        assert_eq!(
+            table_types.iter().collect::<Vec<_>>(),
+            vec![Some(""), Some(""), Some("VIEW")]
+        );
+    }
+
+    #[test]
+    fn native_tables_filter_retains_null_and_empty_table_types() {
+        let mut fields = GET_TABLES_SCHEMA
+            .fields()
+            .iter()
+            .map(|field| field.as_ref().clone())
+            .collect::<Vec<_>>();
+        fields[3] = Field::new("TABLE_TYPE", DataType::Utf8, true);
+        let nulls = || Arc::new(arrow_array::StringArray::from(vec![None::<&str>; 3])) as ArrayRef;
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(fields)),
+            vec![
+                Arc::new(arrow_array::StringArray::from(vec!["main"; 3])),
+                Arc::new(arrow_array::StringArray::from(vec!["default"; 3])),
+                Arc::new(arrow_array::StringArray::from(vec![
+                    "empty", "null", "view",
+                ])),
+                Arc::new(arrow_array::StringArray::from(vec![
+                    Some(""),
+                    None,
+                    Some("VIEW"),
+                ])),
+                nulls(),
+                nulls(),
+                nulls(),
+                nulls(),
+                nulls(),
+                nulls(),
+            ],
+        )
+        .unwrap();
+
+        let normalized =
+            normalize_native_metadata_batch(&batch, GET_TABLES_SCHEMA.clone()).unwrap();
+        let tables =
+            thrift_shape::process_native_tables(&normalized, Some("main"), Some(&["TABLE"]))
+                .unwrap();
+
+        assert_eq!(tables.num_rows(), 2);
+        assert_eq!(
+            tables
+                .column(2)
+                .as_string::<i32>()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![Some("empty"), Some("null")]
+        );
     }
 
     #[test]
