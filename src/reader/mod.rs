@@ -886,7 +886,6 @@ impl ResultReader for InlineStreamingReader {
 pub struct InMemoryReader {
     schema: SchemaRef,
     batches: std::vec::IntoIter<RecordBatch>,
-    metrics: Option<ResultReaderMetrics>,
 }
 
 impl InMemoryReader {
@@ -898,13 +897,7 @@ impl InMemoryReader {
         Self {
             schema,
             batches: batches.into_iter(),
-            metrics: None,
         }
-    }
-
-    pub(crate) fn with_metrics(mut self, metrics: Option<ResultReaderMetrics>) -> Self {
-        self.metrics = metrics;
-        self
     }
 }
 
@@ -920,10 +913,6 @@ impl ResultReader for InMemoryReader {
 
     fn try_next_batch(&mut self) -> Result<TryNextBatch> {
         Ok(TryNextBatch::from_option(self.batches.next()))
-    }
-
-    fn metrics(&self) -> Option<ResultReaderMetrics> {
-        self.metrics
     }
 }
 

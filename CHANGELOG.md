@@ -10,8 +10,7 @@ cadences and may not move in lockstep with the crate.
 
 ### Added
 - Native parameter-set snapshots on `StatementSpec` and the C ABI submit an
-  atomic batch and report aggregate affected-row counts. Node.js and Python
-  bindings do not expose parameter-set snapshots.
+  atomic batch and report aggregate affected-row counts.
 
 ### Changed
 

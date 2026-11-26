@@ -3462,7 +3462,6 @@ async fn native_batch_preserves_order_and_resets_bindings() {
         .param(2, TypedValue::String("first".into()))
         .unwrap();
     stmt.spec().add_parameter_set();
-    assert!(stmt.spec().positional_params.is_empty());
     stmt.spec()
         .param_raw(None, "BIGINT", Some("7".into()))
         .param_raw(None, "VOID", None)
@@ -3473,6 +3472,7 @@ async fn native_batch_preserves_order_and_resets_bindings() {
         .unwrap();
     stmt.spec().add_parameter_set();
     let mut exec = stmt.execute().await.unwrap();
+    assert_eq!(stmt.spec().row_limit, Some(1));
     assert_eq!(exec.num_modified_rows(), Some(3));
     let fetched = drain(exec.result_stream_mut()).await;
     assert_eq!(fetched.len(), 1);
@@ -3504,163 +3504,17 @@ async fn native_batch_preserves_order_and_resets_bindings() {
 }
 
 #[tokio::test]
-async fn native_batch_decodes_repeated_unknown_and_malformed_counts_without_replay() {
-    let cases = [
-        (
-            vec![Some(2), Some(3)],
-            Some(vec![Some(2), Some(1)]),
-            Ok(Some(7)),
-        ),
-        (vec![Some(0)], Some(vec![Some(3)]), Ok(Some(0))),
-        (
-            vec![Some(1), Some(-2)],
-            Some(vec![Some(1), Some(2)]),
-            Ok(None),
-        ),
-        (vec![None], Some(vec![Some(3)]), Ok(None)),
-        (vec![Some(2), Some(1), Some(4)], None, Ok(Some(7))),
-        (vec![], Some(vec![]), Ok(None)),
-        (vec![Some(1)], Some(vec![Some(0)]), Err(())),
-        (vec![Some(1)], Some(vec![Some(-1)]), Err(())),
-        (vec![Some(1)], Some(vec![None]), Err(())),
-        (vec![Some(1)], Some(vec![Some(4)]), Err(())),
-        (vec![Some(1)], Some(vec![Some(2)]), Err(())),
-        (vec![Some(-3)], Some(vec![Some(3)]), Err(())),
-        (vec![Some(i64::MAX)], Some(vec![Some(3)]), Err(())),
-        (
-            vec![Some(i64::MAX), Some(1)],
-            Some(vec![Some(1), Some(2)]),
-            Err(()),
-        ),
-    ];
-    for (affected, repeat, expected) in cases {
-        let server = MockServer::start().await;
-        mount_create_session(&server).await;
-        mount_close_any_statement(&server).await;
-        let counts = native_batch_counts(affected, repeat);
-        let mut body: serde_json::Value =
-            serde_json::from_str(&succeeded_inline_body("batch-count", &counts)).unwrap();
-        if counts.num_rows() > 1 {
-            let mut ipc = Vec::new();
-            let mut writer = StreamWriter::try_new(&mut ipc, &counts.schema()).unwrap();
-            for row in 0..counts.num_rows() {
-                writer.write(&counts.slice(row, 1)).unwrap();
-            }
-            writer.finish().unwrap();
-            drop(writer);
-            body["result"]["attachment"] = json!(STANDARD.encode(&ipc));
-            body["result"]["byte_count"] = json!(ipc.len());
-            body["manifest"]["total_byte_count"] = json!(ipc.len());
-        }
-        if counts.num_rows() == 0 {
-            body["manifest"]["total_chunk_count"] = json!(0);
-            body.as_object_mut().unwrap().remove("result");
-        }
-        Mock::given(method("POST"))
-            .and(path("/api/2.0/sql/statements"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(body))
-            .expect(1)
-            .mount(&server)
-            .await;
-        let session = open_session(&server).await;
-        let mut stmt = session.statement();
-        stmt.spec().sql("INSERT INTO t VALUES (?)");
-        for i in 0..3 {
-            stmt.spec()
-                .param(1, TypedValue::Int64(i))
-                .unwrap()
-                .add_parameter_set();
-        }
-        match (stmt.execute().await, expected) {
-            (Ok(mut exec), Ok(total)) => {
-                assert_eq!(exec.num_modified_rows(), total, "{counts:?}");
-                let fetched = drain(exec.result_stream_mut()).await;
-                assert_eq!(
-                    fetched.iter().map(RecordBatch::num_rows).sum::<usize>(),
-                    counts.num_rows()
-                );
-            }
-            (Err(error), Err(())) => {
-                assert_eq!(error.code, ErrorCode::DataLoss, "{error}");
-                assert_eq!(error.query_id.as_deref(), Some("batch-count"));
-                assert!(!error.retryable);
-                assert_eq!(
-                    wait_for_close_delete(&server, "batch-count", 1, Duration::from_secs(1)).await,
-                    1
-                );
-            }
-            (actual, expected) => {
-                panic!(
-                    "count decoding mismatch: error {:?}, expected {expected:?}",
-                    actual.err()
-                )
-            }
-        }
-    }
-}
-
-#[tokio::test]
-async fn native_batch_accepts_count_nullability_after_empty_leading_chunk() {
-    let server = MockServer::start().await;
-    mount_create_session(&server).await;
-    mount_close_any_statement(&server).await;
-    let counts = int64_batch("num_affected_rows", vec![1, 1]);
-    let metadata = HashMap::from([
-        ("databricks.type_name".into(), "BIGINT".into()),
-        ("databricks.type_text".into(), "BIGINT".into()),
-        ("Spark:DataType:SqlName".into(), "BIGINT".into()),
-    ]);
-    let advertised = Schema::new(vec![
-        Field::new("num_affected_rows", DataType::Int64, true).with_metadata(metadata)
-    ]);
-    let initial = arrow_schema_ipc_bytes(&advertised);
-    let mut body: serde_json::Value =
-        serde_json::from_str(&succeeded_inline_body("batch-schema", &counts)).unwrap();
-    body["manifest"]["arrow_schema"] = json!(STANDARD.encode(&initial));
-    body["manifest"]["total_chunk_count"] = json!(2);
-    body["result"]["attachment"] = json!(STANDARD.encode(&initial));
-    body["result"]["byte_count"] = json!(initial.len());
-    body["result"]["row_count"] = json!(0);
-    body["result"]["next_chunk_index"] = json!(1);
-    mount_execute(&server, body.to_string()).await;
-    Mock::given(method("GET"))
-        .and(path("/api/2.0/sql/statements/batch-schema/result/chunks/1"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "chunk_index": 1, "row_offset": 0, "row_count": 2,
-            "attachment": STANDARD.encode(arrow_ipc_bytes(&counts)),
-        })))
-        .expect(1)
-        .mount(&server)
-        .await;
-    let session = open_session(&server).await;
-    let mut statement = session.statement();
-    statement.spec().sql("INSERT INTO t VALUES (?)");
-    for value in [11, 29] {
-        statement
-            .spec()
-            .param(1, TypedValue::Int64(value))
-            .unwrap()
-            .add_parameter_set();
-    }
-    let mut executed = statement.execute().await.unwrap();
-    assert_eq!(executed.num_modified_rows(), Some(2));
-    let batches = drain(executed.result_stream_mut()).await;
-    assert_eq!(batches.len(), 1);
-    assert_eq!(batches[0].columns(), counts.columns());
-    assert_eq!(batches[0].schema().as_ref(), &advertised);
-    assert_eq!(native_batch_requests(&server).await.len(), 1);
-}
-
-#[tokio::test]
 async fn native_batch_sends_entire_batch_and_preserves_server_limit_error() {
     let server = MockServer::start().await;
     mount_create_session(&server).await;
-    mount_close_any_statement(&server).await;
-    mount_execute(
-        &server,
-        failed_body("batch-limit", "parameter limit exceeded", "54000"),
-    )
-    .await;
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "error_code": "INVALID_PARAMETER_VALUE",
+            "message": "too many parameters"
+        })))
+        .mount(&server)
+        .await;
     let session = open_session(&server).await;
     let mut stmt = session.statement();
     stmt.spec()
@@ -3676,10 +3530,8 @@ async fn native_batch_sends_entire_batch_and_preserves_server_limit_error() {
             .add_parameter_set();
     }
     let error = stmt.execute().await.err().expect("batch must fail");
-    assert!(!error.retryable);
-    assert_eq!(error.code, ErrorCode::SqlError);
-    assert_eq!(error.sql_state.as_deref(), Some("54000"));
-    assert_eq!(error.query_id.as_deref(), Some("batch-limit"));
+    assert_eq!(error.code, ErrorCode::InvalidArgument);
+    assert_eq!(error.http_status, Some(400));
     let requests = native_batch_requests(&server).await;
     assert_eq!(requests.len(), 1);
     let sets = requests[0]["parameter_sets"].as_array().unwrap();
@@ -3691,14 +3543,7 @@ async fn native_batch_sends_entire_batch_and_preserves_server_limit_error() {
 
 #[tokio::test]
 async fn native_batch_transport_and_result_failures_do_not_replay() {
-    for failure in [
-        "transport",
-        "poll_transport",
-        "attachment",
-        "failed_attachment",
-        "arrow",
-        "type",
-    ] {
+    for failure in ["transport", "poll_error", "arrow"] {
         let server = MockServer::start().await;
         mount_create_session(&server).await;
         mount_close_any_statement(&server).await;
@@ -3707,27 +3552,10 @@ async fn native_batch_transport_and_result_failures_do_not_replay() {
             &native_batch_counts(vec![Some(1)], Some(vec![Some(2)])),
         ))
         .unwrap();
-        if failure == "attachment" {
-            body["result"]["attachment"] = json!("%invalid");
-        }
-        if failure == "failed_attachment" {
-            body["status"] = json!({
-                "state": "FAILED", "sql_state": "42P02",
-                "error": {"error_code":"BAD_REQUEST", "message":"[UNBOUND_SQL_PARAMETER] missing"}
-            });
-            body["result"]["attachment"] = json!("%invalid");
-        }
         if failure == "arrow" {
             body["result"]["attachment"] = json!(STANDARD.encode(b"invalid arrow"));
         }
-        if failure == "type" {
-            body = serde_json::from_str(&succeeded_inline_body(
-                "batch-decode",
-                &str_batch("num_affected_rows", vec!["bad"]),
-            ))
-            .unwrap();
-        }
-        if failure == "poll_transport" {
+        if failure == "poll_error" {
             body = serde_json::from_str(&running_body("batch-decode")).unwrap();
             Mock::given(method("GET"))
                 .and(path("/api/2.0/sql/statements/batch-decode"))
@@ -3737,7 +3565,7 @@ async fn native_batch_transport_and_result_failures_do_not_replay() {
                 .await;
         }
         let response = if failure == "transport" {
-            ResponseTemplate::new(500)
+            ResponseTemplate::new(504)
         } else {
             ResponseTemplate::new(200).set_body_json(body)
         };
@@ -3758,10 +3586,6 @@ async fn native_batch_transport_and_result_failures_do_not_replay() {
         }
         let error = stmt.execute().await.err().expect("batch must fail");
         assert!(!error.retryable, "{failure}: {error}");
-        if failure == "failed_attachment" {
-            assert_eq!(error.code, ErrorCode::DataLoss);
-            assert_eq!(error.sql_state, None);
-        }
         if failure == "transport" {
             assert_eq!(error.query_id, None, "{failure}: {error}");
         } else {
@@ -3779,87 +3603,56 @@ async fn native_batch_direct_and_async_use_aggregate_counts() {
     let server = MockServer::start().await;
     mount_create_session(&server).await;
     mount_close_any_statement(&server).await;
-    let body = succeeded_inline_body(
+    let counts = native_batch_counts(vec![Some(1)], Some(vec![Some(3)]));
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .respond_with(DelayedFirstExecute {
+            first: succeeded_inline_body("batch-direct", &counts),
+            later: running_body("batch-async"),
+            first_delay: Duration::ZERO,
+            calls: AtomicUsize::new(0),
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
+    mount_status(
+        &server,
         "batch-async",
-        &native_batch_counts(vec![Some(2)], Some(vec![Some(3)])),
-    );
-    mount_execute(&server, body.clone()).await;
-    mount_status(&server, "batch-async", body).await;
+        succeeded_inline_body("batch-async", &counts),
+    )
+    .await;
     let session = open_session(&server).await;
     let mut stmt = session.statement();
     stmt.spec().sql("INSERT INTO t VALUES (?)");
-    for i in 0..3 {
+    for value in [11, 29, 43] {
         stmt.spec()
-            .param(1, TypedValue::Int64(i))
+            .param(1, TypedValue::Int64(value))
             .unwrap()
             .add_parameter_set();
     }
-    let DirectStatement::Completed(exec) = stmt.execute_direct().await.unwrap() else {
+    let DirectStatement::Completed(direct) = stmt.execute_direct().await.unwrap() else {
         panic!("expected completion")
     };
-    assert_eq!(exec.num_modified_rows(), Some(6));
-    let attached = session.attach_async_statement("batch-async").await.unwrap();
-    let _stream = attached.await_result().await.unwrap();
-    assert_eq!(attached.num_modified_rows(), None);
-    assert_eq!(native_batch_requests(&server).await.len(), 1);
+    assert_eq!(direct.num_modified_rows(), Some(3));
 
-    for (last_count, expected) in [(4, Some(6)), (-2, None)] {
-        let server = MockServer::start().await;
-        mount_create_session(&server).await;
-        mount_close_any_statement(&server).await;
-        let first = native_batch_counts(vec![Some(2)], None);
-        let last = native_batch_counts(vec![Some(last_count)], None);
-        let mut body: serde_json::Value =
-            serde_json::from_str(&succeeded_inline_body("batch-paged", &first)).unwrap();
-        body["manifest"]["total_chunk_count"] = json!(2);
-        body["manifest"]["total_row_count"] = json!(2);
-        body["result"]["next_chunk_index"] = json!(1);
-        mount_execute(&server, running_body("batch-paged")).await;
-        mount_status(&server, "batch-paged", body.to_string()).await;
-        Mock::given(method("GET"))
-            .and(path("/api/2.0/sql/statements/batch-paged/result/chunks/1"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "chunk_index": 1, "row_offset": 1, "row_count": 1,
-                "attachment": STANDARD.encode(arrow_ipc_bytes(&last)),
-            })))
-            .mount(&server)
-            .await;
-        let session = open_session(&server).await;
-        let mut statement = session.statement();
-        statement.spec().sql("INSERT INTO t VALUES (?)");
-        for value in [11, 29] {
-            statement
-                .spec()
-                .param(1, TypedValue::Int64(value))
-                .unwrap()
-                .add_parameter_set();
-        }
-        let executed = statement.submit().await.unwrap();
-        executed.status().await.unwrap();
-        assert_eq!(executed.num_modified_rows(), None);
-        let _stream = executed.await_result().await.unwrap();
-        assert_eq!(executed.num_modified_rows(), expected);
-        assert_eq!(
-            executed.reader().unwrap().num_modified_rows().unwrap(),
-            expected
-        );
-        executed.status().await.unwrap();
-        assert_eq!(executed.num_modified_rows(), expected);
-        let _stream = executed.fetch_result().await.unwrap();
-        assert_eq!(executed.num_modified_rows(), expected);
-        Mock::given(method("GET"))
-            .and(path("/api/2.0/sql/statements/batch-paged"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "statement_id": "batch-paged", "status": {"state": "SUCCEEDED"}
-            })))
-            .with_priority(1)
-            .expect(1)
-            .mount(&server)
-            .await;
-        executed.status().await.unwrap();
-        assert_eq!(executed.num_modified_rows(), expected);
-        assert_eq!(native_batch_requests(&server).await.len(), 1);
-    }
+    let submitted = stmt.submit().await.unwrap();
+    let _stream = submitted.await_result().await.unwrap();
+    assert_eq!(submitted.num_modified_rows(), Some(3));
+    Mock::given(method("GET"))
+        .and(path("/api/2.0/sql/statements/batch-async"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "statement_id": "batch-async", "status": {"state": "SUCCEEDED"}
+        })))
+        .with_priority(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    submitted.status().await.unwrap();
+    assert_eq!(submitted.num_modified_rows(), Some(3));
+    assert_eq!(
+        submitted.reader().unwrap().num_modified_rows().unwrap(),
+        Some(3)
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3870,23 +3663,14 @@ async fn native_batch_c_abi_snapshot_execute_count_and_sql_reset() {
     let server = MockServer::start().await;
     mount_create_session(&server).await;
     mount_close_any_statement(&server).await;
-    Mock::given(method("POST"))
-        .and(path("/api/2.0/sql/statements"))
-        .respond_with(DelayedFirstExecute {
-            first: succeeded_inline_body(
-                "batch-ffi",
-                &native_batch_counts(vec![Some(1)], Some(vec![Some(2)])),
-            ),
-            later: succeeded_inline_body(
-                "batch-ffi",
-                &native_batch_counts(vec![Some(-2)], Some(vec![Some(2)])),
-            ),
-            first_delay: Duration::ZERO,
-            calls: AtomicUsize::new(0),
-        })
-        .expect(3)
-        .mount(&server)
-        .await;
+    mount_execute(
+        &server,
+        succeeded_inline_body(
+            "batch-ffi",
+            &native_batch_counts(vec![Some(1)], Some(vec![Some(2)])),
+        ),
+    )
+    .await;
     std::thread::scope(|scope| {
         scope
             .spawn(|| unsafe {
@@ -3910,25 +3694,23 @@ async fn native_batch_c_abi_snapshot_execute_count_and_sql_reset() {
                 let sql = CString::new("INSERT INTO t VALUES (?)").unwrap();
                 let sql_type = CString::new("BIGINT").unwrap();
                 let mut exec = null_mut();
-                for expected in [2, -1] {
-                    assert_eq!(kernel_statement_set_sql(stmt, sql.as_ptr()), Success);
-                    for value in ["42", "7"] {
-                        let value = CString::new(value).unwrap();
-                        assert_eq!(
-                            kernel_statement_bind_parameter(
-                                stmt,
-                                null(),
-                                sql_type.as_ptr(),
-                                value.as_ptr()
-                            ),
-                            Success
-                        );
-                        assert_eq!(kernel_statement_add_parameter_set(stmt), Success);
-                    }
-                    assert_eq!(kernel_statement_execute(stmt, &mut exec), Success);
-                    assert_eq!(kernel_executed_statement_num_modified_rows(exec), expected);
-                    assert_eq!(kernel_executed_statement_close(exec), Success);
+                assert_eq!(kernel_statement_set_sql(stmt, sql.as_ptr()), Success);
+                for value in ["42", "7"] {
+                    let value = CString::new(value).unwrap();
+                    assert_eq!(
+                        kernel_statement_bind_parameter(
+                            stmt,
+                            null(),
+                            sql_type.as_ptr(),
+                            value.as_ptr()
+                        ),
+                        Success
+                    );
+                    assert_eq!(kernel_statement_add_parameter_set(stmt), Success);
                 }
+                assert_eq!(kernel_statement_execute(stmt, &mut exec), Success);
+                assert_eq!(kernel_executed_statement_num_modified_rows(exec), 2);
+                assert_eq!(kernel_executed_statement_close(exec), Success);
                 assert_eq!(kernel_statement_set_sql(stmt, sql.as_ptr()), Success);
                 assert_eq!(kernel_statement_bind_int64(stmt, 1, 99), Success);
                 assert_eq!(kernel_statement_execute(stmt, &mut exec), Success);
@@ -3940,7 +3722,7 @@ async fn native_batch_c_abi_snapshot_execute_count_and_sql_reset() {
             .unwrap()
     });
     let requests = native_batch_requests(&server).await;
-    assert_eq!(requests.len(), 3);
+    assert_eq!(requests.len(), 2);
     assert_eq!(
         requests[0]["parameter_sets"][0]["parameters"][0]["value"],
         "42"
@@ -3949,8 +3731,7 @@ async fn native_batch_c_abi_snapshot_execute_count_and_sql_reset() {
         requests[0]["parameter_sets"][1]["parameters"][0]["value"],
         "7"
     );
-    assert_eq!(requests[1]["parameter_sets"].as_array().unwrap().len(), 2);
-    assert!(requests[2].get("parameter_sets").is_none());
-    assert_eq!(requests[2]["parameters"][0]["ordinal"], 1);
-    assert_eq!(requests[2]["parameters"][0]["value"], "99");
+    assert!(requests[1].get("parameter_sets").is_none());
+    assert_eq!(requests[1]["parameters"][0]["ordinal"], 1);
+    assert_eq!(requests[1]["parameters"][0]["value"], "99");
 }

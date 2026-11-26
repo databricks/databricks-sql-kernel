@@ -31,9 +31,9 @@ use crate::reader::ResultReaderFactory;
 use crate::telemetry::ExecutionResultFormat;
 use crate::types::cloudfetch::CloudFetchLink;
 use crate::types::sea::{
-    CompressionCodec, CreateSessionRequest, CreateSessionResponse, ExecuteStatementRequest,
-    GetChunksResponse, SessionExecutionMode, SessionVersion, StatementExecutionResponse,
-    StatementState,
+    CompressionCodec, CreateSessionRequest, CreateSessionResponse, ExecuteParams,
+    ExecuteStatementRequest, GetChunksResponse, SessionExecutionMode, SessionVersion,
+    StatementExecutionResponse, StatementParameterSet, StatementState,
 };
 use async_trait::async_trait;
 use reqwest::Method;
@@ -97,6 +97,18 @@ impl MetadataOperation {
 struct ExecutionRequest {
     request_type: RequestType,
     metadata_operation: Option<MetadataOperation>,
+}
+
+#[derive(serde::Serialize)]
+struct BatchRequest<'a> {
+    #[serde(flatten)]
+    statement: ExecuteStatementRequest,
+    #[serde(skip_serializing_if = "slice_is_empty")]
+    parameter_sets: &'a [StatementParameterSet],
+}
+
+fn slice_is_empty<T>(values: &&[T]) -> bool {
+    values.is_empty()
 }
 
 /// Internal terminal-outcome for a single SEA statement response.
@@ -170,20 +182,6 @@ fn timeout_query_id(params: &ExecutionParams) -> Option<String> {
                 })
                 .clone()
         })
-}
-
-fn batch_response_decode_error(mut error: Error, body: &[u8]) -> Error {
-    // Attachment decoding can fail before the full response exposes its query id.
-    #[derive(serde::Deserialize)]
-    struct Context {
-        statement_id: Option<String>,
-    }
-    if let Ok(context) = serde_json::from_slice::<Context>(body) {
-        if let Some(id) = context.statement_id {
-            error = error.with_query_id(id);
-        }
-    }
-    error
 }
 
 /// SEA client for the Databricks SQL Statement Execution API.
@@ -670,7 +668,8 @@ impl SeaRestTransport {
         &self,
         session_id: &str,
         sql: &str,
-        params: &ExecutionParams,
+        scalar: &ExecuteParams,
+        parameter_sets: &[StatementParameterSet],
         request_type: RequestType,
         metadata_operation: Option<MetadataOperation>,
     ) -> Result<ExecuteResponse> {
@@ -688,16 +687,16 @@ impl SeaRestTransport {
             statement: sql.to_string(),
             session_id,
             session_version: self.current_session_version(),
-            catalog: params.scalar.catalog.clone(),
-            schema: params.scalar.schema.clone(),
+            catalog: scalar.catalog.clone(),
+            schema: scalar.schema.clone(),
             disposition: "INLINE_OR_EXTERNAL_LINKS".to_string(),
             format: "ARROW_STREAM".to_string(),
-            wait_timeout: params.scalar.wait_timeout.clone(),
-            on_wait_timeout: params.scalar.on_wait_timeout.clone(),
-            row_limit: params.scalar.row_limit,
+            wait_timeout: scalar.wait_timeout.clone(),
+            on_wait_timeout: scalar.on_wait_timeout.clone(),
+            row_limit: scalar.row_limit,
             result_compression: Some("LZ4_FRAME".to_string()),
-            parameters: params.scalar.parameters.clone(),
-            query_tags: params.scalar.query_tags.clone(),
+            parameters: scalar.parameters.clone(),
+            query_tags: scalar.query_tags.clone(),
         };
 
         debug!("Executing statement at {}: {}", url, sql);
@@ -736,19 +735,9 @@ impl SeaRestTransport {
             }
         }
 
-        #[derive(serde::Serialize)]
-        struct BatchRequest<'a> {
-            #[serde(flatten)]
-            statement: ExecuteStatementRequest,
-            #[serde(skip_serializing_if = "slice_is_empty")]
-            parameter_sets: &'a [crate::types::sea::StatementParameterSet],
-        }
-        fn slice_is_empty<T>(values: &&[T]) -> bool {
-            values.is_empty()
-        }
         let request_body = BatchRequest {
             statement: request_body,
-            parameter_sets: &params.parameter_sets,
+            parameter_sets,
         };
         let request = builder.json(&request_body).build().map_err(|e| {
             Error::invalid_argument().message(format!("Failed to build request: {e}"))
@@ -762,24 +751,13 @@ impl SeaRestTransport {
             .await
             .map_err(|e| Error::network_error().message(format!("Failed to read response: {e}")))?;
 
-        let sea_response: Result<StatementExecutionResponse> = serde_json::from_slice(&body)
-            .map_err(|e| {
-                let error = Error::data_loss().message(format!(
+        let sea_response: StatementExecutionResponse =
+            serde_json::from_slice(&body).map_err(|e| {
+                Error::data_loss().message(format!(
                     "Failed to parse execute response: {e} - body: {}",
                     String::from_utf8_lossy(&body)
-                ));
-                if params.parameter_sets.is_empty() {
-                    error
-                } else {
-                    batch_response_decode_error(error, &body)
-                }
-            });
-        if let Err(error) = &sea_response {
-            if let Some(id) = error.query_id.as_deref() {
-                self.close_orphaned_statement(id, "response_decode").await;
-            }
-        }
-        let sea_response = sea_response?;
+                ))
+            })?;
 
         self.observe_session_version(sea_response.status.session_version);
 
@@ -846,7 +824,8 @@ impl SeaRestTransport {
             .call_execute_api(
                 session_id,
                 sql,
-                params,
+                &params.scalar,
+                &params.parameter_sets,
                 request.request_type,
                 request.metadata_operation,
             )
@@ -1329,13 +1308,14 @@ impl Transport for SeaRestTransport {
         // matches the retry policy of the sync path — submit is also
         // non-idempotent in the worst case (e.g. an INSERT submitted
         // twice).
-        let mut params = params.clone();
-        params.scalar.wait_timeout = Some("0s".to_string());
-        params.scalar.on_wait_timeout = Some("CONTINUE".to_string());
+        let mut scalar = params.scalar.clone();
+        scalar.wait_timeout = Some("0s".to_string());
+        scalar.on_wait_timeout = Some("CONTINUE".to_string());
         self.call_execute_api(
             session_id,
             sql,
-            &params,
+            &scalar,
+            &params.parameter_sets,
             RequestType::ExecuteStatement,
             None,
         )
@@ -1360,7 +1340,14 @@ impl Transport for SeaRestTransport {
         // internal poll loop: a query that outlasts the inline wait
         // comes back `Running` for the caller to poll/cancel.
         let response = self
-            .call_execute_api(session_id, sql, params, RequestType::ExecuteStatement, None)
+            .call_execute_api(
+                session_id,
+                sql,
+                &params.scalar,
+                &params.parameter_sets,
+                RequestType::ExecuteStatement,
+                None,
+            )
             .await?;
         let statement_id = response.statement_id.clone();
 

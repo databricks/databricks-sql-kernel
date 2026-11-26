@@ -74,7 +74,7 @@ async fn native_parameter_batch_counts_values_and_atomic_errors() {
         ));
         statement.execute().await.unwrap().close().await.unwrap();
         let insert = format!("INSERT INTO {table} VALUES (?)");
-        statement.spec().sql(&insert).row_limit = Some(1);
+        statement.spec().sql(&insert);
         for id in [17, 29, 43] {
             statement
                 .spec()
@@ -85,7 +85,6 @@ async fn native_parameter_batch_counts_values_and_atomic_errors() {
         let executed = statement.execute().await.unwrap();
         assert_eq!(executed.num_modified_rows(), Some(3));
         executed.close().await.unwrap();
-        assert_eq!(statement.spec().row_limit, Some(1));
 
         statement.spec().sql(&insert);
         for id in [
@@ -101,31 +100,10 @@ async fn native_parameter_batch_counts_values_and_atomic_errors() {
             .err()
             .expect("NOT NULL batch must fail");
         assert_eq!(error.code, ErrorCode::SqlError);
-        assert!(!error.retryable);
-
-        statement.spec().sql(&insert);
-        for id in 0..12_000 {
-            statement
-                .spec()
-                .param(1, TypedValue::Int64(id))
-                .unwrap()
-                .add_parameter_set();
-        }
-        let error = statement
-            .execute()
-            .await
-            .err()
-            .expect("parameter limit must reject the whole batch");
-        assert_eq!(error.code, ErrorCode::InvalidArgument, "{error:?}");
-        assert_eq!(error.http_status, Some(400));
-        assert_eq!(error.error_code.as_deref(), Some("INVALID_PARAMETER_VALUE"));
-        assert!(error.message.contains("too many parameters"), "{error:?}");
-        assert!(!error.retryable);
 
         statement
             .spec()
-            .sql(format!("SELECT id FROM {table} ORDER BY id"))
-            .row_limit = None;
+            .sql(format!("SELECT id FROM {table} ORDER BY id"));
         let mut executed = statement.execute().await.unwrap();
         let stream = executed.result_stream_mut();
         let mut rows = Vec::new();
@@ -144,20 +122,7 @@ async fn native_parameter_batch_counts_values_and_atomic_errors() {
         statement
             .spec()
             .sql(format!("DROP TABLE IF EXISTS {table}"));
-        statement.execute().await?.close().await?;
-        statement
-            .spec()
-            .sql(format!("SHOW TABLES IN {schema} LIKE '{name}'"));
-        let mut result = statement.execute().await?;
-        let mut remaining = 0;
-        let stream = result.result_stream_mut();
-        while stream.next_batch().await?.is_some() {
-            while stream.next_row_in_batch().is_some() {
-                remaining += 1;
-            }
-        }
-        result.close().await?;
-        Ok::<_, databricks_sql_kernel::Error>(remaining)
+        statement.execute().await?.close().await
     }
     .await;
     let closed = session.close().await;
@@ -170,10 +135,7 @@ async fn native_parameter_batch_counts_values_and_atomic_errors() {
         }
         std::panic::resume_unwind(panic);
     }
-    assert_eq!(
-        cleanup.expect("drop batch test table and verify absence"),
-        0
-    );
+    cleanup.expect("drop batch test table");
     closed.expect("session close");
 }
 

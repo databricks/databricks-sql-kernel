@@ -542,7 +542,7 @@ impl ExecutedAsyncStatement {
         // Payload before metadata keeps concurrent publications from mixing observations.
         let pending = self.pending_result.lock().ok();
         if let Ok(mut guard) = self.latest_status.lock() {
-            // Scalar status enrichment cannot establish a whole-batch count.
+            // Status polls never carry a batch's aggregate count; keep the one read from the result.
             if self.parameter_set_count != 0 {
                 fresh.num_modified_rows = guard.num_modified_rows;
             }
@@ -953,23 +953,27 @@ impl ExecutedAsyncStatement {
                 if result.status.state == crate::types::sea::StatementState::Closed {
                     self.closed.store(true, Ordering::Release);
                 }
-                let result = crate::statement::dml_count::decode_parameter_batch(
-                    result,
-                    self.parameter_set_count,
-                )
-                .await?;
-                if self.parameter_set_count != 0 {
-                    if let Ok(mut status) = self.latest_status.lock() {
-                        status.num_modified_rows = result.status.num_modified_rows;
-                    }
-                }
                 let mut stream = ResultStream::from_reader(result.reader).await?;
                 stream.attach_telemetry(self.statement_telemetry.clone());
                 // SEA carries no row count on the async status either; for a
                 // DML the count rides in the result set. Derive it once
                 // (non-consuming) and record it onto the latest status so
                 // `num_modified_rows()` matches the sync path / Thrift.
-                if self.parameter_set_count == 0 && self.num_modified_rows().is_none() {
+                if self.parameter_set_count != 0 {
+                    let count = crate::statement::dml_count::read_batch_affected_rows(
+                        &mut stream,
+                        self.parameter_set_count,
+                    )
+                    .await
+                    .map_err(|error| {
+                        error
+                            .with_query_id(&self.statement_id)
+                            .with_retryable(false)
+                    })?;
+                    if let Ok(mut status) = self.latest_status.lock() {
+                        status.num_modified_rows = count;
+                    }
+                } else if self.num_modified_rows().is_none() {
                     if let Some(n) =
                         crate::statement::dml_count::read_dml_affected_rows(&mut stream).await?
                     {

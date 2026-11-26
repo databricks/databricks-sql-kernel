@@ -34,123 +34,13 @@
 //! caller's fetch exactly as it does on the Thrift path — this only adds
 //! the status value, it does not change which rows are returned.
 
-use crate::client::transport::ExecuteResult;
-use crate::kernel_error::{Error, Result};
-use crate::reader::InMemoryReader;
+use crate::kernel_error::Result;
 use crate::result_stream::{ResultBatch, ResultStream};
 use crate::types::sea::ResultManifest;
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Int16Type, Int32Type, Int64Type, Int8Type};
 use arrow_array::Array;
 use arrow_schema::DataType;
-
-/// Decode native batch counts without expanding repeated rows. Preserve the
-/// count result for fetching; a decoding failure must never resubmit the write.
-pub(crate) async fn decode_parameter_batch(
-    mut result: ExecuteResult,
-    parameter_set_count: usize,
-) -> Result<ExecuteResult> {
-    if parameter_set_count == 0 {
-        return Ok(result);
-    }
-    let decoded = async {
-        result.status.num_modified_rows = None;
-        let schema = result.reader.schema().await?;
-        if schema.fields().is_empty() {
-            return Ok(());
-        }
-        let affected = schema
-            .index_of(AFFECTED_ROWS_COLUMN)
-            .map_err(|_| malformed_batch_count("missing num_affected_rows"))?;
-        let repeat = schema.index_of("repeat").ok();
-        let mut represented = 0usize;
-        let mut total = Some(0i64);
-        let mut batches = Vec::new();
-        while let Some(mut batch) = result.reader.next_batch().await? {
-            let actual_schema = batch.schema();
-            let compatible = actual_schema.fields().len() == schema.fields().len()
-                && actual_schema
-                    .fields()
-                    .iter()
-                    .zip(schema.fields())
-                    .all(|(a, b)| a.name() == b.name() && a.data_type() == b.data_type());
-            if !compatible {
-                return Err(malformed_batch_count("inconsistent count schema"));
-            }
-            for row in 0..batch.num_rows() {
-                let repetitions = match repeat {
-                    Some(i) => batch_count_value(batch.column(i).as_ref(), row)?
-                        .filter(|n| *n > 0)
-                        .ok_or_else(|| malformed_batch_count("repeat must be positive"))?,
-                    None => 1,
-                };
-                represented = usize::try_from(repetitions)
-                    .ok()
-                    .and_then(|n| represented.checked_add(n))
-                    .filter(|n| *n <= parameter_set_count)
-                    .ok_or_else(|| malformed_batch_count("too many parameter-set counts"))?;
-                let count = batch_affected_value(batch.column(affected).as_ref(), row)?;
-                total = match (total, count) {
-                    (Some(sum), Some(n)) => Some(
-                        n.checked_mul(repetitions)
-                            .and_then(|n| sum.checked_add(n))
-                            .ok_or_else(|| malformed_batch_count("affected count overflow"))?,
-                    ),
-                    _ => None,
-                };
-            }
-            if actual_schema.fields() != schema.fields() {
-                batch = arrow_array::RecordBatch::try_new(schema.clone(), batch.columns().to_vec())
-                    .map_err(|error| {
-                        malformed_batch_count(&format!("inconsistent count nullability: {error}"))
-                    })?;
-            }
-            batches.push(batch);
-        }
-        if represented != 0 && represented != parameter_set_count {
-            return Err(malformed_batch_count("missing parameter-set counts"));
-        }
-        result.status.num_modified_rows = if represented == 0 { None } else { total };
-        let metrics = result.reader.metrics();
-        result.reader = Box::new(InMemoryReader::new(schema, batches).with_metrics(metrics));
-        Ok(())
-    }
-    .await;
-    decoded.map_err(|error: Error| {
-        error
-            .with_query_id(&result.statement_id)
-            .with_retryable(false)
-    })?;
-    Ok(result)
-}
-
-fn malformed_batch_count(detail: &str) -> Error {
-    Error::data_loss().message(format!(
-        "Native parameter batch succeeded but its counts could not be decoded: {detail}. Rows may already be committed",
-    ))
-}
-
-fn batch_affected_value(column: &dyn Array, row: usize) -> Result<Option<i64>> {
-    match batch_count_value(column, row)? {
-        // SUCCESS_NO_INFO means execution succeeded without a precise count.
-        None | Some(-2) => Ok(None),
-        Some(n) if n >= 0 => Ok(Some(n)),
-        _ => Err(malformed_batch_count("invalid negative affected count")),
-    }
-}
-
-fn batch_count_value(column: &dyn Array, row: usize) -> Result<Option<i64>> {
-    if column.is_null(row) {
-        return Ok(None);
-    }
-    Ok(Some(match column.data_type() {
-        DataType::Int64 => column.as_primitive::<Int64Type>().value(row),
-        DataType::Int32 => column.as_primitive::<Int32Type>().value(row) as i64,
-        DataType::Int16 => column.as_primitive::<Int16Type>().value(row) as i64,
-        DataType::Int8 => column.as_primitive::<Int8Type>().value(row) as i64,
-        _ => return Err(malformed_batch_count("count must be an integer")),
-    }))
-}
 
 /// The exact set of column names a SEA DML count result is built from.
 const DML_COUNT_COLUMNS: [&str; 4] = [
@@ -178,19 +68,9 @@ pub(crate) fn manifest_is_dml_count(manifest: &ResultManifest) -> bool {
         && cols.iter().any(|c| c.name == AFFECTED_ROWS_COLUMN)
 }
 
-/// If `stream`'s result set is a DML row-count result, return its
-/// `num_affected_rows` value; otherwise `None`.
-///
-/// Detection is deliberately strict — **every** column must be one of the
-/// known `num_*_rows` counters and `num_affected_rows` must be present —
-/// so a `SELECT 1 AS num_affected_rows` (a real query that merely aliases
-/// a column to that name) is not mistaken for a DML result. Thrift never
-/// faces this ambiguity because it reads the count from operation
-/// metadata rather than the result columns; the strict signature keeps us
-/// as close as the SEA wire shape allows.
-///
-/// Non-consuming: peeks the first batch and buffers it, so the caller's
-/// subsequent fetch still sees the row.
+/// Reads the signed integer `num_affected_rows` when the first batch has
+/// one row and every column is a known DML counter. A SELECT with the same
+/// result shape is indistinguishable. Peeking leaves the batch fetchable.
 pub(crate) async fn read_dml_affected_rows(stream: &mut ResultStream) -> Result<Option<i64>> {
     let schema = stream.schema();
     let fields = schema.fields();
@@ -214,71 +94,112 @@ pub(crate) async fn read_dml_affected_rows(stream: &mut ResultStream) -> Result<
     if batch.num_rows() != 1 {
         return Ok(None);
     }
-    let col = batch.column(col_idx);
-    if col.is_null(0) {
+    Ok(int_value(batch.column(col_idx).as_ref(), 0))
+}
+
+/// Read an aggregate count when the first result batch accounts for every
+/// parameter set. Peeking leaves the result available to the caller.
+pub(crate) async fn read_batch_affected_rows(
+    stream: &mut ResultStream,
+    parameter_set_count: usize,
+) -> Result<Option<i64>> {
+    let Some(ResultBatch::Arrow(batch)) = stream.peek_first_batch().await? else {
         return Ok(None);
-    }
-    // The server types these BIGINT (Arrow Int64); accept the narrower
-    // signed widths defensively, and ignore anything else rather than
-    // mis-reporting.
-    let value = match col.data_type() {
-        DataType::Int64 => col.as_primitive::<Int64Type>().value(0),
-        DataType::Int32 => col.as_primitive::<Int32Type>().value(0) as i64,
-        DataType::Int16 => col.as_primitive::<Int16Type>().value(0) as i64,
-        DataType::Int8 => col.as_primitive::<Int8Type>().value(0) as i64,
-        _ => return Ok(None),
     };
-    Ok(Some(value))
+    let Some(affected) = batch.column_by_name(AFFECTED_ROWS_COLUMN) else {
+        return Ok(None);
+    };
+    let repeats = batch.column_by_name("repeat");
+    let totals = (0..batch.num_rows()).try_fold((0usize, 0i64), |(represented, total), row| {
+        let repeat = match repeats {
+            Some(col) => int_value(col.as_ref(), row).filter(|&n| n > 0)?,
+            None => 1,
+        };
+        let count = int_value(affected.as_ref(), row).filter(|&n| n >= 0)?;
+        Some((
+            represented.checked_add(usize::try_from(repeat).ok()?)?,
+            total.checked_add(count.checked_mul(repeat)?)?,
+        ))
+    });
+    Ok(totals
+        .and_then(|(represented, total)| (represented == parameter_set_count).then_some(total)))
+}
+
+fn int_value(col: &dyn Array, row: usize) -> Option<i64> {
+    if col.is_null(row) {
+        return None;
+    }
+    Some(match col.data_type() {
+        DataType::Int64 => col.as_primitive::<Int64Type>().value(row),
+        DataType::Int32 => col.as_primitive::<Int32Type>().value(row) as i64,
+        DataType::Int16 => col.as_primitive::<Int16Type>().value(row) as i64,
+        DataType::Int8 => col.as_primitive::<Int8Type>().value(row) as i64,
+        _ => return None,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::reader::{InMemoryReader, ResultReaderMetrics};
-    use crate::telemetry::ExecutionResultFormat;
+    use crate::reader::InMemoryReader;
     use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray};
     use arrow_schema::{Field, Schema};
     use std::sync::Arc;
 
     #[tokio::test]
-    async fn batch_counts_preserve_reader_metrics() {
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            AFFECTED_ROWS_COLUMN,
-            DataType::Int64,
-            true,
-        )]));
-        let batch =
-            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![2, 3]))])
-                .unwrap();
-        let metrics = ResultReaderMetrics {
-            total_chunks_present: Some(1),
-            total_chunks_iterated: Some(1),
-            sum_chunks_download_time: Some(std::time::Duration::from_millis(7)),
-            ..Default::default()
+    async fn batch_counts_are_optional_and_non_consuming() {
+        let affected = |values| {
+            (
+                AFFECTED_ROWS_COLUMN,
+                Arc::new(Int64Array::from(values)) as ArrayRef,
+            )
         };
-        let result = ExecuteResult {
-            statement_id: "batch-metrics".into(),
-            reader: Box::new(
-                InMemoryReader::new(schema.clone(), vec![batch.clone()])
-                    .with_metrics(Some(metrics)),
+        let cases = [
+            ("repeated", affected(vec![Some(1)]), Some(3), Some(3)),
+            ("unknown", affected(vec![Some(-2)]), Some(3), None),
+            (
+                "uncompressed",
+                affected(vec![Some(1), Some(2), Some(3)]),
+                None,
+                Some(6),
             ),
-            manifest: None,
-            telemetry_result_format: ExecutionResultFormat::InlineArrow,
-            telemetry_is_compressed: false,
-            status: serde_json::from_str(r#"{"state":"SUCCEEDED"}"#).unwrap(),
-        };
-        let result = decode_parameter_batch(result, 2).await.unwrap();
-        assert_eq!(result.status.num_modified_rows, Some(5));
-        let retained = result.reader.metrics().expect("source metrics retained");
-        assert_eq!(retained.total_chunks_present, metrics.total_chunks_present);
-        assert_eq!(
-            retained.total_chunks_iterated,
-            metrics.total_chunks_iterated
-        );
-        assert_eq!(
-            retained.sum_chunks_download_time,
-            metrics.sum_chunks_download_time
-        );
+            ("wrong set count", affected(vec![Some(1)]), Some(2), None),
+            ("zero repeat", affected(vec![Some(1)]), Some(0), None),
+            ("null count", affected(vec![None]), Some(3), None),
+            (
+                "string count",
+                (
+                    AFFECTED_ROWS_COLUMN,
+                    Arc::new(StringArray::from(vec!["1"])) as ArrayRef,
+                ),
+                Some(3),
+                None,
+            ),
+            (
+                "missing count",
+                ("other", Arc::new(Int64Array::from(vec![1])) as ArrayRef),
+                Some(3),
+                None,
+            ),
+            ("overflow", affected(vec![Some(i64::MAX)]), Some(3), None),
+        ];
+
+        for (name, column, repeat, expected) in cases {
+            let mut columns = vec![column];
+            if let Some(repeat) = repeat {
+                columns.push(("repeat", Arc::new(Int64Array::from(vec![repeat]))));
+            }
+            let batch = RecordBatch::try_from_iter(columns).unwrap();
+            let reader = InMemoryReader::new(batch.schema(), vec![batch.clone()]);
+            let mut stream = ResultStream::from_reader(Box::new(reader)).await.unwrap();
+            assert_eq!(
+                read_batch_affected_rows(&mut stream, 3).await.unwrap(),
+                expected,
+                "{name}"
+            );
+            let ResultBatch::Arrow(fetched) = stream.next_batch().await.unwrap().expect(name);
+            assert_eq!(fetched, &batch, "{name}");
+        }
     }
 
     /// Build a single-batch `ResultStream` from `(name, Int64 values)` columns.

@@ -186,9 +186,9 @@ pub struct StatementSpec {
     /// return `ErrorCode::InvalidArgument` if still `None` at execute time.
     pub sql: Option<String>,
 
-    /// Positional parameters, 1-based on the wire. Index `i` in this Vec
-    /// corresponds to ordinal `i + 1`. Mutually exclusive with
-    /// `named_params` (see below).
+    /// Positional parameters in binding order. Index `i` corresponds to API
+    /// ordinal `i + 1`. Wire ordinals are 1-based for ordinary execution and
+    /// 0-based for native parameter sets. Mutually exclusive with `named_params`.
     pub positional_params: Vec<TypedValue>,
 
     /// Named parameters. Mutually exclusive with `positional_params`:
@@ -309,11 +309,12 @@ impl StatementSpec {
     }
 
     /// Push a pre-marshalled SEA parameter (host-stringified value + Databricks
-    /// type name). `name` empty → positional (ordinal assigned at execute in
-    /// push order, 1-based); non-empty → named. `value` None → SQL NULL (the
-    /// host passes type "VOID"). This is the raw-bind path a C-ABI host uses; it
-    /// bypasses `TypedValue` inference because the host already knows the wire
-    /// type and string form.
+    /// type name). `name` empty → positional; non-empty → named. Positional
+    /// ordinals are assigned in push order at execution, 1-based on the wire
+    /// for ordinary execution and 0-based for native parameter sets.
+    /// `value` None → SQL NULL (the host passes type "VOID"). This is the raw-bind
+    /// path a C-ABI host uses; it bypasses `TypedValue` inference because the host
+    /// already knows the wire type and string form.
     ///
     /// Each call appends a binding; repeated calls do not replace a previous
     /// ordinal or name. [`Self::add_parameter_set`] snapshots and clears current

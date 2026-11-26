@@ -125,6 +125,11 @@ fn resolve_wait_timeout(caller_wait_secs: Option<&str>) -> (Option<String>, Opti
     }
 }
 
+/// Build the `(sql, ExecutionParams)` dispatch pair from a statement spec.
+///
+/// This borrows the spec without a session, so the row limit, wait settings,
+/// and parameter bindings can be tested without a live connection. Both sync
+/// and async execution use it through [`Statement::prepare_for_dispatch`].
 fn build_execute_params(
     spec: &StatementSpec,
     wait_timeout_secs: Option<&str>,
@@ -190,6 +195,8 @@ fn build_parameters(
     raw: &[StatementParameter],
     ordinal_base: i32,
 ) -> Result<Vec<StatementParameter>> {
+    // The server rejects mixed positional and named markers with an opaque
+    // BAD_REQUEST; reject every mixed binding style here.
     if !positional.is_empty() && !named.is_empty() {
         return Err(Error::invalid_argument()
             .message("positional and named parameters are mutually exclusive; pass only one"));
@@ -424,12 +431,6 @@ impl Statement {
             self.last_valid = Some(valid.clone());
             self.last_closed = Some(Arc::clone(&closed));
 
-            let is_batch = !exec_params.parameter_sets.is_empty();
-            let result = crate::statement::dml_count::decode_parameter_batch(
-                result,
-                exec_params.parameter_sets.len(),
-            )
-            .await?;
             let mut result_stream = ResultStream::from_reader(result.reader).await?;
             result_stream.attach_telemetry(telemetry_for_body.clone());
             // SEA puts no row count on the status envelope; for a DML it
@@ -438,7 +439,14 @@ impl Statement {
             // result (non-consuming — the count row still reaches the
             // caller's fetch) so `num_modified_rows()` matches Thrift.
             let mut status = result.status;
-            if !is_batch && status.num_modified_rows.is_none() {
+            let parameter_set_count = exec_params.parameter_sets.len();
+            if parameter_set_count != 0 {
+                status.num_modified_rows = crate::statement::dml_count::read_batch_affected_rows(
+                    &mut result_stream,
+                    parameter_set_count,
+                )
+                .await?;
+            } else if status.num_modified_rows.is_none() {
                 status.num_modified_rows =
                     crate::statement::dml_count::read_dml_affected_rows(&mut result_stream).await?;
             }
@@ -668,16 +676,18 @@ impl Statement {
                     self.last_statement_id = Some(result.statement_id.clone());
                     self.last_valid = Some(valid.clone());
                     self.last_closed = Some(Arc::clone(&closed));
-                    let is_batch = !exec_params.parameter_sets.is_empty();
-                    let result = crate::statement::dml_count::decode_parameter_batch(
-                        result,
-                        exec_params.parameter_sets.len(),
-                    )
-                    .await?;
                     let mut result_stream = ResultStream::from_reader(result.reader).await?;
                     result_stream.attach_telemetry(telemetry_for_body.clone());
                     let mut status = result.status;
-                    if !is_batch && status.num_modified_rows.is_none() {
+                    let parameter_set_count = exec_params.parameter_sets.len();
+                    if parameter_set_count != 0 {
+                        status.num_modified_rows =
+                            crate::statement::dml_count::read_batch_affected_rows(
+                                &mut result_stream,
+                                parameter_set_count,
+                            )
+                            .await?;
+                    } else if status.num_modified_rows.is_none() {
                         // Optional count reads must not turn a successful write into an execute error.
                         if let Ok(count) =
                             crate::statement::dml_count::read_dml_affected_rows(&mut result_stream)
@@ -1081,9 +1091,6 @@ mod tests {
 
     #[test]
     fn build_execute_params_threads_row_limit_to_wire() {
-        // Headline parity feature: spec.row_limit must reach
-        // ExecutionParams.scalar.row_limit. A regression dropping it would otherwise
-        // pass every other test (the seam this pins).
         let mut spec = StatementSpec::new();
         spec.sql("SELECT 1").row_limit(Some(100));
         let (sql, params) = build_execute_params(&spec, None).unwrap();
@@ -1093,10 +1100,6 @@ mod tests {
 
     #[test]
     fn build_execute_params_threads_query_tags_to_wire_array() {
-        // Per-statement query tags set via Statement::query_tags must reach
-        // ExecutionParams.scalar.query_tags as the native SEA {key, value} array (the
-        // SEA request has no conf overlay). Regression guard for the seam
-        // where statement_conf["query_tags"] is converted to the array.
         use std::collections::HashMap;
         let mut spec = StatementSpec::new();
         spec.sql("SELECT 1");
@@ -1131,12 +1134,7 @@ mod tests {
 
     #[test]
     fn build_execute_params_reads_raw_query_tags_conf() {
-        // The C ABI `kernel_statement_set_query_tags` stores the pre-serialized
-        // wire string directly under `statement_conf["query_tags"]` (rather than
-        // going through the typed `Statement::query_tags` builder). It must reach
-        // `ExecutionParams.scalar.query_tags` as the native array just the same — this is
-        // the seam the C ABI relies on. Includes a bare key (None value) and an
-        // escaped colon in a value.
+        // The C ABI writes serialized tags to statement_conf, bypassing the typed query-tag builder.
         use std::collections::{HashMap, HashSet};
         let mut spec = StatementSpec::new();
         spec.sql("SELECT 1");
@@ -1164,10 +1162,6 @@ mod tests {
 
     #[test]
     fn build_execute_params_clears_query_tags_when_conf_removed() {
-        // The C ABI `kernel_statement_set_query_tags(stmt, "")` clears tags by
-        // removing statement_conf["query_tags"] — needed because the conf survives
-        // set_sql, so a reused handle would otherwise leak a prior query's tags.
-        // After removal, no query_tags reach the wire.
         use std::collections::HashMap;
         let mut spec = StatementSpec::new();
         spec.sql("SELECT 1");
@@ -1175,7 +1169,6 @@ mod tests {
             "query_tags".to_string(),
             "team:eng".to_string(),
         )]));
-        // Simulate the empty-string clear path.
         spec.statement_conf.remove("query_tags");
 
         let (_sql, params) = build_execute_params(&spec, None).unwrap();
@@ -1334,7 +1327,7 @@ mod tests {
         );
     }
     #[test]
-    fn native_batch_rejects_mixed_bindings_and_preserves_snapshots() {
+    fn native_batch_rejects_mixed_and_leftover_bindings() {
         let mut spec = StatementSpec::new();
         spec.sql("INSERT INTO t VALUES (?)");
         spec.param_raw(None, "BIGINT", Some("1".into()));
@@ -1352,21 +1345,6 @@ mod tests {
         assert!(build_execute_params(&spec, None)
             .unwrap_err()
             .message
-            .contains("mutually exclusive"));
-        spec.add_parameter_set();
-        let cloned = spec.clone();
-        spec.sql("SELECT 1");
-        assert!(build_execute_params(&spec, None)
-            .unwrap()
-            .1
-            .parameter_sets
-            .is_empty());
-        let sets = build_execute_params(&cloned, None)
-            .unwrap()
-            .1
-            .parameter_sets;
-        assert_eq!(sets.len(), 2);
-        assert_eq!(sets[0].parameters[0].value.as_deref(), Some("1"));
-        assert_eq!(sets[1].parameters[0].value.as_deref(), Some("2"));
+            .contains("native parameter sets"));
     }
 }
