@@ -565,8 +565,9 @@ pub(crate) fn reshape_schemas(
 ///
 /// `requested_catalog` fills `TABLE_CAT` rows for server responses
 /// that omit it (single-catalog form). `table_types`, when `Some` with
-/// at least one entry, filters rows to those whose `TABLE_TYPE` appears
-/// in the slice (matches JDBC `DatabaseMetaData.getTables` behaviour).
+/// at least one entry, keeps rows whose known `TABLE_TYPE` appears in the
+/// slice and passes through rows whose type is null or empty (matching
+/// legacy Thrift `GetTables` behaviour).
 /// A `Some(&[])` (explicit empty slice) matches NO table types and
 /// yields an empty result — it is NOT treated like `None`. See the
 /// inline note in the filter block below (METADATA-035 conformance /
@@ -1506,7 +1507,7 @@ mod tests {
     }
 
     #[test]
-    fn tables_filter_by_type_keeps_only_matching_rows() {
+    fn tables_filter_by_type_keeps_matching_and_unknown_rows() {
         let b = server_tables_full();
         let out = reshape_tables(&b, Some("main"), Some(&["TABLE"])).unwrap();
         assert_eq!(out.num_rows(), 2);
@@ -2220,7 +2221,7 @@ mod tests {
     }
 
     #[test]
-    fn filter_tables_by_type_drops_non_matching_and_nulls() {
+    fn filter_tables_by_type_drops_non_matching_known_rows() {
         let batch = tables_with_types(&["TABLE", "VIEW"]);
         let out = filter_tables_by_type(&batch, &["MANAGED"]).unwrap();
         assert_eq!(out.num_rows(), 0);

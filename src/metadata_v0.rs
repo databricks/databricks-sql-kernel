@@ -779,9 +779,9 @@ impl Metadata {
     /// "must not contain a search pattern", so catalog wildcarding is a
     /// `getTables`-only behaviour.
     ///
-    /// `table_types`, when `Some(non-empty)`, filters the result to
-    /// rows whose `TABLE_TYPE` matches one of the listed strings —
-    /// matches `java.sql.DatabaseMetaData.getTables` behaviour.
+    /// `table_types`, when `Some(non-empty)`, keeps rows whose known
+    /// `TABLE_TYPE` matches one of the listed strings. Rows whose type is
+    /// null or empty also pass through, matching legacy Thrift behaviour.
     /// Databricks `SHOW TABLES` itself does not accept a type filter,
     /// so the filter is applied kernel-side after reshape.
     pub async fn list_tables(
