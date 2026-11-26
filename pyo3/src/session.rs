@@ -25,8 +25,11 @@ use crate::executed_async::ExecutedAsyncStatement;
 use crate::metadata::Metadata;
 use crate::runtime::KernelRuntime;
 use crate::statement::Statement;
-use databricks_sql_kernel::{GeospatialResultRepresentation, Session as KSession};
+use databricks_sql_kernel::{
+    ConnectionConfig, GeospatialResultRepresentation, Session as KSession,
+};
 use pyo3::prelude::*;
+use pyo3::types::{PyBool, PyInt};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::runtime::Builder;
@@ -141,6 +144,42 @@ fn build_telemetry_config(
         telemetry.circuit_breaker_timeout = std::time::Duration::from_millis(v);
     }
     Ok(telemetry)
+}
+
+/// Validate the optional `port` argument. `None` (or Python `None`) means
+/// unset, which is `0`. Anything else must be an `int` in `0..=65535`: a
+/// non-int (`bool` included) or an out-of-range value raises `ValueError`.
+fn parse_port(port: Option<Bound<'_, PyAny>>) -> PyResult<u16> {
+    const INVALID: &str = "port must be an int between 0 and 65535";
+    let Some(obj) = port else {
+        return Ok(0);
+    };
+    if obj.is_none() {
+        return Ok(0);
+    }
+    if obj.is_instance_of::<PyBool>() || !obj.is_instance_of::<PyInt>() {
+        return Err(pyo3::exceptions::PyValueError::new_err(INVALID));
+    }
+    let value: i64 = obj
+        .extract()
+        .map_err(|_| pyo3::exceptions::PyValueError::new_err(INVALID))?;
+    port_from_int(value).ok_or_else(|| pyo3::exceptions::PyValueError::new_err(INVALID))
+}
+
+/// Range-check an already-extracted Python int into a port (`0..=65535`).
+fn port_from_int(value: i64) -> Option<u16> {
+    u16::try_from(value).ok()
+}
+
+/// Build the kernel connection from `host`, `http_path` and the validated
+/// port. Port `0` leaves the host unchanged; a bad host/port combination is
+/// the kernel's `InvalidArgument`.
+fn connection_config(
+    host: String,
+    http_path: &str,
+    port: u16,
+) -> Result<ConnectionConfig, databricks_sql_kernel::Error> {
+    ConnectionConfig::from_http_path(host, http_path)?.with_port(port)
 }
 
 fn geospatial_result_representation(enabled: bool) -> GeospatialResultRepresentation {
@@ -280,6 +319,16 @@ impl Session {
     /// fully-qualified (`https://...`). `http_path` is the SQL
     /// endpoint path.
     ///
+    /// `port` is an optional connection port (`int`, `0..=65535`, default
+    /// `None`). A non-default port is folded into the host by the kernel,
+    /// so the connection goes to `host:port`. Port `0` and the scheme
+    /// default (443 for `https`, 80 for `http`) change nothing. The host
+    /// must not carry credentials, a path, a query, or a fragment. A port
+    /// already in `host` wins over `port`, and the kernel logs a warning
+    /// when they differ. A bad host/port combination raises `KernelError`
+    /// (`InvalidArgument`). A value outside `0..=65535`, or a non-int, raises
+    /// `ValueError`.
+    ///
     /// Auth: pass `auth_type` plus the matching credentials.
     ///
     /// - `"pat"` (or omit `auth_type` and pass `access_token`):
@@ -351,6 +400,7 @@ impl Session {
         host,
         http_path,
         *,
+        port=None,
         auth_type=None,
         access_token=None,
         client_id=None,
@@ -416,6 +466,7 @@ impl Session {
         py: Python<'_>,
         host: String,
         http_path: String,
+        port: Option<Bound<'_, PyAny>>,
         auth_type: Option<String>,
         access_token: Option<String>,
         client_id: Option<String>,
@@ -478,6 +529,9 @@ impl Session {
         telemetry_circuit_breaker_threshold: Option<u32>,
         telemetry_circuit_breaker_timeout_ms: Option<u64>,
     ) -> PyResult<Self> {
+        // Range/type check first: a bad port is a plain argument error and
+        // never reaches the kernel.
+        let port = parse_port(port)?;
         // Resolve auth_type. Explicit `auth_type` always wins. When
         // omitted, default to "pat" if `access_token` was passed
         // (back-compat for existing PAT callers). A bare
@@ -628,7 +682,7 @@ impl Session {
         let rt = runtime.clone();
         let session = run_kernel!(py, rt, async {
             let mut builder = KSession::builder()
-                .http_path(host, http_path)
+                .connection(connection_config(host, &http_path, port)?)
                 .auth(auth_config);
             if let Some(tls) = tls_config {
                 builder = builder.tls(tls);
@@ -760,6 +814,37 @@ mod send_sync_tests {
     fn runtime_arc_is_send_sync() {
         assert_send_sync::<Arc<KernelRuntime>>();
         assert_send_sync::<SessionInner>();
+    }
+
+    #[test]
+    fn port_range_check_accepts_0_to_65535_only() {
+        assert_eq!(port_from_int(0), Some(0));
+        assert_eq!(port_from_int(8443), Some(8443));
+        assert_eq!(port_from_int(65535), Some(65535));
+        for bad in [-1, 65536, i64::MAX, i64::MIN] {
+            assert_eq!(port_from_int(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn connection_config_folds_port_and_keeps_credentials_out_of_errors() {
+        let folded = connection_config(
+            "workspace.databricks.com".into(),
+            "/sql/1.0/warehouses/abc",
+            8443,
+        )
+        .expect("fold");
+        assert_eq!(folded.host, "https://workspace.databricks.com:8443");
+
+        // Port 0 is the unset case: the host is exactly what the caller passed.
+        let unset =
+            connection_config("https://h".into(), "/sql/1.0/warehouses/abc", 0).expect("unset");
+        assert_eq!(unset.host, "https://h");
+
+        match connection_config("https://u:s3cret@h".into(), "/sql/1.0/warehouses/abc", 8443) {
+            Ok(_) => panic!("credentials with a port must be rejected"),
+            Err(err) => assert!(!err.message.contains("s3cret"), "{}", err.message),
+        }
     }
 
     #[test]

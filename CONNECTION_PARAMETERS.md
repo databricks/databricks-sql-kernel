@@ -32,6 +32,40 @@ warehouse id and org id out of a `/sql/1.0/warehouses/{id}` path).
 | `warehouse_id` | Warehouse id, e.g. `abc123`. Accepts `/sql/1.0/warehouses/{id}` and legacy `/sql/1.0/endpoints/{id}` forms via `from_http_path`. | **(required)** |
 | `org_id` | Workspace organization id for multi-tenant routing; sent as the `x-databricks-org-id` header. Auto-populated from the `?o=` query parameter of the HTTP path. | `None` |
 
+### Connection port
+
+A connection port is an input, not a field: the kernel folds it into `host`
+as `scheme://host:port`, and the transport connects there. Set it with
+`ConnectionConfig::with_port(port)` in Rust, the pyo3 `port=` keyword, the
+napi `port` option, or `kernel_session_config_set_port` in the C ABI. Bindings
+no longer build the port into the host string themselves.
+
+| Port | Effect |
+|------|--------|
+| `0` (or omitted) | Unset. The host is unchanged. |
+| The scheme default (`443` for `https`, `80` for `http`) | Unchanged, with no validation. |
+| Any other port | Folded into the host. |
+
+A non-default port is rejected with `InvalidArgument` when:
+
+- the host has userinfo (`user:pw@host`); error text shows `<redacted>@host`;
+- the host is empty, or has a path, query or fragment;
+- the host already has an embedded port that is not `1` to `65535`.
+
+A port already embedded in the host (`host:N` or `[v6]:N`) is kept and wins
+over the requested port. The kernel logs a `WARN` when a non-default requested
+port differs from it; a requested port equal to the scheme default is treated
+as unset, so it never warns. A bare
+IPv6 literal is bracketed, so `2001:db8::1` becomes `[2001:db8::1]:port`. Only
+`http` and `https` hosts are accepted. The applied port is reported as
+`host_info.port` in connection telemetry.
+
+The C ABI validates eagerly. A bad host/port combination returns
+`InvalidArgument` from whichever of `kernel_session_config_set_port`,
+`kernel_session_config_set_warehouse` or `kernel_session_config_set_http_path`
+is called second, and the config is unchanged. The bindings validate the port
+value at construction or open, before any network I/O.
+
 ## `AuthConfig` — authentication (required)
 
 An enum; pick one variant. Use the validating constructors

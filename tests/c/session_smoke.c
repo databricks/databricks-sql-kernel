@@ -154,6 +154,40 @@ static void test_http_path_and_m2m_setters(void) {
   kernel_session_config_free(config);
 }
 
+/* Connection port: set before the host, a host that cannot take a port is
+ * rejected at set_warehouse (eager), the error never echoes the password, and
+ * clearing the port (0) makes the same host acceptable again. */
+static void test_port_setter(void) {
+  KernelSessionConfig* config = NULL;
+  (void)kernel_session_config_new(&config);
+
+  KernelStatusCode rc = kernel_session_config_set_port(config, 8443);
+  CHECK(rc == KernelStatusCode_Success, "set_port before host succeeds");
+
+  rc = kernel_session_config_set_warehouse(
+      config, "https://user:s3cret@example.databricks.com", "wh123");
+  CHECK(rc == KernelStatusCode_InvalidArgument,
+        "set_warehouse with credentials + port → InvalidArgument");
+
+  KernelError err;
+  memset(&err, 0, sizeof(err));
+  CHECK(kernel_get_last_error(&err) && err.message != NULL,
+        "port rejection populates last error");
+  CHECK(err.message != NULL && strstr(err.message, "s3cret") == NULL,
+        "port rejection message does not echo the password");
+
+  rc = kernel_session_config_set_port(config, 0);
+  CHECK(rc == KernelStatusCode_Success, "set_port(0) clears the port");
+  rc = kernel_session_config_set_warehouse(
+      config, "https://user:s3cret@example.databricks.com", "wh123");
+  CHECK(rc == KernelStatusCode_Success, "set_warehouse with no port succeeds");
+
+  rc = kernel_session_config_set_port(NULL, 8443);
+  CHECK(rc == KernelStatusCode_InvalidArgument, "set_port(NULL cfg) → InvalidArgument");
+
+  kernel_session_config_free(config);
+}
+
 /* A null required string argument to a setter → InvalidArgument. */
 static void test_setter_null_arg_rejected(void) {
   KernelSessionConfig* config = NULL;
@@ -386,6 +420,7 @@ int main(void) {
   test_open_requires_connection_and_auth();
   test_open_unreachable_host_errors();
   test_http_path_and_m2m_setters();
+  test_port_setter();
   test_setter_null_arg_rejected();
   test_proxy_and_tls_setters();
   test_u2m_and_header_setters();

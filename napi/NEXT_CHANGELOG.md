@@ -14,6 +14,14 @@ layout, or npm publishing. Pure-kernel changes go in the root
 
 ### Added
 
+- `ConnectionOptions.port` (`port?: number`): an optional connection port.
+  A non-default port is folded into the host by the kernel. `0` and the scheme
+  default (443 for `https`, 80 for `http`) change nothing. The host must not
+  have credentials, a path, a query or a fragment. A port already in the host
+  wins. A value that is not an integer in `0..=65535` gives the
+  `InvalidArgument` error. A bad host/port combination also gives
+  `InvalidArgument`.
+
 ### Changed
 
 ### Updated
