@@ -191,7 +191,9 @@ impl TelemetryClient {
 // abort the process. The worker stack floor is shared with the C-ABI runtime
 // via `crate::util::runtime` (single source of truth); see that module for the
 // floor-not-cap semantics and the #326 / #328 history.
-use crate::util::runtime::{ambient_rust_min_stack, runtime_thread_stack_size};
+use crate::util::runtime::{
+    ambient_rust_min_stack, block_sigpipe_on_current_thread, runtime_thread_stack_size,
+};
 
 fn telemetry_runtime_handle() -> std::io::Result<Handle> {
     // A host client can outlive the session that created it. Keep its timer,
@@ -210,6 +212,7 @@ fn telemetry_runtime_handle() -> std::io::Result<Handle> {
         .worker_threads(1)
         .thread_name("dbx-sql-telemetry")
         .thread_stack_size(runtime_thread_stack_size(ambient_rust_min_stack()))
+        .on_thread_start(block_sigpipe_on_current_thread)
         .enable_all()
         .build()?;
     let handle = built.handle().clone();
@@ -226,6 +229,13 @@ mod tests {
 
     // The pure floor-not-cap resolution (#326 / #328) is exercised once over
     // the shared helper in `crate::util::runtime`.
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn telemetry_runtime_threads_block_sigpipe() {
+        let handle = telemetry_runtime_handle().expect("telemetry runtime");
+        crate::util::runtime::assert_runtime_threads_block_sigpipe(&handle);
+    }
 
     #[tokio::test]
     async fn batch_size_triggers_background_flush() {
