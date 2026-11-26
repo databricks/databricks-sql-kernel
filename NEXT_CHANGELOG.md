@@ -17,6 +17,8 @@ changes go in their respective binding's NEXT_CHANGELOG.
 
 ### Fixed
 
+- The C ABI and shared telemetry runtime threads now block SIGPIPE. A TLS write after a peer reset no longer kills a host that doesn't ignore SIGPIPE, such as a Go program linking the C ABI; the write fails with `EPIPE` and the request reports the connection error instead.
+
 ---
 *Note: When making changes, please add your change under the appropriate
 section with a brief description. At release time, move the entries here

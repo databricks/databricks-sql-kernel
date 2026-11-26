@@ -621,6 +621,7 @@ dependencies = [
  "hex",
  "hmac 0.13.0",
  "jsonwebtoken",
+ "libc",
  "lz4_flex",
  "moka",
  "oauth2",

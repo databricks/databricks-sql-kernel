@@ -664,6 +664,7 @@ dependencies = [
  "hex",
  "hmac 0.13.0",
  "jsonwebtoken",
+ "libc",
  "log",
  "lz4_flex",
  "moka",

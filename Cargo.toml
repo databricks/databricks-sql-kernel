@@ -159,6 +159,11 @@ zeroize = "1.9"                                                                 
 jsonwebtoken = { version = "9", default-features = false, features = ["use_pem"] } # JWT signing (RS256/384/512, PS256/384/512, ES256/384); use_pem = PEM key loading (adds pem + simple_asn1, no TLS)
 pkcs8 = { version = "0.10", features = ["encryption", "pem", "std"] }            # PKCS#8 PEM parsing + PBES2 passphrase decryption
 
+# `pthread_sigmask` for kernel-owned runtime threads (`src/util/runtime.rs`).
+# Already in the graph through tokio, so no new crate is added.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util"] }
 wiremock = "0.6"

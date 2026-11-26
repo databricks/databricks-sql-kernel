@@ -149,6 +149,49 @@ pub(crate) fn ambient_rust_min_stack() -> Option<usize> {
         .and_then(|v| v.parse::<usize>().ok())
 }
 
+/// `on_thread_start` hook for kernel-owned runtimes. std's `write_vectored` is a plain
+/// `writev`, so a write after a peer reset raises SIGPIPE on this thread, and non-Rust hosts
+/// that don't ignore it (Go) die. Only kernel threads change; the write still fails with EPIPE.
+#[cfg(unix)]
+pub(crate) fn block_sigpipe_on_current_thread() {
+    // SAFETY: initialises a stack-local `sigset_t` and changes only this thread's mask.
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGPIPE);
+        libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+    }
+}
+
+/// Windows has no SIGPIPE.
+#[cfg(not(unix))]
+pub(crate) fn block_sigpipe_on_current_thread() {}
+
+/// Whether SIGPIPE is in the calling thread's `SigBlk` mask.
+#[cfg(all(test, target_os = "linux"))]
+fn sigpipe_blocked() -> bool {
+    let path = "/proc/thread-self/status";
+    let status = std::fs::read_to_string(path).unwrap();
+    let mask = status
+        .lines()
+        .find_map(|l| l.strip_prefix("SigBlk:"))
+        .unwrap();
+    let mask = u64::from_str_radix(mask.trim(), 16).unwrap();
+    (mask & (1u64 << (libc::SIGPIPE - 1))) != 0
+}
+
+/// Asserts that a worker and a blocking-pool thread of `handle` block SIGPIPE.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn assert_runtime_threads_block_sigpipe(handle: &tokio::runtime::Handle) {
+    assert!(!sigpipe_blocked(), "caller already blocks SIGPIPE");
+    let worker = handle.spawn(async { sigpipe_blocked() });
+    let blocking = handle.spawn_blocking(sigpipe_blocked);
+    let on_worker = futures::executor::block_on(worker).unwrap();
+    let on_blocking = futures::executor::block_on(blocking).unwrap();
+    assert!(on_worker, "runtime worker must block SIGPIPE");
+    assert!(on_blocking, "blocking-pool thread must block SIGPIPE");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

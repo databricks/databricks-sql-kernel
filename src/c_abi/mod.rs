@@ -84,7 +84,9 @@ static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 // The kernel-owned worker stack floor lives in `crate::util::runtime` as a
 // single source of truth shared with the telemetry runtime; see that module
 // for the floor-not-cap semantics and the #326 / #328 history.
-use crate::util::runtime::{ambient_rust_min_stack, runtime_thread_stack_size};
+use crate::util::runtime::{
+    ambient_rust_min_stack, block_sigpipe_on_current_thread, runtime_thread_stack_size,
+};
 
 /// Fetch (initialising on first use) the process-wide C-ABI runtime.
 ///
@@ -107,6 +109,7 @@ pub(crate) fn runtime() -> crate::kernel_error::Result<&'static tokio::runtime::
         .enable_all()
         .thread_name("kernel-c-abi")
         .thread_stack_size(runtime_thread_stack_size(ambient_rust_min_stack()))
+        .on_thread_start(block_sigpipe_on_current_thread)
         .build()
         .map_err(|e| {
             crate::kernel_error::Error::internal()
@@ -556,5 +559,12 @@ mod tests {
              on the caller thread), so no runtime-context TLS is registered on a foreign \
              caller thread — see #276",
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn c_abi_runtime_threads_block_sigpipe() {
+        let rt = runtime().expect("C-ABI runtime");
+        crate::util::runtime::assert_runtime_threads_block_sigpipe(rt.handle());
     }
 }
