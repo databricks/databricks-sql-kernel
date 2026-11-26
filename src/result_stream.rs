@@ -474,8 +474,8 @@ pub struct ResultStream {
     /// `next_row_in_batch` reads and increments.
     current_row_idx: usize,
 
-    /// Flips to `true` once the wrapped reader returns its first
-    /// `None`. Subsequent `next_batch` calls short-circuit to
+    /// Flips to `true` when a normal fetch or first-batch peek observes
+    /// the end. Ready-only lookahead leaves this false. Later `next_batch` calls return
     /// `Ok(None)` without re-entering the reader — saves a wasted
     /// call on readers whose `next_batch` is non-trivial (CloudFetch
     /// in particular checks state and may take a runtime tick).
@@ -714,7 +714,11 @@ impl ResultStream {
         // A batch buffered by `peek_first_batch` is replayed here first,
         // so a non-consuming peek doesn't steal it from the caller.
         if let Some(batch) = self.prefetched.take() {
-            self.set_current_batch(batch.map_err(|error| *error)?);
+            let batch = batch.map_err(|error| {
+                self.finalize_telemetry(Some(&error));
+                *error
+            })?;
+            self.set_current_batch(batch);
             return Ok(self.current.as_ref());
         }
         if self.exhausted {
@@ -747,14 +751,40 @@ impl ResultStream {
     /// Return the next batch if it is already available without waiting for
     /// network or background-prefetch progress.
     pub fn try_next_batch(&mut self) -> Result<TryNextBatch<'_>> {
+        self.try_next_batch_inner(true)
+    }
+
+    /// Non-blocking lookahead for bindings packing ready batches. Errors and
+    /// end-of-stream do not finalize telemetry or clear the current batch.
+    /// `Ready` advances the stream, replaces `current`, and resets the row cursor.
+    /// Call `next_batch` (or `try_next_batch`) to deliver a buffered error or
+    /// observe the end and finalize consumption. Readers may opt out of probing.
+    ///
+    /// `Pending` can persist indefinitely for opt-out readers or a buffered
+    /// error. Repeated calls need not make progress; fall back to `next_batch`
+    /// to await the next outcome rather than polling this method alone.
+    pub fn try_next_ready_batch(&mut self) -> Result<TryNextBatch<'_>> {
+        self.try_next_batch_inner(false)
+    }
+
+    fn try_next_batch_inner(&mut self, finalize: bool) -> Result<TryNextBatch<'_>> {
+        if !finalize && matches!(self.prefetched, Some(Err(_))) {
+            return Ok(TryNextBatch::Pending);
+        }
         if let Some(batch) = self.prefetched.take() {
-            self.set_current_batch(batch.map_err(|error| *error)?);
+            let batch = batch.map_err(|error| {
+                self.finalize_telemetry(Some(&error));
+                *error
+            })?;
+            self.set_current_batch(batch);
             return Ok(TryNextBatch::Ready(
                 self.current.as_ref().expect("batch was just installed"),
             ));
         }
         if self.exhausted {
-            self.finalize_telemetry(None);
+            if finalize {
+                self.finalize_telemetry(None);
+            }
             return Ok(TryNextBatch::End);
         }
 
@@ -762,7 +792,12 @@ impl ResultStream {
             .reader
             .as_mut()
             .expect("ResultStream reader is present until into_owned_batches consumes it");
-        match reader.try_next_batch() {
+        let next = if finalize {
+            reader.try_next_batch()
+        } else {
+            reader.try_next_ready_batch()
+        };
+        match next {
             Ok(crate::reader::TryNextBatch::Ready(batch)) => {
                 self.set_current_batch(ResultBatch::Arrow(batch));
                 Ok(TryNextBatch::Ready(
@@ -770,12 +805,17 @@ impl ResultStream {
                 ))
             }
             Ok(crate::reader::TryNextBatch::Pending) => Ok(TryNextBatch::Pending),
+            Ok(crate::reader::TryNextBatch::End) if !finalize => Ok(TryNextBatch::End),
             Ok(crate::reader::TryNextBatch::End) => {
                 self.current = None;
                 self.current_row_idx = 0;
                 self.exhausted = true;
                 self.finalize_telemetry(None);
                 Ok(TryNextBatch::End)
+            }
+            Err(error) if !finalize => {
+                self.prefetched = Some(Err(Box::new(error)));
+                Ok(TryNextBatch::Pending)
             }
             Err(error) => {
                 self.finalize_telemetry(Some(&error));
@@ -979,6 +1019,9 @@ impl Iterator for OwnedBatchIter {
                 }
                 Err(error) => {
                     self.done = true;
+                    if let Some(telemetry) = &mut self.telemetry {
+                        telemetry.finish(self.reader.metrics(), Some(&error), true);
+                    }
                     Some(Err(*error))
                 }
             };
@@ -1362,6 +1405,88 @@ mod tests {
         stream.next_batch().await.unwrap();
         assert!(stream.next_batch().await.unwrap().is_none());
         // Subsequent calls keep returning None without crashing.
+        assert!(stream.next_batch().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn ready_lookahead_does_not_finalize_end_before_payload_delivery() {
+        for close_before_end in [false, true] {
+            let schema = schema_for(vec![Field::new("a", DataType::Int32, false)]);
+            let batch =
+                RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![1]))]).unwrap();
+            let mut stream = stream_with(batch).await;
+            stream.attach_telemetry(StatementTelemetry::noop());
+            assert!(stream.next_batch().await.unwrap().is_some());
+            assert!(matches!(
+                stream.try_next_ready_batch().unwrap(),
+                TryNextBatch::End
+            ));
+            assert!(stream.current().is_some());
+            assert!(!stream.exhausted);
+            assert!(!stream.telemetry.as_ref().unwrap().finalized);
+            assert!(!stream.telemetry.as_ref().unwrap().consumed_recorded);
+            if close_before_end {
+                stream.finish_telemetry();
+                assert!(!stream.telemetry.as_ref().unwrap().consumed_recorded);
+            } else {
+                assert!(stream.next_batch().await.unwrap().is_none());
+                assert!(stream.telemetry.as_ref().unwrap().consumed_recorded);
+            }
+            assert!(stream.telemetry.as_ref().unwrap().finalized);
+        }
+    }
+
+    #[tokio::test]
+    async fn ready_lookahead_preserves_unconsumed_empty_stream() {
+        let schema = schema_for(vec![Field::new("a", DataType::Int32, false)]);
+        let mut stream = ResultStream::from_reader(Box::new(InMemoryReader::new(schema, vec![])))
+            .await
+            .unwrap();
+        stream.attach_telemetry(StatementTelemetry::noop());
+        assert!(stream.peek_first_batch().await.unwrap().is_none());
+        assert!(matches!(
+            stream.try_next_ready_batch().unwrap(),
+            TryNextBatch::End
+        ));
+        assert!(!stream.telemetry.as_ref().unwrap().finalized);
+        assert!(stream.next_batch().await.unwrap().is_none());
+        assert!(stream.telemetry.as_ref().unwrap().finalized);
+    }
+
+    #[tokio::test]
+    async fn ready_lookahead_falls_back_for_non_polling_readers() {
+        struct NonPollingReader(std::vec::IntoIter<RecordBatch>, SchemaRef);
+
+        #[async_trait::async_trait]
+        impl crate::reader::ResultReader for NonPollingReader {
+            async fn schema(&self) -> Result<SchemaRef> {
+                Ok(self.1.clone())
+            }
+
+            async fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
+                Ok(self.0.next())
+            }
+        }
+
+        let batch =
+            RecordBatch::try_from_iter([("n", Arc::new(Int32Array::from(vec![13])) as ArrayRef)])
+                .unwrap();
+        let mut stream = ResultStream::from_reader(Box::new(NonPollingReader(
+            vec![batch.clone(), batch.clone()].into_iter(),
+            batch.schema(),
+        )))
+        .await
+        .unwrap();
+        for _ in 0..2 {
+            assert!(matches!(
+                stream.try_next_ready_batch().unwrap(),
+                TryNextBatch::Pending
+            ));
+            let Some(ResultBatch::Arrow(actual)) = stream.next_batch().await.unwrap() else {
+                panic!("blocking fetch must still return the next batch");
+            };
+            assert_eq!(actual, &batch);
+        }
         assert!(stream.next_batch().await.unwrap().is_none());
     }
 

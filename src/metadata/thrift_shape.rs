@@ -1254,6 +1254,12 @@ impl ResultReader for ThriftReshapingReader {
         }
     }
 
+    fn try_next_ready_batch(&mut self) -> Result<crate::reader::TryNextBatch> {
+        self.upstream
+            .try_next_ready_batch()?
+            .map_ready(|batch| self.reshape_batch(batch))
+    }
+
     fn try_next_batch(&mut self) -> Result<crate::reader::TryNextBatch> {
         self.upstream
             .try_next_batch()?
@@ -1266,6 +1272,69 @@ mod tests {
     use super::*;
     use arrow_array::cast::AsArray;
     use arrow_array::{BooleanArray, RecordBatch};
+
+    #[tokio::test]
+    async fn ready_probe_reshapes_batches_and_forwards_pending_and_end() {
+        use crate::reader::{InMemoryReader, TryNextBatch};
+
+        struct PendingOnce(InMemoryReader, bool);
+
+        #[async_trait::async_trait]
+        impl ResultReader for PendingOnce {
+            async fn schema(&self) -> Result<SchemaRef> {
+                self.0.schema().await
+            }
+
+            async fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
+                self.0.next_batch().await
+            }
+
+            fn try_next_batch(&mut self) -> Result<TryNextBatch> {
+                panic!("ready-only probing must use the upstream ready-only method");
+            }
+
+            fn try_next_ready_batch(&mut self) -> Result<TryNextBatch> {
+                if std::mem::take(&mut self.1) {
+                    Ok(TryNextBatch::Pending)
+                } else {
+                    self.0.try_next_ready_batch()
+                }
+            }
+        }
+
+        let batch = RecordBatch::try_from_iter([(
+            "catalog",
+            Arc::new(StringArray::from(vec![Some("main"), None])) as ArrayRef,
+        )])
+        .unwrap();
+        let upstream = PendingOnce(InMemoryReader::new(batch.schema(), vec![batch]), true);
+        let mut reader = ThriftReshapingReader::new(
+            Box::new(upstream),
+            GET_CATALOGS_SCHEMA.clone(),
+            Box::new(reshape_catalogs),
+        );
+        assert_eq!(reader.schema().await.unwrap(), GET_CATALOGS_SCHEMA.clone());
+        assert!(matches!(
+            reader.try_next_ready_batch().unwrap(),
+            TryNextBatch::Pending
+        ));
+        let TryNextBatch::Ready(batch) = reader.try_next_ready_batch().unwrap() else {
+            panic!("the ready upstream batch must be reshaped");
+        };
+        assert_eq!(batch.schema(), GET_CATALOGS_SCHEMA.clone());
+        assert_eq!(
+            batch
+                .column(0)
+                .as_string::<i32>()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![Some("main"), None]
+        );
+        assert!(matches!(
+            reader.try_next_ready_batch().unwrap(),
+            TryNextBatch::End
+        ));
+    }
 
     // ─── is_object_not_found tests ─────────────────────────────────
 

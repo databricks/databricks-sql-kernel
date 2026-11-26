@@ -728,6 +728,13 @@ pub trait ResultReader: Send + Sync {
         Err(Error::invalid_state().message("reader does not support non-blocking batch reads"))
     }
 
+    /// Optional speculative probe used by bindings to pack ready batches.
+    /// Returning `Pending` opts out, leaving the next normal fetch to make
+    /// progress. Polling readers should override this alongside `try_next_batch`.
+    fn try_next_ready_batch(&mut self) -> Result<TryNextBatch> {
+        Ok(TryNextBatch::Pending)
+    }
+
     /// Optional reader-level metrics accumulated below `ResultStream`.
     ///
     /// CloudFetch overrides this to surface chunk download metrics into
@@ -791,6 +798,10 @@ impl CloudFetchResultReader {
 
 #[async_trait]
 impl ResultReader for CloudFetchResultReader {
+    fn try_next_ready_batch(&mut self) -> Result<TryNextBatch> {
+        self.try_next_batch()
+    }
+
     async fn schema(&self) -> Result<SchemaRef> {
         self.provider.get_schema().await
     }
@@ -826,6 +837,10 @@ impl InlineArrowReader {
 
 #[async_trait]
 impl ResultReader for InlineArrowReader {
+    fn try_next_ready_batch(&mut self) -> Result<TryNextBatch> {
+        self.try_next_batch()
+    }
+
     async fn schema(&self) -> Result<SchemaRef> {
         self.schema
             .clone()
@@ -862,6 +877,10 @@ impl InlineStreamingReader {
 
 #[async_trait]
 impl ResultReader for InlineStreamingReader {
+    fn try_next_ready_batch(&mut self) -> Result<TryNextBatch> {
+        self.try_next_batch()
+    }
+
     async fn schema(&self) -> Result<SchemaRef> {
         self.schema.clone().ok_or_else(|| {
             Error::invalid_state().message("Schema not available for inline-Arrow streaming result")
@@ -903,6 +922,10 @@ impl InMemoryReader {
 
 #[async_trait]
 impl ResultReader for InMemoryReader {
+    fn try_next_ready_batch(&mut self) -> Result<TryNextBatch> {
+        self.try_next_batch()
+    }
+
     async fn schema(&self) -> Result<SchemaRef> {
         Ok(self.schema.clone())
     }
@@ -933,6 +956,10 @@ impl EmptyReader {
 
 #[async_trait]
 impl ResultReader for EmptyReader {
+    fn try_next_ready_batch(&mut self) -> Result<TryNextBatch> {
+        self.try_next_batch()
+    }
+
     async fn schema(&self) -> Result<SchemaRef> {
         Ok(self.schema.clone())
     }

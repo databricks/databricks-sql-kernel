@@ -40,7 +40,7 @@ use databricks_sql_kernel::{
 };
 
 use crate::error::napi_err_from_kernel;
-use crate::result::{ArrowBatch, ArrowSchema};
+use crate::result::{ArrowBatch, ArrowSchema, BatchSource, IpcStream};
 use crate::runtime;
 use crate::util::guarded;
 
@@ -79,7 +79,19 @@ enum AnyInner {
     Metadata(ResultStream),
 }
 
-impl AnyInner {
+impl BatchSource for AnyInner {
+    fn try_next_ready_batch(
+        &mut self,
+    ) -> databricks_sql_kernel::Result<databricks_sql_kernel::result_stream::TryNextBatch<'_>> {
+        match self {
+            AnyInner::Executed(statement) => statement
+                .executed
+                .result_stream_mut()
+                .try_next_ready_batch(),
+            AnyInner::Metadata(stream) => stream.try_next_ready_batch(),
+        }
+    }
+
     /// Pull the next batch, variant-aware so the executed path gets the
     /// kernel's **auto-close-on-drain** (fire-and-forget CloseStatement
     /// once the stream is exhausted, after all lazy CloudFetch link
@@ -119,7 +131,7 @@ pub struct Statement {
     /// handle via the shared `ValidityFlag`); the `Metadata` variant
     /// wraps a bare `ResultStream` produced by `Metadata::list_*` /
     /// `primary_keys` / `foreign_keys` / `type_info` / `table_types`.
-    inner: Arc<Mutex<Option<AnyInner>>>,
+    inner: Arc<Mutex<Option<IpcStream<AnyInner>>>>,
     /// Schema captured at construction. Available even after `close()`.
     /// For the `Executed` variant this is the executed handle's
     /// schema; for the `Metadata` variant it's the result-stream's
@@ -154,11 +166,11 @@ impl Statement {
         let schema = executed.schema();
         let statement_id = executed.statement_id().to_owned();
         Self {
-            inner: Arc::new(Mutex::new(Some(AnyInner::Executed(Box::new(
-                StatementInner {
+            inner: Arc::new(Mutex::new(Some(IpcStream::new(AnyInner::Executed(
+                Box::new(StatementInner {
                     _parent: parent,
                     executed,
-                },
+                }),
             ))))),
             schema,
             statement_id,
@@ -179,7 +191,7 @@ impl Statement {
     pub(crate) fn from_result_stream(stream: ResultStream) -> Self {
         let schema = stream.schema();
         Self {
-            inner: Arc::new(Mutex::new(Some(AnyInner::Metadata(stream)))),
+            inner: Arc::new(Mutex::new(Some(IpcStream::new(AnyInner::Metadata(stream))))),
             schema,
             statement_id: String::new(),
             finished: Arc::new(AtomicBool::new(false)),
@@ -223,7 +235,7 @@ impl Statement {
         guarded(async move {
             let guard = inner.lock().await;
             let inner_state = guard.as_ref().ok_or_else(statement_closed_err)?;
-            match inner_state {
+            match &inner_state.source {
                 AnyInner::Executed(s) => Ok(s.executed.num_modified_rows()),
                 AnyInner::Metadata(_) => Ok(None),
             }
@@ -257,7 +269,7 @@ impl Statement {
         guarded(async move {
             let guard = inner.lock().await;
             let inner_state = guard.as_ref().ok_or_else(statement_closed_err)?;
-            match inner_state {
+            match &inner_state.source {
                 AnyInner::Executed(s) => Ok(s.executed.display_message().map(str::to_owned)),
                 AnyInner::Metadata(_) => Ok(None),
             }
@@ -276,7 +288,7 @@ impl Statement {
         guarded(async move {
             let guard = inner.lock().await;
             let inner_state = guard.as_ref().ok_or_else(statement_closed_err)?;
-            match inner_state {
+            match &inner_state.source {
                 AnyInner::Executed(s) => Ok(s.executed.diagnostic_info().map(str::to_owned)),
                 AnyInner::Metadata(_) => Ok(None),
             }
@@ -304,7 +316,7 @@ impl Statement {
         guarded(async move {
             let guard = inner.lock().await;
             let inner_state = guard.as_ref().ok_or_else(statement_closed_err)?;
-            match inner_state {
+            match &inner_state.source {
                 AnyInner::Executed(s) => Ok(s.executed.error_details_json().map(str::to_owned)),
                 AnyInner::Metadata(_) => Ok(None),
             }
@@ -314,7 +326,7 @@ impl Statement {
 
     /// Pull the next batch of results. Returns `null` when the stream
     /// is exhausted. The returned `ArrowBatch.ipcBytes` is a complete
-    /// Arrow IPC stream (schema header + 1 record-batch message)
+    /// Arrow IPC stream (schema header + one or more record-batch messages)
     /// suitable for handing to `apache-arrow`'s `RecordBatchReader`.
     ///
     /// On `Err`, the stream is in an unspecified state — call
@@ -336,44 +348,15 @@ impl Statement {
             // Variant-aware: the executed path auto-closes the server
             // statement on drain; the metadata path uses its own
             // close-on-drop guard. (See `AnyInner::next_batch`.)
-            let maybe_batch = inner_state
-                .next_batch()
-                .await
-                .map_err(napi_err_from_kernel)?;
-            let Some(batch) = maybe_batch else {
+            let maybe_bytes = inner_state
+                .next(&schema, "databricks-sql-kernel-napi")
+                .await?;
+            let Some(bytes) = maybe_bytes else {
                 // End of stream — record so a defensive cancel after
                 // natural completion can short-circuit to Ok(()).
                 finished.store(true, Ordering::Release);
                 return Ok(None);
             };
-            // `ResultBatch` is `#[non_exhaustive]`; v0 only ever
-            // yields `Arrow`. The error arm exists for forward
-            // compat — v1+ may add ColumnarThrift / JsonRows / etc.,
-            // and we want the binding to surface that as a typed
-            // error rather than silently misbehaving.
-            let record_batch = match batch {
-                ResultBatch::Arrow(rb) => rb,
-                _ => {
-                    // `InvalidArgument`, not `Internal`: this isn't a
-                    // kernel bug (which would page oncall via the
-                    // Internal-category dashboards) — it's "binding
-                    // too old for the kernel it's linked against."
-                    // The kernel has rolled a new ResultBatch variant
-                    // that this binding's decode path doesn't know
-                    // how to handle, and the JS-side adapter should
-                    // surface this as a version-skew error to the
-                    // user. Matches the sibling-binding convention.
-                    return Err(napi_err_from_kernel(
-                        KernelError::invalid_argument().message(format!(
-                            "non-Arrow ResultBatch variant from kernel — \
-                             databricks-sql-kernel-napi v{} cannot decode this batch \
-                             shape, upgrade the binding",
-                            env!("CARGO_PKG_VERSION"),
-                        )),
-                    ));
-                }
-            };
-            let bytes = crate::result::encode_ipc_stream(&schema, Some(record_batch))?;
             Ok(Some(ArrowBatch {
                 ipc_bytes: bytes.into(),
             }))
@@ -436,7 +419,7 @@ impl Statement {
                 return Ok(());
             }
             let inner_state = guard.as_ref().ok_or_else(statement_closed_err)?;
-            match inner_state {
+            match &inner_state.source {
                 AnyInner::Executed(s) => s.executed.cancel().await.map_err(napi_err_from_kernel),
                 // Metadata streams have no server-side cancel handle, so the
                 // query keeps running server-side. Emit a breadcrumb so a
@@ -485,7 +468,7 @@ impl Statement {
                 let mut guard = inner.lock().await;
                 guard.take()
             };
-            match inner_state {
+            match inner_state.map(|stream| stream.source) {
                 Some(AnyInner::Executed(mut s)) => {
                     ExecutedStatement::close(&mut s.executed)
                         .await
@@ -546,6 +529,17 @@ pub(crate) fn statement_closed_err() -> napi::Error {
     napi_err_from_kernel(
         KernelError::invalid_statement_handle().message("statement already closed"),
     )
+}
+
+#[cfg(test)]
+impl Statement {
+    pub(crate) async fn has_current_batch_for_test(&self) -> bool {
+        let guard = self.inner.lock().await;
+        match &guard.as_ref().expect("statement open").source {
+            AnyInner::Executed(statement) => statement.executed.result_stream().current().is_some(),
+            AnyInner::Metadata(stream) => stream.current().is_some(),
+        }
+    }
 }
 
 #[cfg(test)]

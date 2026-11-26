@@ -297,6 +297,12 @@ impl ResultReader for ResultPostProcessor {
         Ok(Some(self.process_batch(batch)?))
     }
 
+    fn try_next_ready_batch(&mut self) -> Result<crate::reader::TryNextBatch> {
+        self.inner
+            .try_next_ready_batch()?
+            .map_ready(|batch| self.process_batch(batch))
+    }
+
     fn try_next_batch(&mut self) -> Result<TryNextBatch> {
         let next = self.inner.try_next_batch()?;
         next.map_ready(|batch| self.process_batch(batch))

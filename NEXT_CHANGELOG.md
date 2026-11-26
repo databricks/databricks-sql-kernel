@@ -11,6 +11,8 @@ changes go in their respective binding's NEXT_CHANGELOG.
 
 ### Added
 
+- `ResultStream::try_next_ready_batch()` advances the stream when a batch is ready without blocking. Errors and end-of-stream remain deferred until a normal fetch observes them.
+
 ### Changed
 
 ### Updated

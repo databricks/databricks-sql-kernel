@@ -60,11 +60,11 @@ use tokio::sync::Mutex;
 use arrow_schema::SchemaRef;
 use databricks_sql_kernel::{
     AsyncStatementCanceller, Error as KernelError, ExecutedAsyncStatement, ExecutedStatementHandle,
-    ResultBatch, ResultStream, Statement as KernelStatement,
+    ResultStream, Statement as KernelStatement,
 };
 
 use crate::error::napi_err_from_kernel;
-use crate::result::{encode_ipc_stream, ArrowBatch, ArrowSchema};
+use crate::result::{encode_ipc_stream, ArrowBatch, ArrowSchema, IpcStream};
 use crate::runtime;
 use crate::util::guarded;
 
@@ -89,7 +89,7 @@ fn closed_err(what: &str) -> napi::Error {
 // ───────────────────────── AsyncStatement ─────────────────────────
 
 /// An `AsyncResultHandle`'s stream, shared with its parent `AsyncStatement`.
-type ResultSlot = Mutex<Option<ResultStream>>;
+type ResultSlot = Mutex<Option<IpcStream<ResultStream>>>;
 
 /// Inner state for the JS-visible `AsyncStatement` wrapper. Same
 /// shape rationale as `StatementInner` in `statement.rs`: we hold
@@ -320,7 +320,7 @@ impl AsyncStatement {
                 .map_err(napi_err_from_kernel)?;
             let statement_id = inner_state.executed_async.statement_id().to_owned();
             let schema = stream.schema();
-            let stream = Arc::new(Mutex::new(Some(stream)));
+            let stream = Arc::new(Mutex::new(Some(IpcStream::new(stream))));
             // Registered while `inner` is held, so a queued `close()` sees it.
             results
                 .lock()
@@ -473,10 +473,10 @@ impl AsyncResultHandle {
 
     /// Pull the next batch of results. Returns `null` when the
     /// stream is exhausted. The returned `ArrowBatch.ipcBytes` is a
-    /// complete Arrow IPC stream (schema header + 1 record-batch
-    /// message), suitable for handing to `apache-arrow`'s
-    /// `RecordBatchReader`. Byte-identical to the sync
-    /// `Statement.fetchNextBatch()` payload for the same query.
+    /// complete Arrow IPC stream (schema header + one or more record-batch
+    /// messages), suitable for handing to `apache-arrow`'s
+    /// `RecordBatchReader`. Uses the same bounded packing as
+    /// `Statement.fetchNextBatch()`.
     /// Rejects with `KernelError(InvalidStatementHandle)` after the
     /// parent `AsyncStatement` is closed (see `AsyncStatement.close()`).
     #[napi]
@@ -488,24 +488,10 @@ impl AsyncResultHandle {
             let stream = guard
                 .as_mut()
                 .ok_or_else(|| closed_err("AsyncResultHandle"))?;
-            let maybe_batch = stream.next_batch().await.map_err(napi_err_from_kernel)?;
-            let Some(batch) = maybe_batch else {
+            let maybe_bytes = stream.next(&schema, "databricks-sea-native").await?;
+            let Some(bytes) = maybe_bytes else {
                 return Ok(None);
             };
-            let record_batch = match batch {
-                ResultBatch::Arrow(rb) => rb,
-                _ => {
-                    return Err(napi_err_from_kernel(
-                        KernelError::invalid_argument().message(format!(
-                            "non-Arrow ResultBatch variant from kernel — \
-                             databricks-sea-native v{} cannot decode this batch \
-                             shape, upgrade the binding",
-                            env!("CARGO_PKG_VERSION"),
-                        )),
-                    ));
-                }
-            };
-            let bytes = encode_ipc_stream(&schema, Some(record_batch))?;
             Ok(Some(ArrowBatch {
                 ipc_bytes: bytes.into(),
             }))
