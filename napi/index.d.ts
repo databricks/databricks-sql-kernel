@@ -852,7 +852,11 @@ export declare class AsyncStatement {
    * inner is already `None`, so a JS-side retry sees the
    * closed-handle short-circuit and returns `Ok(())` without
    * re-attempting the wire call. The kernel's own `Drop`
-   * fire-and-forget retry runs once in the background.
+   * fire-and-forget retry runs once in the background after an awaited
+   * close fails. Once any stream of this execution reaches successful
+   * EOF, close schedules background cleanup instead: cleanup errors are
+   * not returned and do not trigger a `Drop` retry, even if another
+   * stream is unread or partly read.
    *
    * Also invalidates the handles `awaitResult()` returned: their
    * `fetchNextBatch()` then rejects with `InvalidStatementHandle`,
