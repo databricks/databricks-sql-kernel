@@ -587,11 +587,13 @@ mod tests {
             .output()
             .expect("launch SIGPIPE subprocess");
 
+        // "1 passed" guards against the filter matching nothing.
+        let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
-            output.status.success(),
+            output.status.success() && stdout.contains("1 passed"),
             "write after peer reset failed (status {}):\nstdout:\n{}\nstderr:\n{}",
             output.status,
-            String::from_utf8_lossy(&output.stdout),
+            stdout,
             String::from_utf8_lossy(&output.stderr),
         );
     }
