@@ -335,6 +335,10 @@ kernel_session_config_set_oauth_scopes(KernelSessionConfig* config,
  * consumed before session creation, and NEVER reach the wire. Client-only keys
  * (matched case-insensitively):
  *
+ *   cloudfetch_download_ahead — integer 0..16, extra GETs ahead of the decoded
+ *       window (capped at that window). Bodies wait for admission; socket memory
+ *       increases. Unspecified defers to the server flag (missing means 0);
+ *       explicit 0 disables, overriding the flag.
  *   cloudfetch_max_chunks_in_memory  — positive integer; how many decompressed
  *       CloudFetch chunks the kernel holds in memory at once (bounds peak RSS on
  *       large result sets; default 16). A value above the kernel ceiling (256) is
@@ -597,6 +601,7 @@ KernelStatusCode kernel_session_config_set_u2m_token_cache_config(KernelSessionC
  * - "cloudfetch_enabled" = "true"|"false" — false serves every result
  *   through paged inline delivery without cloud-storage downloads.
  * - "cloudfetch_link_prefetch_window" = positive integer.
+ * - "cloudfetch_download_ahead" = integer 0..16 (extra GETs; explicit 0 disables)
  * - "cloudfetch_max_chunks_in_memory" = positive integer (bounds peak RSS;
  *   values above the kernel ceiling of 256 are clamped with a warning).
  * - "inline_max_chunks_in_memory" = positive integer (inline-Arrow prefetch

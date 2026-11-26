@@ -11,6 +11,8 @@ changes go in their respective binding's NEXT_CHANGELOG.
 
 ### Added
 
+- Opt-in CloudFetch request-ahead overlaps download headers without enlarging the decoded chunk window. Defaults remain unchanged.
+
 ### Changed
 
 ### Updated

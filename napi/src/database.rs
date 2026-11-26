@@ -230,7 +230,10 @@ pub struct ConnectionOptions {
     pub schema: Option<String>,
     /// Server-bound session conf (Spark conf, `ANSI_MODE`, `TIMEZONE`,
     /// query-tag presets, …). Forwarded verbatim to SEA
-    /// `session_confs`. Unknown keys are rejected server-side.
+    /// `session_confs`. `cloudfetch_download_ahead` (integer string 0..16) is
+    /// client-only and stripped: explicit zero disables, unspecified defers to
+    /// the server flag (default 0). Extra GETs consume socket memory without
+    /// enlarging the decoded window. Other unknown keys are rejected server-side.
     pub session_conf: Option<HashMap<String, String>>,
     /// Select whether `GEOMETRY` / `GEOGRAPHY` results use their native Arrow
     /// representation. `true` (the default) requests Arrow

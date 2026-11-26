@@ -1102,6 +1102,11 @@ pub struct ResultConfig {
     /// Bounds parallelism and peak RSS.
     pub cloudfetch_max_chunks_in_memory: usize,
 
+    /// Extra CloudFetch GETs allowed ahead of the decoded chunk window (0..=16).
+    /// Bodies remain unread until admitted. Increases socket memory, not the
+    /// decoded window. None defers to the server flag (missing flag means 0).
+    pub cloudfetch_download_ahead: Option<usize>,
+
     /// Maximum number of decompressed Arrow chunks the inline-Arrow
     /// streaming reader holds in memory at once. Analogue of
     /// [`Self::cloudfetch_max_chunks_in_memory`] for paged inline results.
@@ -1159,6 +1164,7 @@ impl Default for ResultConfig {
             cloudfetch_enabled: true,
             cloudfetch_link_prefetch_window: 10,
             cloudfetch_max_chunks_in_memory: 16,
+            cloudfetch_download_ahead: None,
             inline_max_chunks_in_memory: 4,
             complex_types_as_json: false,
             intervals_as_string: false,
@@ -1190,6 +1196,7 @@ pub(crate) enum ClientConfKey {
     CloudfetchEnabled,
     CloudfetchLinkPrefetchWindow,
     CloudfetchMaxChunksInMemory,
+    CloudfetchDownloadAhead,
     InlineMaxChunksInMemory,
     ComplexTypesAsJson,
     IntervalsAsString,
@@ -1202,6 +1209,7 @@ impl ClientConfKey {
         Self::CloudfetchEnabled,
         Self::CloudfetchLinkPrefetchWindow,
         Self::CloudfetchMaxChunksInMemory,
+        Self::CloudfetchDownloadAhead,
         Self::InlineMaxChunksInMemory,
         Self::ComplexTypesAsJson,
         Self::IntervalsAsString,
@@ -1213,6 +1221,7 @@ impl ClientConfKey {
             Self::CloudfetchEnabled => "cloudfetch_enabled",
             Self::CloudfetchLinkPrefetchWindow => "cloudfetch_link_prefetch_window",
             Self::CloudfetchMaxChunksInMemory => "cloudfetch_max_chunks_in_memory",
+            Self::CloudfetchDownloadAhead => "cloudfetch_download_ahead",
             Self::InlineMaxChunksInMemory => "inline_max_chunks_in_memory",
             Self::ComplexTypesAsJson => "complex_types_as_json",
             Self::IntervalsAsString => "intervals_as_string",
@@ -1317,6 +1326,19 @@ impl ResultConfig {
             }
             ClientConfKey::InlineMaxChunksInMemory => {
                 self.inline_max_chunks_in_memory = parse_positive_usize(value)?;
+            }
+            ClientConfKey::CloudfetchDownloadAhead => {
+                let lead = value
+                    .trim()
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|lead| *lead <= 16)
+                    .ok_or_else(|| {
+                        crate::kernel_error::Error::invalid_argument().message(
+                            "client conf 'cloudfetch_download_ahead' expects an integer in 0..=16",
+                        )
+                    })?;
+                self.cloudfetch_download_ahead = Some(lead);
             }
             ClientConfKey::ComplexTypesAsJson => {
                 self.complex_types_as_json = parse_bool(value)?;
@@ -1576,6 +1598,31 @@ pub struct SessionConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn download_ahead_client_conf_validates_without_overwriting_on_error() {
+        let mut result = ResultConfig::default();
+        assert_eq!(result.cloudfetch_download_ahead, None);
+        for lead in ["0", "8", "16"] {
+            result
+                .apply_client_conf("CLOUDFETCH_DOWNLOAD_AHEAD", lead)
+                .unwrap();
+            assert_eq!(
+                result.cloudfetch_download_ahead,
+                Some(lead.parse().unwrap())
+            );
+        }
+        for invalid in ["", "17", "-1", "1.5", "true", "18446744073709551616"] {
+            assert_eq!(
+                result
+                    .apply_client_conf("cloudfetch_download_ahead", invalid)
+                    .unwrap_err()
+                    .code,
+                crate::ErrorCode::InvalidArgument
+            );
+            assert_eq!(result.cloudfetch_download_ahead, Some(16));
+        }
+    }
 
     #[test]
     fn geospatial_result_representation_defaults_to_binary() {

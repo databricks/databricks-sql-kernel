@@ -36,6 +36,8 @@ pub const DEFAULT_CHUNK_READY_TIMEOUT_SECS: u64 = 30;
 /// Configuration for CloudFetch streaming.
 #[derive(Debug, Clone)]
 pub struct CloudFetchConfig {
+    /// Extra header-only downloads ahead of the decoded window; 0 disables.
+    pub download_ahead: usize,
     /// Number of chunk links to prefetch ahead of consumption.
     pub link_prefetch_window: usize,
     /// Maximum number of chunks to hold in memory (controls parallelism).
@@ -80,6 +82,7 @@ pub struct CloudFetchConfig {
 impl Default for CloudFetchConfig {
     fn default() -> Self {
         Self {
+            download_ahead: 0,
             // Match JDBC default: prefetch 128 chunks ahead of consumer
             link_prefetch_window: 128,
             // Match JDBC default: cloudFetchThreadPoolSize = 16

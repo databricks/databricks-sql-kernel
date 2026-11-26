@@ -173,6 +173,7 @@ Setting only one of `client_cert_pem` / `client_key_pem` is rejected at
 | `cloudfetch_enabled` | Opt into CloudFetch (cloud-storage-backed download of large results via presigned URLs). Set `false` to force the inline-Arrow path (mirrors JDBC `EnableQueryResultDownload=0`). | `true` |
 | `cloudfetch_link_prefetch_window` | Number of presigned URLs to prefetch ahead of the consumer. | `10` |
 | `cloudfetch_max_chunks_in_memory` | Max decompressed CloudFetch chunks held in memory at once (bounds download parallelism and peak RSS). | `16` |
+| `cloudfetch_download_ahead` | Extra CloudFetch GETs ahead of the decoded window (0–16, capped at the window). Bodies wait for admission; socket memory increases. Explicit `0` disables, overriding the connector-service flag. | Unspecified (missing flag: `0`) |
 | `inline_max_chunks_in_memory` | Prefetch window for the inline-Arrow path (used when CloudFetch is disabled). `1` disables prefetching. | `4` |
 | `complex_types_as_json` | Render complex columns (`ARRAY` / `MAP` / `STRUCT` / `VARIANT`) as compact JSON strings instead of native Arrow nested types. Top-level geo columns use `geospatial_result_representation`; nested geo leaves are normalized before the enclosing value is rendered as JSON. | `false` |
 | `intervals_as_string` | Render `INTERVAL` / `DURATION` columns as canonical Databricks text (e.g. `"Y-M"`, `"D HH:MM:SS.nnnnnnnnn"`) instead of native Arrow interval types. | `false` |
@@ -259,6 +260,7 @@ Each key mirrors a field of [`ResultConfig`](#resultconfig--result-handling-opti
 | `cloudfetch_enabled` | Same knob as `ResultConfig::cloudfetch_enabled` — opt into CloudFetch (`false` forces the inline-Arrow path). | `true` |
 | `cloudfetch_link_prefetch_window` | Same knob as `ResultConfig::cloudfetch_link_prefetch_window` — number of presigned URLs to prefetch ahead of the consumer. | `10` |
 | `cloudfetch_max_chunks_in_memory` | Same knob as `ResultConfig::cloudfetch_max_chunks_in_memory` — max decompressed CloudFetch chunks held in memory at once. Values above `256` are clamped (with a warning) rather than rejected (peak RSS scales with this, so the ceiling bounds OOM risk). | `16` |
+| `cloudfetch_download_ahead` | Same knob as `ResultConfig::cloudfetch_download_ahead`: integer 0–16; explicit zero disables. Also accepted through Python/Node `session_conf` (stripped before server transmission). Extra requests consume socket memory; decoded window is unchanged. | Unspecified (missing flag: `0`) |
 | `inline_max_chunks_in_memory` | Same knob as `ResultConfig::inline_max_chunks_in_memory` — prefetch window for the inline-Arrow path. `1` disables prefetching. | `4` |
 | `complex_types_as_json` | Same knob as `ResultConfig::complex_types_as_json` — render complex columns as compact JSON strings instead of native Arrow nested types. | `false` |
 | `intervals_as_string` | Same knob as `ResultConfig::intervals_as_string` — render `INTERVAL` / `DURATION` columns as canonical Databricks text instead of native Arrow interval types. | `false` |
