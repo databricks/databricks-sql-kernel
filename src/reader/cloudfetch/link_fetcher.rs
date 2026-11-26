@@ -1083,9 +1083,10 @@ impl ChunkLinkFetcher for SeaChunkLinkFetcherHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::transport::ExecutionParams;
     use crate::client::{ExecuteResult, ExecutionTimeout, SessionInfo};
     use crate::reader::EmptyReader;
-    use crate::types::sea::{ExecuteParams, StatementState, StatementStatus};
+    use crate::types::sea::{StatementState, StatementStatus};
     use arrow_schema::Schema;
     use std::collections::HashMap;
     use std::sync::Arc as StdArc;
@@ -1133,7 +1134,7 @@ mod tests {
             &self,
             _session_id: &str,
             _sql: &str,
-            _params: &ExecuteParams,
+            _params: &ExecutionParams,
             _timeout: ExecutionTimeout,
         ) -> Result<ExecuteResult> {
             Ok(ExecuteResult {
@@ -1159,7 +1160,7 @@ mod tests {
             &self,
             _session_id: &str,
             _sql: &str,
-            _params: &ExecuteParams,
+            _params: &ExecutionParams,
         ) -> Result<crate::client::ExecuteResponse> {
             unimplemented!("submit_statement not used by the link-fetcher mock")
         }
@@ -1167,7 +1168,7 @@ mod tests {
             &self,
             _session_id: &str,
             _sql: &str,
-            _params: &ExecuteParams,
+            _params: &ExecutionParams,
         ) -> Result<crate::client::DirectOutcome> {
             unimplemented!("execute_statement_direct not used by the link-fetcher mock")
         }
@@ -1256,8 +1257,13 @@ mod tests {
         }
 
         async fn list_catalogs(&self, _session_id: &str) -> Result<ExecuteResult> {
-            self.execute_statement("", "", &ExecuteParams::default(), ExecutionTimeout::Default)
-                .await
+            self.execute_statement(
+                "",
+                "",
+                &ExecutionParams::default(),
+                ExecutionTimeout::Default,
+            )
+            .await
         }
 
         async fn list_schemas(
@@ -1266,8 +1272,13 @@ mod tests {
             _catalog: Option<&str>,
             _schema_pattern: Option<&str>,
         ) -> Result<ExecuteResult> {
-            self.execute_statement("", "", &ExecuteParams::default(), ExecutionTimeout::Default)
-                .await
+            self.execute_statement(
+                "",
+                "",
+                &ExecutionParams::default(),
+                ExecutionTimeout::Default,
+            )
+            .await
         }
 
         async fn list_tables(
@@ -1278,8 +1289,13 @@ mod tests {
             _table_pattern: Option<&str>,
             _table_types: Option<&[&str]>,
         ) -> Result<ExecuteResult> {
-            self.execute_statement("", "", &ExecuteParams::default(), ExecutionTimeout::Default)
-                .await
+            self.execute_statement(
+                "",
+                "",
+                &ExecutionParams::default(),
+                ExecutionTimeout::Default,
+            )
+            .await
         }
 
         async fn list_columns(
@@ -1290,8 +1306,13 @@ mod tests {
             _table_pattern: Option<&str>,
             _column_pattern: Option<&str>,
         ) -> Result<ExecuteResult> {
-            self.execute_statement("", "", &ExecuteParams::default(), ExecutionTimeout::Default)
-                .await
+            self.execute_statement(
+                "",
+                "",
+                &ExecutionParams::default(),
+                ExecutionTimeout::Default,
+            )
+            .await
         }
 
         async fn list_procedures(
@@ -1301,8 +1322,13 @@ mod tests {
             _schema_pattern: Option<&str>,
             _procedure_pattern: Option<&str>,
         ) -> Result<ExecuteResult> {
-            self.execute_statement("", "", &ExecuteParams::default(), ExecutionTimeout::Default)
-                .await
+            self.execute_statement(
+                "",
+                "",
+                &ExecutionParams::default(),
+                ExecutionTimeout::Default,
+            )
+            .await
         }
 
         async fn list_functions(
@@ -1312,8 +1338,13 @@ mod tests {
             _schema_pattern: Option<&str>,
             _function_pattern: Option<&str>,
         ) -> Result<ExecuteResult> {
-            self.execute_statement("", "", &ExecuteParams::default(), ExecutionTimeout::Default)
-                .await
+            self.execute_statement(
+                "",
+                "",
+                &ExecutionParams::default(),
+                ExecutionTimeout::Default,
+            )
+            .await
         }
 
         async fn list_procedure_columns(
@@ -1324,8 +1355,13 @@ mod tests {
             _procedure_pattern: Option<&str>,
             _column_pattern: Option<&str>,
         ) -> Result<ExecuteResult> {
-            self.execute_statement("", "", &ExecuteParams::default(), ExecutionTimeout::Default)
-                .await
+            self.execute_statement(
+                "",
+                "",
+                &ExecutionParams::default(),
+                ExecutionTimeout::Default,
+            )
+            .await
         }
 
         async fn list_primary_keys(
@@ -1335,8 +1371,13 @@ mod tests {
             _schema: &str,
             _table: &str,
         ) -> Result<ExecuteResult> {
-            self.execute_statement("", "", &ExecuteParams::default(), ExecutionTimeout::Default)
-                .await
+            self.execute_statement(
+                "",
+                "",
+                &ExecutionParams::default(),
+                ExecutionTimeout::Default,
+            )
+            .await
         }
 
         async fn list_foreign_keys(
@@ -1349,8 +1390,13 @@ mod tests {
             _foreign_schema: &str,
             _foreign_table: &str,
         ) -> Result<ExecuteResult> {
-            self.execute_statement("", "", &ExecuteParams::default(), ExecutionTimeout::Default)
-                .await
+            self.execute_statement(
+                "",
+                "",
+                &ExecutionParams::default(),
+                ExecutionTimeout::Default,
+            )
+            .await
         }
 
         fn list_table_types(&self) -> Vec<String> {

@@ -72,12 +72,12 @@ pub(crate) fn manifest_is_dml_count(manifest: &ResultManifest) -> bool {
 /// `num_affected_rows` value; otherwise `None`.
 ///
 /// Detection is deliberately strict — **every** column must be one of the
-/// known `num_*_rows` counters and `num_affected_rows` must be present —
-/// so a `SELECT 1 AS num_affected_rows` (a real query that merely aliases
-/// a column to that name) is not mistaken for a DML result. Thrift never
-/// faces this ambiguity because it reads the count from operation
-/// metadata rather than the result columns; the strict signature keeps us
-/// as close as the SEA wire shape allows.
+/// known `num_*_rows` counters and `num_affected_rows` must be present. A
+/// SELECT such as `SELECT 1 AS num_affected_rows` passes the same checks and
+/// is indistinguishable from a DML result. Thrift never faces this ambiguity
+/// because it reads the count from operation metadata rather than the result
+/// columns; the strict signature keeps us as close as the SEA wire shape
+/// allows.
 ///
 /// Non-consuming: peeks the first batch and buffers it, so the caller's
 /// subsequent fetch still sees the row.
@@ -104,21 +104,51 @@ pub(crate) async fn read_dml_affected_rows(stream: &mut ResultStream) -> Result<
     if batch.num_rows() != 1 {
         return Ok(None);
     }
-    let col = batch.column(col_idx);
-    if col.is_null(0) {
+    Ok(int_value(batch.column(col_idx).as_ref(), 0))
+}
+
+/// Read an aggregate count when the first result batch accounts for every
+/// parameter set. Peeking leaves the result available to the caller.
+pub(crate) async fn read_batch_affected_rows(
+    stream: &mut ResultStream,
+    parameter_set_count: usize,
+) -> Result<Option<i64>> {
+    let Some(ResultBatch::Arrow(batch)) = stream.peek_first_batch().await? else {
         return Ok(None);
-    }
-    // The server types these BIGINT (Arrow Int64); accept the narrower
-    // signed widths defensively, and ignore anything else rather than
-    // mis-reporting.
-    let value = match col.data_type() {
-        DataType::Int64 => col.as_primitive::<Int64Type>().value(0),
-        DataType::Int32 => col.as_primitive::<Int32Type>().value(0) as i64,
-        DataType::Int16 => col.as_primitive::<Int16Type>().value(0) as i64,
-        DataType::Int8 => col.as_primitive::<Int8Type>().value(0) as i64,
-        _ => return Ok(None),
     };
-    Ok(Some(value))
+    let Some(affected) = batch.column_by_name(AFFECTED_ROWS_COLUMN) else {
+        return Ok(None);
+    };
+    let repeats = batch.column_by_name("repeat");
+    let totals = (0..batch.num_rows()).try_fold((0usize, 0i64), |(represented, total), row| {
+        let repeat = match repeats {
+            Some(col) => int_value(col.as_ref(), row).filter(|&n| n > 0)?,
+            None => 1,
+        };
+        let count = int_value(affected.as_ref(), row).filter(|&n| n >= 0)?;
+        Some((
+            represented.checked_add(usize::try_from(repeat).ok()?)?,
+            total.checked_add(count.checked_mul(repeat)?)?,
+        ))
+    });
+    Ok(totals
+        .and_then(|(represented, total)| (represented == parameter_set_count).then_some(total)))
+}
+
+// The server types these BIGINT (Arrow Int64); accept the narrower
+// signed widths defensively, and ignore anything else rather than
+// mis-reporting.
+fn int_value(col: &dyn Array, row: usize) -> Option<i64> {
+    if col.is_null(row) {
+        return None;
+    }
+    Some(match col.data_type() {
+        DataType::Int64 => col.as_primitive::<Int64Type>().value(row),
+        DataType::Int32 => col.as_primitive::<Int32Type>().value(row) as i64,
+        DataType::Int16 => col.as_primitive::<Int16Type>().value(row) as i64,
+        DataType::Int8 => col.as_primitive::<Int8Type>().value(row) as i64,
+        _ => return None,
+    })
 }
 
 #[cfg(test)]
@@ -128,6 +158,62 @@ mod tests {
     use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray};
     use arrow_schema::{Field, Schema};
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn batch_counts_are_optional_and_non_consuming() {
+        let affected = |values| {
+            (
+                AFFECTED_ROWS_COLUMN,
+                Arc::new(Int64Array::from(values)) as ArrayRef,
+            )
+        };
+        let cases = [
+            ("repeated", affected(vec![Some(1)]), Some(3), Some(3)),
+            ("unknown", affected(vec![Some(-2)]), Some(3), None),
+            (
+                "one row per set",
+                affected(vec![Some(1), Some(2), Some(3)]),
+                None,
+                Some(6),
+            ),
+            ("wrong set count", affected(vec![Some(1)]), Some(2), None),
+            ("zero repeat", affected(vec![Some(1)]), Some(0), None),
+            ("null count", affected(vec![None]), Some(3), None),
+            (
+                "string count",
+                (
+                    AFFECTED_ROWS_COLUMN,
+                    Arc::new(StringArray::from(vec!["1"])) as ArrayRef,
+                ),
+                Some(3),
+                None,
+            ),
+            (
+                "missing count",
+                ("other", Arc::new(Int64Array::from(vec![1])) as ArrayRef),
+                Some(3),
+                None,
+            ),
+            ("overflow", affected(vec![Some(i64::MAX)]), Some(3), None),
+        ];
+
+        for (name, column, repeat, expected) in cases {
+            let mut columns = vec![column];
+            if let Some(repeat) = repeat {
+                columns.push(("repeat", Arc::new(Int64Array::from(vec![repeat]))));
+            }
+            let batch = RecordBatch::try_from_iter(columns).unwrap();
+            let reader = InMemoryReader::new(batch.schema(), vec![batch.clone()]);
+            let mut stream = ResultStream::from_reader(Box::new(reader)).await.unwrap();
+            assert_eq!(
+                read_batch_affected_rows(&mut stream, 3).await.unwrap(),
+                expected,
+                "{name}"
+            );
+            let ResultBatch::Arrow(fetched) = stream.next_batch().await.unwrap().expect(name);
+            assert_eq!(fetched, &batch, "{name}");
+        }
+    }
 
     /// Build a single-batch `ResultStream` from `(name, Int64 values)` columns.
     async fn count_stream(cols: &[(&str, &[i64])]) -> ResultStream {

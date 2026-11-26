@@ -223,6 +223,7 @@ pub struct ExecutedAsyncStatement {
     latest_status: Arc<std::sync::Mutex<crate::types::sea::StatementStatus>>,
     /// Take-once ownership avoids retaining raw payloads after reader construction.
     pending_result: std::sync::Mutex<Option<ExecuteResponse>>,
+    parameter_set_count: usize,
     statement_telemetry: StatementTelemetry,
     /// Set once result materialisation hands success finalization to
     /// the returned `ResultStream`.
@@ -335,6 +336,7 @@ impl ExecutedAsyncStatement {
             session_attribution: SessionAttribution::Current,
             latest_status: Arc::new(std::sync::Mutex::new(initial_status)),
             pending_result: std::sync::Mutex::new(None),
+            parameter_set_count: 0,
             statement_telemetry,
             result_stream_owns_success_telemetry: AtomicBool::new(false),
             client_deadline,
@@ -342,6 +344,11 @@ impl ExecutedAsyncStatement {
             client_timeout_expired: AtomicBool::new(false),
             terminal_observed: AtomicBool::new(initial_terminal),
         }
+    }
+
+    pub(crate) fn with_parameter_set_count(mut self, count: usize) -> Self {
+        self.parameter_set_count = count;
+        self
     }
 
     /// Crate-internal constructor for a **non-owning** (read-only
@@ -395,6 +402,7 @@ impl ExecutedAsyncStatement {
             session_attribution,
             latest_status: Arc::new(std::sync::Mutex::new(initial_status)),
             pending_result: std::sync::Mutex::new(None),
+            parameter_set_count: 0,
             statement_telemetry: StatementTelemetry::noop(),
             result_stream_owns_success_telemetry: AtomicBool::new(false),
             client_deadline: None,
@@ -421,7 +429,8 @@ impl ExecutedAsyncStatement {
                 Arc::clone(&self.owner_released),
                 self.session_attribution,
                 status,
-            ),
+            )
+            .with_parameter_set_count(self.parameter_set_count),
         })
     }
 
@@ -527,12 +536,16 @@ impl ExecutedAsyncStatement {
     /// the handle's accessor surface keeps working).
     fn record_latest_status(
         &self,
-        fresh: crate::types::sea::StatementStatus,
+        mut fresh: crate::types::sea::StatementStatus,
         response: Option<ExecuteResponse>,
     ) {
         // Payload before metadata keeps concurrent publications from mixing observations.
         let pending = self.pending_result.lock().ok();
         if let Ok(mut guard) = self.latest_status.lock() {
+            // Status polls never carry a batch's aggregate count; keep the one read from the result.
+            if self.parameter_set_count != 0 {
+                fresh.num_modified_rows = guard.num_modified_rows;
+            }
             *guard = fresh;
         }
         if let Some(mut pending) = pending {
@@ -915,11 +928,27 @@ impl ExecutedAsyncStatement {
             StatementState::Running => "Running",
             _ => "non-terminal",
         };
+        let completed_batch = self.parameter_set_count != 0
+            && matches!(
+                response.status.state,
+                StatementState::Succeeded | StatementState::Closed
+            );
+        // Result reading can fail after a batch commits; retrying could duplicate rows.
+        let batch_error = |error: Error| {
+            if completed_batch {
+                error
+                    .with_query_id(&self.statement_id)
+                    .with_retryable(false)
+            } else {
+                error
+            }
+        };
         let result = self
             .session
             .transport()
             .completed_result(response, self.session_attribution)
-            .await?;
+            .await
+            .map_err(batch_error)?;
         self.check_read_validity()?;
         match result {
             Some(result) => {
@@ -946,7 +975,17 @@ impl ExecutedAsyncStatement {
                 // DML the count rides in the result set. Derive it once
                 // (non-consuming) and record it onto the latest status so
                 // `num_modified_rows()` matches the sync path / Thrift.
-                if self.num_modified_rows().is_none() {
+                if self.parameter_set_count != 0 {
+                    let count = crate::statement::dml_count::read_batch_affected_rows(
+                        &mut stream,
+                        self.parameter_set_count,
+                    )
+                    .await
+                    .map_err(batch_error)?;
+                    if let Ok(mut status) = self.latest_status.lock() {
+                        status.num_modified_rows = count;
+                    }
+                } else if self.num_modified_rows().is_none() {
                     if let Some(n) =
                         crate::statement::dml_count::read_dml_affected_rows(&mut stream).await?
                     {

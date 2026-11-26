@@ -684,13 +684,25 @@ KernelStatusCode kernel_session_rollback(kernel_session_t* session);
 /* ─── Statement ───────────────────────────────────────────────────────*/
 
 /* Set the statement's SQL text, replacing any previously set SQL. Also clears
- * every previously-bound parameter (raw and the typed positional binders below),
+ * every previously-bound parameter (raw, typed, and native parameter sets),
  * so a reused statement handle starts each query with a fresh parameter set. */
 KernelStatusCode kernel_statement_set_sql(kernel_statement_t* stmt, const char* sql);
 
+/* Snapshot current scalar bindings as the next ordered native parameter set,
+ * then clear the scalar bindings. Repeat bind + add_parameter_set for each set,
+ * then use kernel_statement_execute to submit the entire batch in one request.
+ * The caller selects eligible SQL; the server validates the parameter sets.
+ * Scalar bindings and batch sets cannot be submitted together.
+ * kernel_statement_set_sql clears all snapshots. Execute retains them.
+ * num_modified_rows reports the aggregate affected count, or -1 if unavailable.
+ *
+ * Errors reading the batch's affected-row count are non-retryable because
+ * the rows may already be committed. */
+KernelStatusCode kernel_statement_add_parameter_set(kernel_statement_t* stmt);
+
 /* Typed positional parameter binding (1-based ordinal); the kernel infers the
  * SEA wire type from the C type. These are the "typed params" the
- * kernel_statement_bind_parameter contract refers to: within one statement they
+ * kernel_statement_bind_parameter contract refers to: within one parameter set they
  * cannot be combined with kernel_statement_bind_parameter (raw binds) — pick one
  * binding style. The conflict is reported at kernel_statement_execute, not here. */
 KernelStatusCode kernel_statement_bind_null(kernel_statement_t* stmt, size_t ordinal);
@@ -710,14 +722,14 @@ KernelStatusCode kernel_statement_bind_string(kernel_statement_t* stmt, size_t o
  * non-empty (an empty type is rejected here with InvalidArgument).
  *
  * Lifecycle: raw binds ACCUMULATE (each call appends a marker in push order);
- * they carry no ordinal to overwrite by. kernel_statement_set_sql is the sole
- * reset point — it clears ALL prior binds (raw AND the typed positional binders
- * below) so each set_sql begins a fresh parameter set. kernel_statement_execute
- * does NOT clear them, so a host reusing one statement handle across queries must
- * call set_sql before re-binding, or the prior query's markers persist and the
+ * they carry no ordinal to overwrite by. kernel_statement_add_parameter_set
+ * snapshots and clears current binds. kernel_statement_set_sql clears ALL
+ * scalar binds and parameter sets. kernel_statement_execute does NOT clear
+ * them, so a host reusing one statement handle across queries must call
+ * set_sql before re-binding, or the prior query's markers persist and the
  * server sees the wrong parameter count.
  *
- * Two mutual-exclusion rules hold within one statement, both enforced at
+ * Two mutual-exclusion rules hold within each scalar parameter set, enforced at
  * kernel_statement_execute (this call always returns Success on a valid
  * arg — the conflict surfaces later as InvalidArgument from execute):
  *   - positional and named raw params cannot be mixed;

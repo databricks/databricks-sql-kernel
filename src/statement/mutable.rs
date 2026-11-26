@@ -54,6 +54,7 @@
 //! stale handle short-circuits locally — no network round-trip. See
 //! `crate::statement::validity` for the flag implementation.
 
+use crate::client::transport::ExecutionParams;
 use crate::client::{DirectOutcome, ExecutionTimeout};
 use crate::kernel_error::{Error, Result};
 use crate::klog::{debug, warn};
@@ -62,10 +63,13 @@ use crate::session::SessionInner;
 use crate::statement::executed::ExecutedStatement;
 use crate::statement::executed_async::ExecutedAsyncStatement;
 use crate::statement::params::{named_typed_value_to_sea_parameter, typed_value_to_sea_parameter};
-use crate::statement::spec::{deserialize_query_tags, ResultFormat, StatementSpec};
+use crate::statement::spec::{deserialize_query_tags, ResultFormat, StatementSpec, TypedValue};
 use crate::statement::validity::ValidityFlag;
 use crate::telemetry::{OperationType, StatementTelemetry, StatementType};
-use crate::types::sea::{ExecuteParams, QueryTag, StatementState};
+use crate::types::sea::{
+    ExecuteParams, QueryTag, StatementParameter, StatementParameterSet, StatementState,
+};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -121,17 +125,16 @@ fn resolve_wait_timeout(caller_wait_secs: Option<&str>) -> (Option<String>, Opti
     }
 }
 
-/// Build the `(sql, ExecuteParams)` dispatch pair from a statement spec.
+/// Build the `(sql, ExecutionParams)` dispatch pair from a statement spec.
 ///
 /// Pure — borrows `spec`, touches no `Session` — so the spec → wire-params
-/// mapping (row_limit, the resolved wait/on-wait pair, and **1-based**
-/// positional + named parameter binding) is unit-testable without a live
-/// session. Shared by both the sync and async dispatch paths via
-/// [`Statement::prepare_for_dispatch`].
+/// mapping (row_limit, the resolved wait/on-wait pair, and positional + named
+/// parameter binding) is unit-testable without a live session. Shared by both
+/// the sync and async dispatch paths via [`Statement::prepare_for_dispatch`].
 fn build_execute_params(
     spec: &StatementSpec,
     wait_timeout_secs: Option<&str>,
-) -> Result<(String, ExecuteParams)> {
+) -> Result<(String, ExecutionParams)> {
     let sql = spec
         .sql
         .as_deref()
@@ -142,73 +145,93 @@ fn build_execute_params(
     if spec.result_format != ResultFormat::Arrow {
         return Err(Error::invalid_argument().message("v0 supports ResultFormat::Arrow only"));
     }
-    // Positional and named parameters are mutually exclusive: the SEA
-    // server rejects a mixed `parameters` array with
-    // `INVALID_PARAMETER_MARKER_VALUE.MISSING_NAME` (a `BAD_REQUEST`).
-    // Reject at bind time in the kernel so every binding (napi, pyo3,
-    // direct Rust) gets the same InvalidArgument before the wire,
-    // rather than an opaque server round-trip failure.
-    if !spec.positional_params.is_empty() && !spec.named_params.is_empty() {
-        return Err(Error::invalid_argument()
-            .message("positional and named parameters are mutually exclusive; pass only one"));
-    }
-    // raw_params (the C-ABI host-marshalled path) is mutually exclusive with the
-    // TypedValue paths — a host uses one binding style per statement.
-    if !spec.raw_params.is_empty()
-        && (!spec.positional_params.is_empty() || !spec.named_params.is_empty())
-    {
-        return Err(Error::invalid_argument()
-            .message("raw parameters cannot be mixed with positional/named TypedValue params"));
-    }
     let (wait_timeout, on_wait_timeout) = resolve_wait_timeout(wait_timeout_secs);
-    let mut exec_params = ExecuteParams {
-        wait_timeout,
-        on_wait_timeout,
-        row_limit: spec.row_limit,
-        ..ExecuteParams::default()
+    let mut exec_params = ExecutionParams {
+        scalar: ExecuteParams {
+            wait_timeout,
+            on_wait_timeout,
+            row_limit: spec.row_limit,
+            ..ExecuteParams::default()
+        },
+        parameter_sets: Vec::new(),
     };
-    for (i, value) in spec.positional_params.iter().enumerate() {
-        exec_params
-            .parameters
-            .push(typed_value_to_sea_parameter((i + 1) as i32, value)?);
-    }
-    for (name, value) in spec.named_params.iter() {
-        exec_params
-            .parameters
-            .push(named_typed_value_to_sea_parameter(name.clone(), value)?);
-    }
-    // Raw (host-marshalled) params: emit verbatim. Positional entries (name
-    // None) get a 1-based ordinal in push order; named entries pass through.
-    // Positional and named raw params are mutually exclusive for the same reason
-    // TypedValue ones are (the SEA server rejects a mixed markers array).
-    {
-        let has_named_raw = spec.raw_params.iter().any(|p| p.name.is_some());
-        let has_pos_raw = spec.raw_params.iter().any(|p| p.name.is_none());
-        if has_named_raw && has_pos_raw {
-            return Err(Error::invalid_argument().message(
-                "positional and named raw parameters are mutually exclusive; pass only one",
-            ));
+    if spec.parameter_sets.is_empty() {
+        exec_params.scalar.parameters = build_parameters(
+            &spec.positional_params,
+            &spec.named_params,
+            &spec.raw_params,
+            1,
+        )?;
+    } else {
+        if !spec.positional_params.is_empty()
+            || !spec.named_params.is_empty()
+            || !spec.raw_params.is_empty()
+        {
+            return Err(Error::invalid_argument()
+                .message("scalar parameters and native parameter sets are mutually exclusive"));
         }
-        let mut ordinal = 0i32;
-        for p in spec.raw_params.iter() {
-            let mut param = p.clone();
-            if param.name.is_none() {
-                ordinal += 1;
-                param.ordinal = Some(ordinal);
-            }
-            exec_params.parameters.push(param);
+        // A row cap could truncate the count result without limiting inserted rows.
+        exec_params.scalar.row_limit = None;
+        for set in &spec.parameter_sets {
+            exec_params.parameter_sets.push(StatementParameterSet {
+                parameters: build_parameters(&set.positional, &set.named, &set.raw, 0)?,
+            });
         }
     }
     // Per-statement query tags: both `Statement::query_tags` and a raw
     // `statement_conf["query_tags"]` land in the serialized conf string;
     // the SEA wire wants the native `[{key, value}]` array, so convert here.
     if let Some(serialized) = spec.statement_conf.get("query_tags") {
-        exec_params.query_tags = deserialize_query_tags(serialized)
+        exec_params.scalar.query_tags = deserialize_query_tags(serialized)
             .into_iter()
             .map(|(key, value)| QueryTag { key, value })
             .collect();
     }
     Ok((sql, exec_params))
+}
+
+fn build_parameters(
+    positional: &[TypedValue],
+    named: &HashMap<String, TypedValue>,
+    raw: &[StatementParameter],
+    ordinal_base: i32,
+) -> Result<Vec<StatementParameter>> {
+    // The server rejects mixed positional and named markers with an opaque
+    // BAD_REQUEST; reject every mixed binding style here.
+    if !positional.is_empty() && !named.is_empty() {
+        return Err(Error::invalid_argument()
+            .message("positional and named parameters are mutually exclusive; pass only one"));
+    }
+    if !raw.is_empty() && (!positional.is_empty() || !named.is_empty()) {
+        return Err(Error::invalid_argument()
+            .message("raw parameters cannot be mixed with positional/named TypedValue params"));
+    }
+    let has_named_raw = raw.iter().any(|p| p.name.is_some());
+    if has_named_raw && raw.iter().any(|p| p.name.is_none()) {
+        return Err(Error::invalid_argument()
+            .message("positional and named raw parameters are mutually exclusive; pass only one"));
+    }
+    let ordinal = |i: usize| {
+        i32::try_from(i)
+            .ok()
+            .and_then(|i| i.checked_add(ordinal_base))
+            .ok_or_else(|| Error::invalid_argument().message("parameter ordinal exceeds i32"))
+    };
+    let mut parameters = Vec::with_capacity(positional.len() + named.len() + raw.len());
+    for (i, value) in positional.iter().enumerate() {
+        parameters.push(typed_value_to_sea_parameter(ordinal(i)?, value)?);
+    }
+    for (name, value) in named {
+        parameters.push(named_typed_value_to_sea_parameter(name.clone(), value)?);
+    }
+    for (i, p) in raw.iter().enumerate() {
+        let mut param = p.clone();
+        if param.name.is_none() {
+            param.ordinal = Some(ordinal(i)?);
+        }
+        parameters.push(param);
+    }
+    Ok(parameters)
 }
 
 /// Lifecycle owner for a single statement spec.
@@ -349,7 +372,7 @@ impl Statement {
         self.reset_inflight_slot();
         let telemetry = self.statement_telemetry(OperationType::ExecuteStatement);
         let telemetry_for_body = telemetry.clone();
-        let result = async {
+        let mut result = async {
             self.invalidate_prior().await;
             let (sql, mut exec_params) = self.prepare_for_dispatch(None)?;
 
@@ -365,7 +388,7 @@ impl Statement {
             // `StatementCanceller` can cancel a still-running query. The
             // slot was already cleared at method entry, so set the observer
             // now.
-            exec_params.inflight_id_observer = Some(Arc::clone(&self.inflight_id));
+            exec_params.scalar.inflight_id_observer = Some(Arc::clone(&self.inflight_id));
 
             // SeaRestTransport::execute_statement polls to completion
             // (10s server-side wait_timeout, then GetStatementStatus
@@ -417,7 +440,14 @@ impl Statement {
             // result (non-consuming — the count row still reaches the
             // caller's fetch) so `num_modified_rows()` matches Thrift.
             let mut status = result.status;
-            if status.num_modified_rows.is_none() {
+            let parameter_set_count = exec_params.parameter_sets.len();
+            if parameter_set_count != 0 {
+                status.num_modified_rows = crate::statement::dml_count::read_batch_affected_rows(
+                    &mut result_stream,
+                    parameter_set_count,
+                )
+                .await?;
+            } else if status.num_modified_rows.is_none() {
                 status.num_modified_rows =
                     crate::statement::dml_count::read_dml_affected_rows(&mut result_stream).await?;
             }
@@ -433,7 +463,8 @@ impl Statement {
         }
         .instrument(span)
         .await;
-        if let Err(error) = &result {
+        if let Err(error) = &mut result {
+            self.finish_failed_batch(error).await;
             telemetry.finalize(Some(error));
         }
         result
@@ -476,7 +507,7 @@ impl Statement {
         self.reset_inflight_slot();
         let telemetry = self.statement_telemetry(OperationType::ExecuteStatementAsync);
         let telemetry_for_body = telemetry.clone();
-        let result = async {
+        let mut result = async {
             self.invalidate_prior().await;
             let (sql, exec_params) = self.prepare_for_dispatch(Some("0s"))?;
 
@@ -549,11 +580,13 @@ impl Statement {
                 response.status,
                 telemetry_for_body,
                 timeout,
-            ))
+            )
+            .with_parameter_set_count(exec_params.parameter_sets.len()))
         }
         .instrument(span)
         .await;
-        if let Err(error) = &result {
+        if let Err(error) = &mut result {
+            self.finish_failed_batch(error).await;
             telemetry.finalize(Some(error));
         }
         result
@@ -593,7 +626,7 @@ impl Statement {
         self.reset_inflight_slot();
         let telemetry = self.statement_telemetry(OperationType::ExecuteStatement);
         let telemetry_for_body = telemetry.clone();
-        let result = async {
+        let mut result = async {
             self.invalidate_prior().await;
             // `prepare_for_dispatch(None)` leaves `wait_timeout` / `on_wait_timeout`
             // UNSET, so `execute_statement_direct` sends ExecuteStatement with no
@@ -609,7 +642,7 @@ impl Statement {
                 Arc::clone(&self.inflight_id),
             );
             let guard = cancel_state.guard();
-            exec_params.inflight_id_observer = Some(Arc::clone(&self.inflight_id));
+            exec_params.scalar.inflight_id_observer = Some(Arc::clone(&self.inflight_id));
 
             let outcome = match self
                 .session
@@ -647,7 +680,15 @@ impl Statement {
                     let mut result_stream = ResultStream::from_reader(result.reader).await?;
                     result_stream.attach_telemetry(telemetry_for_body.clone());
                     let mut status = result.status;
-                    if status.num_modified_rows.is_none() {
+                    let parameter_set_count = exec_params.parameter_sets.len();
+                    if parameter_set_count != 0 {
+                        status.num_modified_rows =
+                            crate::statement::dml_count::read_batch_affected_rows(
+                                &mut result_stream,
+                                parameter_set_count,
+                            )
+                            .await?;
+                    } else if status.num_modified_rows.is_none() {
                         // Optional count reads must not turn a successful write into an execute error.
                         if let Ok(count) =
                             crate::statement::dml_count::read_dml_affected_rows(&mut result_stream)
@@ -677,24 +718,39 @@ impl Statement {
                     self.last_statement_id = Some(resp.statement_id.clone());
                     self.last_valid = Some(valid.clone());
                     self.last_closed = Some(Arc::clone(&closed));
-                    Ok(DirectStatement::Running(ExecutedAsyncStatement::new(
-                        Arc::clone(&self.session),
-                        resp.statement_id,
-                        valid,
-                        closed,
-                        resp.status,
-                        telemetry_for_body,
-                        ExecutionTimeout::Default,
-                    )))
+                    Ok(DirectStatement::Running(
+                        ExecutedAsyncStatement::new(
+                            Arc::clone(&self.session),
+                            resp.statement_id,
+                            valid,
+                            closed,
+                            resp.status,
+                            telemetry_for_body,
+                            ExecutionTimeout::Default,
+                        )
+                        .with_parameter_set_count(exec_params.parameter_sets.len()),
+                    ))
                 }
             }
         }
         .instrument(span)
         .await;
-        if let Err(error) = &result {
+        if let Err(error) = &mut result {
+            self.finish_failed_batch(error).await;
             telemetry.finalize(Some(error));
         }
         result
+    }
+
+    async fn finish_failed_batch(&mut self, error: &mut Error) {
+        if self.spec.parameter_sets.is_empty() {
+            return;
+        }
+        error.retryable = false;
+        if error.query_id.is_none() {
+            error.query_id = self.inflight_id.lock().ok().and_then(|id| id.clone());
+        }
+        self.invalidate_prior().await;
     }
 
     fn statement_telemetry(&self, operation_type: OperationType) -> StatementTelemetry {
@@ -738,7 +794,7 @@ impl Statement {
         .await
     }
 
-    /// Shared spec-validation + `ExecuteParams` builder used by both
+    /// Shared spec-validation + `ExecutionParams` builder used by both
     /// [`execute`](Self::execute) and [`submit`](Self::submit).
     ///
     /// `wait_timeout_secs`:
@@ -755,7 +811,7 @@ impl Statement {
     fn prepare_for_dispatch(
         &self,
         wait_timeout_secs: Option<&str>,
-    ) -> Result<(String, ExecuteParams)> {
+    ) -> Result<(String, ExecutionParams)> {
         build_execute_params(&self.spec, wait_timeout_secs)
     }
 
@@ -1043,7 +1099,7 @@ mod tests {
         spec.sql("SELECT 1").row_limit(Some(100));
         let (sql, params) = build_execute_params(&spec, None).unwrap();
         assert_eq!(sql, "SELECT 1");
-        assert_eq!(params.row_limit, Some(100));
+        assert_eq!(params.scalar.row_limit, Some(100));
     }
 
     #[test]
@@ -1062,6 +1118,7 @@ mod tests {
 
         let (_sql, params) = build_execute_params(&spec, None).unwrap();
         let got: std::collections::HashSet<(String, Option<String>)> = params
+            .scalar
             .query_tags
             .iter()
             .map(|t| (t.key.clone(), t.value.clone()))
@@ -1080,7 +1137,7 @@ mod tests {
         let mut spec = StatementSpec::new();
         spec.sql("SELECT 1");
         let (_sql, params) = build_execute_params(&spec, None).unwrap();
-        assert!(params.query_tags.is_empty());
+        assert!(params.scalar.query_tags.is_empty());
     }
 
     #[test]
@@ -1101,6 +1158,7 @@ mod tests {
 
         let (_sql, params) = build_execute_params(&spec, None).unwrap();
         let got: HashSet<(String, Option<String>)> = params
+            .scalar
             .query_tags
             .iter()
             .map(|t| (t.key.clone(), t.value.clone()))
@@ -1132,7 +1190,7 @@ mod tests {
         spec.statement_conf.remove("query_tags");
 
         let (_sql, params) = build_execute_params(&spec, None).unwrap();
-        assert!(params.query_tags.is_empty());
+        assert!(params.scalar.query_tags.is_empty());
     }
 
     #[test]
@@ -1142,11 +1200,11 @@ mod tests {
         spec.param(1, TypedValue::Bool(true)).unwrap();
         spec.param(2, TypedValue::Bool(false)).unwrap();
         let (_, params) = build_execute_params(&spec, None).unwrap();
-        assert_eq!(params.parameters.len(), 2);
+        assert_eq!(params.scalar.parameters.len(), 2);
         // Positional binding is 1-based on the wire and carries no name.
-        assert_eq!(params.parameters[0].ordinal, Some(1));
-        assert_eq!(params.parameters[1].ordinal, Some(2));
-        assert!(params.parameters[0].name.is_none());
+        assert_eq!(params.scalar.parameters[0].ordinal, Some(1));
+        assert_eq!(params.scalar.parameters[1].ordinal, Some(2));
+        assert!(params.scalar.parameters[0].name.is_none());
     }
 
     #[test]
@@ -1155,9 +1213,9 @@ mod tests {
         spec.sql("SELECT :flag");
         spec.param_named("flag", TypedValue::Bool(true)).unwrap();
         let (_, params) = build_execute_params(&spec, None).unwrap();
-        assert_eq!(params.parameters.len(), 1);
-        assert_eq!(params.parameters[0].name.as_deref(), Some("flag"));
-        assert!(params.parameters[0].ordinal.is_none());
+        assert_eq!(params.scalar.parameters.len(), 1);
+        assert_eq!(params.scalar.parameters[0].name.as_deref(), Some("flag"));
+        assert!(params.scalar.parameters[0].ordinal.is_none());
     }
 
     #[test]
@@ -1197,13 +1255,13 @@ mod tests {
         spec.param_raw(None, "BIGINT", Some("7".to_owned()));
         spec.param_raw(None, "STRING", Some("hi".to_owned()));
         let (_, params) = build_execute_params(&spec, None).unwrap();
-        assert_eq!(params.parameters.len(), 2);
-        assert_eq!(params.parameters[0].ordinal, Some(1));
-        assert_eq!(params.parameters[0].param_type, "BIGINT");
-        assert_eq!(params.parameters[0].value.as_deref(), Some("7"));
-        assert!(params.parameters[0].name.is_none());
-        assert_eq!(params.parameters[1].ordinal, Some(2));
-        assert_eq!(params.parameters[1].value.as_deref(), Some("hi"));
+        assert_eq!(params.scalar.parameters.len(), 2);
+        assert_eq!(params.scalar.parameters[0].ordinal, Some(1));
+        assert_eq!(params.scalar.parameters[0].param_type, "BIGINT");
+        assert_eq!(params.scalar.parameters[0].value.as_deref(), Some("7"));
+        assert!(params.scalar.parameters[0].name.is_none());
+        assert_eq!(params.scalar.parameters[1].ordinal, Some(2));
+        assert_eq!(params.scalar.parameters[1].value.as_deref(), Some("hi"));
     }
 
     #[test]
@@ -1215,12 +1273,12 @@ mod tests {
         spec.param_raw(Some("flag".to_owned()), "BOOLEAN", Some("true".to_owned()));
         spec.param_raw(Some("maybe".to_owned()), "VOID", None);
         let (_, params) = build_execute_params(&spec, None).unwrap();
-        assert_eq!(params.parameters.len(), 2);
-        assert_eq!(params.parameters[0].name.as_deref(), Some("flag"));
-        assert!(params.parameters[0].ordinal.is_none());
-        assert_eq!(params.parameters[1].name.as_deref(), Some("maybe"));
-        assert_eq!(params.parameters[1].param_type, "VOID");
-        assert!(params.parameters[1].value.is_none());
+        assert_eq!(params.scalar.parameters.len(), 2);
+        assert_eq!(params.scalar.parameters[0].name.as_deref(), Some("flag"));
+        assert!(params.scalar.parameters[0].ordinal.is_none());
+        assert_eq!(params.scalar.parameters[1].name.as_deref(), Some("maybe"));
+        assert_eq!(params.scalar.parameters[1].param_type, "VOID");
+        assert!(params.scalar.parameters[1].value.is_none());
     }
 
     #[test]
@@ -1275,15 +1333,37 @@ mod tests {
         spec.param_raw(None, "STRING", Some(String::new()));
         spec.param_raw(None, "VOID", None);
         let (_, params) = build_execute_params(&spec, None).unwrap();
-        assert_eq!(params.parameters.len(), 2);
+        assert_eq!(params.scalar.parameters.len(), 2);
         assert_eq!(
-            params.parameters[0].value.as_deref(),
+            params.scalar.parameters[0].value.as_deref(),
             Some(""),
             "empty-string value must stay a present empty value, not NULL"
         );
         assert!(
-            params.parameters[1].value.is_none(),
+            params.scalar.parameters[1].value.is_none(),
             "VOID/None must be SQL NULL, distinct from an empty string"
         );
+    }
+
+    #[test]
+    fn native_batch_rejects_mixed_and_leftover_bindings() {
+        let mut spec = StatementSpec::new();
+        spec.sql("INSERT INTO t VALUES (?)");
+        spec.param_raw(None, "BIGINT", Some("1".into()));
+        spec.param(1, TypedValue::Int64(2)).unwrap();
+        spec.add_parameter_set();
+        assert!(build_execute_params(&spec, None)
+            .unwrap_err()
+            .message
+            .contains("raw parameters"));
+        spec.sql("INSERT INTO t VALUES (?)");
+        spec.param(1, TypedValue::Int64(1))
+            .unwrap()
+            .add_parameter_set();
+        spec.param_raw(None, "BIGINT", Some("2".into()));
+        assert!(build_execute_params(&spec, None)
+            .unwrap_err()
+            .message
+            .contains("native parameter sets"));
     }
 }

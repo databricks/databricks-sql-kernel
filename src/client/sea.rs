@@ -18,6 +18,7 @@
 //! SQL Statement Execution API (REST-based).
 
 use crate::client::retry::RequestType;
+use crate::client::transport::ExecutionParams;
 use crate::client::{
     ChunkLinkFetchResult, DatabricksHttpClient, DirectOutcome, ExecuteResponse, ExecuteResult,
     ExecuteResultData, ExecutionTimeout, InlineChunkFetchResult, SessionAttribution, SessionInfo,
@@ -32,7 +33,7 @@ use crate::types::cloudfetch::CloudFetchLink;
 use crate::types::sea::{
     CompressionCodec, CreateSessionRequest, CreateSessionResponse, ExecuteParams,
     ExecuteStatementRequest, GetChunksResponse, SessionExecutionMode, SessionVersion,
-    StatementExecutionResponse, StatementState,
+    StatementExecutionResponse, StatementParameterSet, StatementState,
 };
 use async_trait::async_trait;
 use reqwest::Method;
@@ -98,6 +99,18 @@ struct ExecutionRequest {
     metadata_operation: Option<MetadataOperation>,
 }
 
+#[derive(serde::Serialize)]
+struct BatchRequest<'a> {
+    #[serde(flatten)]
+    statement: ExecuteStatementRequest,
+    #[serde(skip_serializing_if = "slice_is_empty")]
+    parameter_sets: &'a [StatementParameterSet],
+}
+
+fn slice_is_empty<T>(values: &&[T]) -> bool {
+    values.is_empty()
+}
+
 /// Internal terminal-outcome for a single SEA statement response.
 ///
 /// Used by the shared decoder [`SeaRestTransport::terminal_outcome`]
@@ -156,15 +169,19 @@ struct TerminalExecutionFailure {
 
 /// Read the statement id used to attribute and clean up a client timeout.
 /// Recovering a poisoned observer preserves best-effort cleanup after a panic.
-fn timeout_query_id(params: &ExecuteParams) -> Option<String> {
-    params.inflight_id_observer.as_ref().and_then(|slot| {
-        slot.lock()
-            .unwrap_or_else(|poisoned| {
-                warn!("in-flight statement id lock poisoned; recovering for timeout cleanup");
-                poisoned.into_inner()
-            })
-            .clone()
-    })
+fn timeout_query_id(params: &ExecutionParams) -> Option<String> {
+    params
+        .scalar
+        .inflight_id_observer
+        .as_ref()
+        .and_then(|slot| {
+            slot.lock()
+                .unwrap_or_else(|poisoned| {
+                    warn!("in-flight statement id lock poisoned; recovering for timeout cleanup");
+                    poisoned.into_inner()
+                })
+                .clone()
+        })
 }
 
 /// SEA client for the Databricks SQL Statement Execution API.
@@ -651,7 +668,8 @@ impl SeaRestTransport {
         &self,
         session_id: &str,
         sql: &str,
-        params: &ExecuteParams,
+        scalar: &ExecuteParams,
+        parameter_sets: &[StatementParameterSet],
         request_type: RequestType,
         metadata_operation: Option<MetadataOperation>,
     ) -> Result<ExecuteResponse> {
@@ -669,16 +687,16 @@ impl SeaRestTransport {
             statement: sql.to_string(),
             session_id,
             session_version: self.current_session_version(),
-            catalog: params.catalog.clone(),
-            schema: params.schema.clone(),
+            catalog: scalar.catalog.clone(),
+            schema: scalar.schema.clone(),
             disposition: "INLINE_OR_EXTERNAL_LINKS".to_string(),
             format: "ARROW_STREAM".to_string(),
-            wait_timeout: params.wait_timeout.clone(),
-            on_wait_timeout: params.on_wait_timeout.clone(),
-            row_limit: params.row_limit,
+            wait_timeout: scalar.wait_timeout.clone(),
+            on_wait_timeout: scalar.on_wait_timeout.clone(),
+            row_limit: scalar.row_limit,
             result_compression: Some("LZ4_FRAME".to_string()),
-            parameters: params.parameters.clone(),
-            query_tags: params.query_tags.clone(),
+            parameters: scalar.parameters.clone(),
+            query_tags: scalar.query_tags.clone(),
         };
 
         debug!("Executing statement at {}: {}", url, sql);
@@ -717,6 +735,10 @@ impl SeaRestTransport {
             }
         }
 
+        let request_body = BatchRequest {
+            statement: request_body,
+            parameter_sets,
+        };
         let request = builder.json(&request_body).build().map_err(|e| {
             Error::invalid_argument().message(format!("Failed to build request: {e}"))
         })?;
@@ -793,7 +815,7 @@ impl SeaRestTransport {
         &self,
         session_id: &str,
         sql: &str,
-        params: &ExecuteParams,
+        params: &ExecutionParams,
         request: ExecutionRequest,
         timeout: ExecutionTimeout,
         status_request_in_flight: &AtomicBool,
@@ -802,7 +824,8 @@ impl SeaRestTransport {
             .call_execute_api(
                 session_id,
                 sql,
-                params,
+                &params.scalar,
+                &params.parameter_sets,
                 request.request_type,
                 request.metadata_operation,
             )
@@ -815,7 +838,7 @@ impl SeaRestTransport {
 
         // Publish the server statement id to the caller's canceller slot before
         // polling so a concurrent canceller can target a running sync query.
-        if let Some(observer) = params.inflight_id_observer.as_ref() {
+        if let Some(observer) = params.scalar.inflight_id_observer.as_ref() {
             if let Ok(mut slot) = observer.lock() {
                 *slot = Some(statement_id.clone());
             }
@@ -892,7 +915,7 @@ impl SeaRestTransport {
         &self,
         session_id: &str,
         sql: &str,
-        params: &ExecuteParams,
+        params: &ExecutionParams,
         request_type: RequestType,
         metadata_operation: Option<MetadataOperation>,
         timeout: ExecutionTimeout,
@@ -1256,7 +1279,7 @@ impl Transport for SeaRestTransport {
         &self,
         session_id: &str,
         sql: &str,
-        params: &ExecuteParams,
+        params: &ExecutionParams,
         timeout: ExecutionTimeout,
     ) -> Result<ExecuteResult> {
         self.execute_and_read(
@@ -1274,7 +1297,7 @@ impl Transport for SeaRestTransport {
         &self,
         session_id: &str,
         sql: &str,
-        params: &ExecuteParams,
+        params: &ExecutionParams,
     ) -> Result<ExecuteResponse> {
         // Single POST /statements; no polling, no reader creation.
         // Force `wait_timeout = "0s"` regardless of what the caller
@@ -1285,13 +1308,14 @@ impl Transport for SeaRestTransport {
         // matches the retry policy of the sync path — submit is also
         // non-idempotent in the worst case (e.g. an INSERT submitted
         // twice).
-        let mut params = params.clone();
-        params.wait_timeout = Some("0s".to_string());
-        params.on_wait_timeout = Some("CONTINUE".to_string());
+        let mut scalar = params.scalar.clone();
+        scalar.wait_timeout = Some("0s".to_string());
+        scalar.on_wait_timeout = Some("CONTINUE".to_string());
         self.call_execute_api(
             session_id,
             sql,
-            &params,
+            &scalar,
+            &params.parameter_sets,
             RequestType::ExecuteStatement,
             None,
         )
@@ -1302,7 +1326,7 @@ impl Transport for SeaRestTransport {
         &self,
         session_id: &str,
         sql: &str,
-        params: &ExecuteParams,
+        params: &ExecutionParams,
     ) -> Result<DirectOutcome> {
         // directResults model: OMIT `wait_timeout` (exactly like the sync
         // `execute` path) so the server applies its default ~10s inline wait
@@ -1316,7 +1340,14 @@ impl Transport for SeaRestTransport {
         // internal poll loop: a query that outlasts the inline wait
         // comes back `Running` for the caller to poll/cancel.
         let response = self
-            .call_execute_api(session_id, sql, params, RequestType::ExecuteStatement, None)
+            .call_execute_api(
+                session_id,
+                sql,
+                &params.scalar,
+                &params.parameter_sets,
+                RequestType::ExecuteStatement,
+                None,
+            )
             .await?;
         let statement_id = response.statement_id.clone();
 
@@ -1324,7 +1355,7 @@ impl Transport for SeaRestTransport {
         // a concurrent `StatementCanceller::cancel()` (the Running arm) can
         // target the still-running query immediately, no mid-execute observer
         // race (the id is known from this POST response).
-        if let Some(observer) = params.inflight_id_observer.as_ref() {
+        if let Some(observer) = params.scalar.inflight_id_observer.as_ref() {
             if let Ok(mut slot) = observer.lock() {
                 *slot = Some(statement_id.clone());
             }
@@ -1643,7 +1674,7 @@ impl Transport for SeaRestTransport {
         self.execute_and_read(
             session_id,
             &sql,
-            &ExecuteParams::default(),
+            &ExecutionParams::default(),
             RequestType::ExecuteMetadataQuery,
             Some(MetadataOperation::Catalogs),
             ExecutionTimeout::Default,
@@ -1665,7 +1696,7 @@ impl Transport for SeaRestTransport {
         self.execute_and_read(
             session_id,
             &sql,
-            &ExecuteParams::default(),
+            &ExecutionParams::default(),
             RequestType::ExecuteMetadataQuery,
             Some(MetadataOperation::Schemas),
             ExecutionTimeout::Default,
@@ -1691,7 +1722,7 @@ impl Transport for SeaRestTransport {
         self.execute_and_read(
             session_id,
             &sql,
-            &ExecuteParams::default(),
+            &ExecutionParams::default(),
             RequestType::ExecuteMetadataQuery,
             Some(MetadataOperation::Tables),
             ExecutionTimeout::Default,
@@ -1716,7 +1747,7 @@ impl Transport for SeaRestTransport {
         self.execute_and_read(
             session_id,
             &sql,
-            &ExecuteParams::default(),
+            &ExecutionParams::default(),
             RequestType::ExecuteMetadataQuery,
             Some(MetadataOperation::Columns),
             ExecutionTimeout::Default,
@@ -1737,7 +1768,7 @@ impl Transport for SeaRestTransport {
         self.execute_and_read(
             session_id,
             &sql,
-            &ExecuteParams::default(),
+            &ExecutionParams::default(),
             RequestType::ExecuteMetadataQuery,
             Some(MetadataOperation::Procedures),
             ExecutionTimeout::Default,
@@ -1757,7 +1788,7 @@ impl Transport for SeaRestTransport {
         self.execute_and_read(
             session_id,
             &sql,
-            &ExecuteParams::default(),
+            &ExecutionParams::default(),
             RequestType::ExecuteMetadataQuery,
             Some(MetadataOperation::Functions),
             ExecutionTimeout::Default,
@@ -1783,7 +1814,7 @@ impl Transport for SeaRestTransport {
         self.execute_and_read(
             session_id,
             &sql,
-            &ExecuteParams::default(),
+            &ExecutionParams::default(),
             RequestType::ExecuteMetadataQuery,
             Some(MetadataOperation::ProcedureColumns),
             ExecutionTimeout::Default,
@@ -1803,7 +1834,7 @@ impl Transport for SeaRestTransport {
         self.execute_and_read(
             session_id,
             &sql,
-            &ExecuteParams::default(),
+            &ExecutionParams::default(),
             RequestType::ExecuteMetadataQuery,
             Some(MetadataOperation::PrimaryKeys),
             ExecutionTimeout::Default,
@@ -1841,7 +1872,7 @@ impl Transport for SeaRestTransport {
         self.execute_and_read(
             session_id,
             &sql,
-            &ExecuteParams::default(),
+            &ExecutionParams::default(),
             RequestType::ExecuteMetadataQuery,
             Some(MetadataOperation::CrossReference),
             ExecutionTimeout::Default,
@@ -2010,7 +2041,7 @@ mod tests {
             .execute_and_read(
                 "sess-test",
                 "UPDATE t SET x = x + 1",
-                &ExecuteParams::default(),
+                &ExecutionParams::default(),
                 RequestType::ExecuteStatement,
                 None,
                 ExecutionTimeout::Default,
@@ -2074,7 +2105,7 @@ mod tests {
             .execute_to_terminal(
                 "sess-test",
                 "SELEKT 1",
-                &ExecuteParams::default(),
+                &ExecutionParams::default(),
                 ExecutionRequest {
                     request_type: RequestType::ExecuteStatement,
                     metadata_operation: None,
@@ -2140,7 +2171,7 @@ mod tests {
             .execute_and_read(
                 "sess-test",
                 "SELECT 1",
-                &ExecuteParams::default(),
+                &ExecutionParams::default(),
                 RequestType::ExecuteStatement,
                 None,
                 ExecutionTimeout::Default,
@@ -2197,7 +2228,7 @@ mod tests {
             .execute_and_read(
                 "sess-test",
                 "SELECT 1",
-                &ExecuteParams::default(),
+                &ExecutionParams::default(),
                 RequestType::ExecuteStatement,
                 None,
                 ExecutionTimeout::Unlimited,
@@ -2249,7 +2280,7 @@ mod tests {
             .execute_and_read(
                 "sess-test",
                 "SHOW CATALOGS",
-                &ExecuteParams::default(),
+                &ExecutionParams::default(),
                 RequestType::ExecuteMetadataQuery,
                 Some(MetadataOperation::Catalogs),
                 ExecutionTimeout::Default,
@@ -2769,7 +2800,7 @@ mod tests {
             .await
             .expect("session creation must succeed");
         transport
-            .submit_statement(&session.session_id, "SELECT 1", &ExecuteParams::default())
+            .submit_statement(&session.session_id, "SELECT 1", &ExecutionParams::default())
             .await
             .expect("execute must succeed");
         transport
@@ -2884,7 +2915,7 @@ mod tests {
                 .await
                 .expect("session creation must succeed");
             transport
-                .submit_statement(&session.session_id, "SELECT 1", &ExecuteParams::default())
+                .submit_statement(&session.session_id, "SELECT 1", &ExecutionParams::default())
                 .await
                 .expect("execute must succeed");
             transport
@@ -3057,7 +3088,7 @@ mod tests {
             .expect("FAST session creation must succeed");
 
         transport
-            .submit_statement(&session.session_id, "SELECT 1", &ExecuteParams::default())
+            .submit_statement(&session.session_id, "SELECT 1", &ExecutionParams::default())
             .await
             .expect("FAST execution must send the initial session version");
         transport
@@ -3070,7 +3101,7 @@ mod tests {
         );
 
         transport
-            .submit_statement(&session.session_id, "SELECT 2", &ExecuteParams::default())
+            .submit_statement(&session.session_id, "SELECT 2", &ExecutionParams::default())
             .await
             .expect("FAST execution must send the maximum observed session version");
         transport.observe_session_version(Some(SessionVersion { version_id: 8 }));
@@ -3125,7 +3156,7 @@ mod tests {
         assert_eq!(transport.current_session_version(), None);
 
         transport
-            .submit_statement(&session.session_id, "SELECT 1", &ExecuteParams::default())
+            .submit_statement(&session.session_id, "SELECT 1", &ExecutionParams::default())
             .await
             .expect("execution without a session version must succeed");
         assert_eq!(transport.current_session_version(), None);

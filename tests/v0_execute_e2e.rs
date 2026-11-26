@@ -50,6 +50,97 @@ async fn live_session() -> Session {
 
 #[tokio::test]
 #[ignore]
+async fn native_parameter_batch_counts_values_and_atomic_errors() {
+    use futures::FutureExt;
+    use std::panic::AssertUnwindSafe;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let session = live_session().await;
+    let schema =
+        env_var("DATABRICKS_TEST_SCHEMA").unwrap_or_else(|| "hive_metastore.default".into());
+    let name = format!(
+        "kernel_native_batch_{}_{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let table = format!("{schema}.{name}");
+    let mut statement = session.statement();
+    let checks = AssertUnwindSafe(async {
+        statement.spec().sql(format!(
+            "CREATE TABLE {table} (id BIGINT NOT NULL) USING DELTA"
+        ));
+        statement.execute().await.unwrap().close().await.unwrap();
+        let insert = format!("INSERT INTO {table} VALUES (?)");
+        statement.spec().sql(&insert);
+        for id in [17, 29, 43] {
+            statement
+                .spec()
+                .param(1, TypedValue::Int64(id))
+                .unwrap()
+                .add_parameter_set();
+        }
+        let executed = statement.execute().await.unwrap();
+        assert_eq!(executed.num_modified_rows(), Some(3));
+        executed.close().await.unwrap();
+
+        statement.spec().sql(&insert);
+        for id in [
+            TypedValue::Int64(101),
+            TypedValue::Null,
+            TypedValue::Int64(103),
+        ] {
+            statement.spec().param(1, id).unwrap().add_parameter_set();
+        }
+        let error = statement
+            .execute()
+            .await
+            .err()
+            .expect("NOT NULL batch must fail");
+        assert_eq!(error.code, ErrorCode::SqlError);
+
+        statement
+            .spec()
+            .sql(format!("SELECT id FROM {table} ORDER BY id"));
+        let mut executed = statement.execute().await.unwrap();
+        let stream = executed.result_stream_mut();
+        let mut rows = Vec::new();
+        while stream.next_batch().await.unwrap().is_some() {
+            while let Some(row) = stream.next_row_in_batch() {
+                rows.push(row.get_i64(0).unwrap());
+            }
+        }
+        assert_eq!(rows, vec![Some(17), Some(29), Some(43)]);
+        executed.close().await.unwrap();
+    })
+    .catch_unwind()
+    .await;
+
+    let cleanup = async {
+        statement
+            .spec()
+            .sql(format!("DROP TABLE IF EXISTS {table}"));
+        statement.execute().await?.close().await
+    }
+    .await;
+    let closed = session.close().await;
+    if let Err(panic) = checks {
+        if let Err(error) = &cleanup {
+            eprintln!("batch table cleanup failed: {error}");
+        }
+        if let Err(error) = &closed {
+            eprintln!("session cleanup failed: {error}");
+        }
+        std::panic::resume_unwind(panic);
+    }
+    cleanup.expect("drop batch test table");
+    closed.expect("session close");
+}
+
+#[tokio::test]
+#[ignore]
 async fn cloudfetch_disabled_drains_large_results() {
     use arrow_array::{Int64Array, StringArray};
     use sha2::{Digest, Sha256};

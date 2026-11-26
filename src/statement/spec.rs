@@ -168,6 +168,13 @@ pub mod geo_wire {
     pub const EWKT_SRID_PREFIX: &str = "SRID=";
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct BoundParameterSet {
+    pub positional: Vec<TypedValue>,
+    pub named: HashMap<String, TypedValue>,
+    pub raw: Vec<crate::types::sea::StatementParameter>,
+}
+
 /// Plain-data description of a statement to execute.
 ///
 /// All fields are public; callers may construct directly or use the fluent
@@ -179,8 +186,9 @@ pub struct StatementSpec {
     /// return `ErrorCode::InvalidArgument` if still `None` at execute time.
     pub sql: Option<String>,
 
-    /// Positional parameters, 1-based on the wire. Index `i` in this Vec
-    /// corresponds to ordinal `i + 1`. Mutually exclusive with
+    /// Positional parameters, 1-based on the wire for ordinary execution and
+    /// 0-based for native parameter sets. Index `i` in this Vec
+    /// corresponds to API ordinal `i + 1`. Mutually exclusive with
     /// `named_params` (see below).
     pub positional_params: Vec<TypedValue>,
 
@@ -208,6 +216,8 @@ pub struct StatementSpec {
     /// future alternate transport can then re-shape this field freely.
     pub(crate) raw_params: Vec<crate::types::sea::StatementParameter>,
 
+    pub(crate) parameter_sets: Vec<BoundParameterSet>,
+
     /// Per-statement conf overlay. Maps to SEA `parameters` /
     /// Thrift `confOverlay`. Merged on top of the session-level
     /// `session_conf` at execute time; this map wins on key collisions.
@@ -231,17 +241,17 @@ impl StatementSpec {
     }
 
     /// Set the SQL text. Replaces any previously set SQL and clears **every**
-    /// bound parameter — raw, positional-typed, and named-typed — so each
-    /// `sql()` begins a fresh set of *bound parameters*.
+    /// bound parameter — raw, positional-typed, and named-typed — and all native
+    /// parameter sets, so each `sql()` begins a fresh set of *bound parameters*.
     ///
-    /// Scope note: this clears the three parameter collections only. It does
+    /// Scope note: this clears bound parameters and native parameter sets. It does
     /// **not** reset `statement_conf` (e.g. query tags) or `row_limit`, which
     /// survive a `sql()` call and must be re-set explicitly if a reused handle
     /// should not carry them into the next query.
     ///
-    /// This is the single reset point for the *bound parameters* of a reused
+    /// This resets the *bound parameters* and native parameter sets of a reused
     /// statement handle. New SQL has its own parameter markers, so carrying
-    /// prior binds into it is never correct; clearing all three here matches the
+    /// prior binds into it is never correct; clearing them here matches the
     /// prepared-statement mental model (new SQL → fresh binds) and keeps the
     /// reset uniform across binding styles. Without it, a reused handle leaks
     /// stale binds into the next query
@@ -256,15 +266,32 @@ impl StatementSpec {
     /// re-supplied after each `sql()` and nothing depends on them surviving it.
     pub fn sql(&mut self, sql: impl Into<String>) -> &mut Self {
         self.sql = Some(sql.into());
+        self.parameter_sets.clear();
         self.raw_params.clear();
         self.positional_params.clear();
         self.named_params.clear();
         self
     }
 
+    /// Append the current bindings as the next native parameter set, then clear
+    /// the scalar bindings. Execute sends all sets in one request. The caller
+    /// selects eligible SQL; the server validates completeness and consistency.
+    /// Scalar bindings left after the last snapshot are rejected at execution.
+    ///
+    /// Errors reading the batch's affected-row count are non-retryable because
+    /// the rows may already be committed.
+    pub fn add_parameter_set(&mut self) -> &mut Self {
+        self.parameter_sets.push(BoundParameterSet {
+            positional: std::mem::take(&mut self.positional_params),
+            named: std::mem::take(&mut self.named_params),
+            raw: std::mem::take(&mut self.raw_params),
+        });
+        self
+    }
+
     /// Bind a positional parameter (1-based ordinal). Returns
-    /// `Err(InvalidArgument)` for `ordinal == 0` — the SEA wire format
-    /// is 1-based and ordinal 0 is never valid.
+    /// `Err(InvalidArgument)` for `ordinal == 0`. Bind ordinals remain 1-based;
+    /// native batches convert them to zero-based wire ordinals.
     ///
     /// Grows `positional_params` with `TypedValue::Null` placeholders if
     /// `ordinal` skips ahead of the current length.
@@ -308,23 +335,24 @@ impl StatementSpec {
     }
 
     /// Push a pre-marshalled SEA parameter (host-stringified value + Databricks
-    /// type name). `name` empty → positional (ordinal assigned at execute in
-    /// push order, 1-based); non-empty → named. `value` None → SQL NULL (the
+    /// type name). `name` empty → positional (wire ordinal assigned at execute in
+    /// push order, 1-based for ordinary execution and 0-based for native sets).
+    /// Non-empty `name` → named. `value` None → SQL NULL (the
     /// host passes type "VOID"). This is the raw-bind path a C-ABI host uses; it
     /// bypasses `TypedValue` inference because the host already knows the wire
     /// type and string form.
     ///
-    /// **Append-only, one-shot per query.** Each call *appends* a marker; unlike
+    /// **Append-only, one-shot per parameter set.** Each call *appends* a marker; unlike
     /// the typed [`Self::param`] binder there is no overwrite-by-ordinal (a raw
     /// positional carries no ordinal until execute assigns it in push order), so
     /// re-binding to "correct" a value adds a second marker rather than
-    /// replacing the first. Bind each marker exactly once per query; the only
-    /// reset is [`Self::sql`]. This matches the intended consumer contract — a
-    /// C-ABI host (e.g. the Go driver) binds its arg set once per execute on a
-    /// fresh handle and never re-binds in place. Duplicate-name detection on the
-    /// named raw path is deferred to a later PR, in lockstep with the same
-    /// tightening on [`Self::param_named`], so the raw and typed-named paths stay
-    /// symmetric rather than raw being stricter.
+    /// replacing the first. Bind each marker exactly once per parameter set.
+    /// [`Self::add_parameter_set`] snapshots and clears the current bindings, and
+    /// [`Self::sql`] clears all bindings and native sets. This matches the intended
+    /// consumer contract — a C-ABI host (e.g. the Go driver) binds each arg set
+    /// once and never re-binds in place.
+    ///
+    /// Raw named parameters are appended without duplicate-name validation.
     pub fn param_raw(
         &mut self,
         name: Option<String>,

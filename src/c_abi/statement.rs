@@ -177,7 +177,7 @@ unsafe fn statement_mut<'a>(stmt: *mut kernel_statement_t) -> Option<&'a mut Sta
 // ─── SQL + parameter binding ─────────────────────────────────────────────────
 
 /// Set the statement's SQL text, replacing any previously set SQL. Also clears
-/// every previously-bound parameter (raw and typed), so a reused statement
+/// every previously-bound parameter (raw, typed, and batch), so a reused statement
 /// handle begins each query with a fresh parameter set — see
 /// [`crate::statement::spec::StatementSpec::sql`].
 ///
@@ -197,6 +197,21 @@ pub unsafe extern "C" fn kernel_statement_set_sql(
             .to_str()
             .map_err(|_| Error::invalid_argument().message("sql is not valid UTF-8"))?;
         stmt.spec().sql(sql);
+        Ok(())
+    })
+}
+
+/// Snapshot current bindings as the next ordered native parameter set and clear
+/// scalar bindings. Execute submits all snapshots together; set_sql clears them.
+///
+/// # Safety
+/// `stmt` must be a live statement handle.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_statement_add_parameter_set(
+    stmt: *mut kernel_statement_t,
+) -> KernelStatusCode {
+    with_statement(stmt, |stmt| {
+        stmt.spec().add_parameter_set();
         Ok(())
     })
 }

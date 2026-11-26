@@ -354,8 +354,9 @@ pub struct StatementParameter {
     /// `:name`-style markers and `ordinal` should be `None`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    /// 1-based position of the parameter in the SQL statement. When
-    /// `Some`, the SQL uses `?` markers and `name` should be `None`.
+    /// Position of the parameter: zero-based within native parameter sets,
+    /// one-based for ordinary execution. When `Some`, the SQL uses `?`
+    /// markers and `name` should be `None`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ordinal: Option<i32>,
     /// Databricks SQL type name (e.g., "INT", "STRING", "DOUBLE", "TIMESTAMP").
@@ -377,6 +378,11 @@ pub struct QueryTag {
     pub key: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub value: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct StatementParameterSet {
+    pub parameters: Vec<StatementParameter>,
 }
 
 /// Request body for statement execution.

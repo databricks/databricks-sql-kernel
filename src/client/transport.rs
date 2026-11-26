@@ -28,10 +28,16 @@ use crate::kernel_error::Result;
 use crate::reader::ResultReader;
 use crate::telemetry::ExecutionResultFormat;
 use crate::types::cloudfetch::CloudFetchLink;
-use crate::types::sea::{ExecuteParams, ResultManifest, StatementStatus};
+use crate::types::sea::{ExecuteParams, ResultManifest, StatementParameterSet, StatementStatus};
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ExecutionParams {
+    pub scalar: ExecuteParams,
+    pub parameter_sets: Vec<StatementParameterSet>,
+}
 
 // ─── Transport-shared config ────────────────────────────────────────
 
@@ -297,12 +303,12 @@ pub(crate) trait Transport: Send + Sync + std::fmt::Debug {
         &self,
         session_id: &str,
         sql: &str,
-        params: &ExecuteParams,
+        params: &ExecutionParams,
         timeout: ExecutionTimeout,
     ) -> Result<ExecuteResult>;
 
     /// Execute a SQL statement relying on the server's default inline wait
-    /// (the caller's `ExecuteParams` omit `wait_timeout`/`on_wait_timeout` unless
+    /// (the caller's `ExecutionParams` omit `wait_timeout`/`on_wait_timeout` unless
     /// a `query_timeout_secs` was set), returning WITHOUT the internal poll loop
     /// — the Thrift/JDBC directResults model.
     ///
@@ -314,7 +320,7 @@ pub(crate) trait Transport: Send + Sync + std::fmt::Debug {
         &self,
         session_id: &str,
         sql: &str,
-        params: &ExecuteParams,
+        params: &ExecutionParams,
     ) -> Result<DirectOutcome>;
 
     /// Submit a SQL statement without polling for completion.
@@ -336,7 +342,7 @@ pub(crate) trait Transport: Send + Sync + std::fmt::Debug {
         &self,
         session_id: &str,
         sql: &str,
-        params: &ExecuteParams,
+        params: &ExecutionParams,
     ) -> Result<ExecuteResponse>;
 
     /// Materialise a reader from an observed terminal response.

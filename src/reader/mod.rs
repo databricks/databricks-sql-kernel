@@ -1933,6 +1933,7 @@ mod tests {
     // compiles. We use a panicking stub.
     // ──────────────────────────────────────────────────────────────
 
+    use crate::client::transport::ExecutionParams;
     use crate::client::{
         ChunkLinkFetchResult, DatabricksHttpClient, ExecuteResponse, ExecuteResult,
         ExecuteResultData, ExecutionTimeout, HttpClientConfig, InlineChunkFetchResult, SessionInfo,
@@ -1940,7 +1941,7 @@ mod tests {
     };
     use crate::kernel_error::ErrorCode;
     use crate::reader::post_processor::PostProcessOptions;
-    use crate::types::sea::{ExecuteParams, ServiceError, StatementStatus};
+    use crate::types::sea::{ServiceError, StatementStatus};
     use std::collections::HashMap;
 
     /// Transport stub that panics on every method. Adequate for
@@ -1966,7 +1967,7 @@ mod tests {
             &self,
             _: &str,
             _: &str,
-            _: &ExecuteParams,
+            _: &ExecutionParams,
             _: ExecutionTimeout,
         ) -> Result<ExecuteResult> {
             unreachable!()
@@ -1975,7 +1976,7 @@ mod tests {
             &self,
             _: &str,
             _: &str,
-            _: &ExecuteParams,
+            _: &ExecutionParams,
         ) -> Result<ExecuteResponse> {
             unreachable!()
         }
@@ -1983,7 +1984,7 @@ mod tests {
             &self,
             _: &str,
             _: &str,
-            _: &ExecuteParams,
+            _: &ExecutionParams,
         ) -> Result<crate::client::DirectOutcome> {
             unreachable!()
         }
