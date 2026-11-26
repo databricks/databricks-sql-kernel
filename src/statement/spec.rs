@@ -186,7 +186,7 @@ pub struct StatementSpec {
     /// return `ErrorCode::InvalidArgument` if still `None` at execute time.
     pub sql: Option<String>,
 
-    /// Positional parameters in binding order. Index `i` corresponds to API
+    /// Positional parameters. Index `i` corresponds to API
     /// ordinal `i + 1`. Wire ordinals are 1-based for ordinary execution and
     /// 0-based for native parameter sets. Mutually exclusive with `named_params`.
     pub positional_params: Vec<TypedValue>,
@@ -239,8 +239,30 @@ impl StatementSpec {
         Self::default()
     }
 
-    /// Set SQL and clear all scalar bindings and native parameter sets.
-    /// Statement configuration and `row_limit` survive this call.
+    /// Set the SQL text. Replaces any previously set SQL and clears **every** bound
+    /// parameter — raw, positional-typed, and named-typed — and native parameter
+    /// sets, so each `sql()` begins a fresh set of *bound parameters*.
+    ///
+    /// Scope note: this clears bound parameters and native parameter sets. It does
+    /// **not** reset `statement_conf` (e.g. query tags) or `row_limit`, which
+    /// survive a `sql()` call and must be re-set explicitly if a reused handle
+    /// should not carry them into the next query.
+    ///
+    /// This resets the *bound parameters* and native parameter sets of a reused
+    /// statement handle. New SQL has its own parameter markers, so carrying prior
+    /// binds into it is never correct; clearing them here matches the
+    /// prepared-statement mental model (new SQL → fresh binds) and keeps the reset
+    /// uniform across binding styles. Without it, a reused handle leaks stale binds
+    /// into the next query in two ways: raw binds only `push` (no
+    /// overwrite-by-ordinal), so they would accumulate across executes; and typed
+    /// positional binds overwrite by ordinal (`param`) but a *shrinking* arity
+    /// would keep the stale high-ordinal slots, emitting more markers than the new
+    /// SQL has. A host that bound typed params for one query then raw-binds the
+    /// next would also trip the raw-vs-typed exclusion check on the
+    /// leftover typed slots.
+    ///
+    /// The idiom is always `set_sql` → bind → execute per query, so binds are
+    /// re-supplied after each `sql()` and nothing depends on them surviving it.
     pub fn sql(&mut self, sql: impl Into<String>) -> &mut Self {
         self.sql = Some(sql.into());
         self.parameter_sets.clear();
@@ -255,8 +277,8 @@ impl StatementSpec {
     /// selects eligible SQL; the server validates completeness and consistency.
     /// Scalar bindings left after the last snapshot are rejected at execution.
     ///
-    /// Count-reader errors are non-retryable because the batch may already have
-    /// committed.
+    /// Errors reading the batch's affected-row count are non-retryable because
+    /// the rows may already be committed.
     pub fn add_parameter_set(&mut self) -> &mut Self {
         self.parameter_sets.push(BoundParameterSet {
             positional: std::mem::take(&mut self.positional_params),
@@ -312,16 +334,21 @@ impl StatementSpec {
     }
 
     /// Push a pre-marshalled SEA parameter (host-stringified value + Databricks
-    /// type name). `name` empty → positional; non-empty → named. Positional
-    /// ordinals are assigned in push order at execution, 1-based on the wire
-    /// for ordinary execution and 0-based for native parameter sets.
-    /// `value` None → SQL NULL (the host passes type "VOID"). This is the raw-bind
-    /// path a C-ABI host uses; it bypasses `TypedValue` inference because the host
-    /// already knows the wire type and string form.
+    /// type name). `name` empty → positional (wire ordinal assigned at execute in
+    /// push order, 1-based for ordinary execution and 0-based for native sets);
+    /// non-empty → named. `value` None → SQL NULL (the host passes type "VOID").
+    /// This is the raw-bind path a C-ABI host uses; it bypasses `TypedValue`
+    /// inference because the host already knows the wire type and string form.
     ///
-    /// Each call appends a binding; repeated calls do not replace a previous
-    /// ordinal or name. [`Self::add_parameter_set`] snapshots and clears current
-    /// bindings; [`Self::sql`] clears all scalar bindings and parameter sets.
+    /// **Append-only, one-shot per parameter set.** Each call *appends* a marker;
+    /// unlike the typed [`Self::param`] binder there is no overwrite-by-ordinal (a
+    /// raw positional carries no ordinal until execute assigns it in push order),
+    /// so re-binding to "correct" a value adds a second marker rather than
+    /// replacing the first. Bind each marker exactly once per parameter set;
+    /// [`Self::add_parameter_set`] snapshots and clears the current bindings, and
+    /// [`Self::sql`] clears all bindings and native sets. This matches the intended
+    /// consumer contract — a C-ABI host (e.g. the Go driver) binds each arg set
+    /// once and never re-binds in place.
     pub fn param_raw(
         &mut self,
         name: Option<String>,

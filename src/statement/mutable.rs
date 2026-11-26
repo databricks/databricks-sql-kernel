@@ -127,9 +127,10 @@ fn resolve_wait_timeout(caller_wait_secs: Option<&str>) -> (Option<String>, Opti
 
 /// Build the `(sql, ExecutionParams)` dispatch pair from a statement spec.
 ///
-/// This borrows the spec without a session, so the row limit, wait settings,
-/// and parameter bindings can be tested without a live connection. Both sync
-/// and async execution use it through [`Statement::prepare_for_dispatch`].
+/// Pure — borrows `spec`, touches no `Session` — so the spec → wire-params
+/// mapping (row_limit, the resolved wait/on-wait pair, and positional + named
+/// parameter binding) is unit-testable without a live session. Shared by both
+/// the sync and async dispatch paths via [`Statement::prepare_for_dispatch`].
 fn build_execute_params(
     spec: &StatementSpec,
     wait_timeout_secs: Option<&str>,
@@ -1091,6 +1092,9 @@ mod tests {
 
     #[test]
     fn build_execute_params_threads_row_limit_to_wire() {
+        // Headline parity feature: spec.row_limit must reach
+        // ExecuteParams.row_limit. A regression dropping it would otherwise
+        // pass every other test (the seam this pins).
         let mut spec = StatementSpec::new();
         spec.sql("SELECT 1").row_limit(Some(100));
         let (sql, params) = build_execute_params(&spec, None).unwrap();
@@ -1100,6 +1104,10 @@ mod tests {
 
     #[test]
     fn build_execute_params_threads_query_tags_to_wire_array() {
+        // Per-statement query tags set via Statement::query_tags must reach
+        // ExecuteParams.query_tags as the native SEA {key, value} array (the
+        // SEA request has no conf overlay). Regression guard for the seam
+        // where statement_conf["query_tags"] is converted to the array.
         use std::collections::HashMap;
         let mut spec = StatementSpec::new();
         spec.sql("SELECT 1");
@@ -1134,7 +1142,12 @@ mod tests {
 
     #[test]
     fn build_execute_params_reads_raw_query_tags_conf() {
-        // The C ABI writes serialized tags to statement_conf, bypassing the typed query-tag builder.
+        // The C ABI `kernel_statement_set_query_tags` stores the pre-serialized
+        // wire string directly under `statement_conf["query_tags"]` (rather than
+        // going through the typed `Statement::query_tags` builder). It must reach
+        // `ExecuteParams.query_tags` as the native array just the same — this is
+        // the seam the C ABI relies on. Includes a bare key (None value) and an
+        // escaped colon in a value.
         use std::collections::{HashMap, HashSet};
         let mut spec = StatementSpec::new();
         spec.sql("SELECT 1");
@@ -1162,6 +1175,10 @@ mod tests {
 
     #[test]
     fn build_execute_params_clears_query_tags_when_conf_removed() {
+        // The C ABI `kernel_statement_set_query_tags(stmt, "")` clears tags by
+        // removing statement_conf["query_tags"] — needed because the conf survives
+        // set_sql, so a reused handle would otherwise leak a prior query's tags.
+        // After removal, no query_tags reach the wire.
         use std::collections::HashMap;
         let mut spec = StatementSpec::new();
         spec.sql("SELECT 1");
@@ -1169,6 +1186,7 @@ mod tests {
             "query_tags".to_string(),
             "team:eng".to_string(),
         )]));
+        // Simulate the empty-string clear path.
         spec.statement_conf.remove("query_tags");
 
         let (_sql, params) = build_execute_params(&spec, None).unwrap();
@@ -1326,6 +1344,7 @@ mod tests {
             "VOID/None must be SQL NULL, distinct from an empty string"
         );
     }
+
     #[test]
     fn native_batch_rejects_mixed_and_leftover_bindings() {
         let mut spec = StatementSpec::new();

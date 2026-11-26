@@ -68,9 +68,19 @@ pub(crate) fn manifest_is_dml_count(manifest: &ResultManifest) -> bool {
         && cols.iter().any(|c| c.name == AFFECTED_ROWS_COLUMN)
 }
 
-/// Reads the signed integer `num_affected_rows` when the first batch has
-/// one row and every column is a known DML counter. A SELECT with the same
-/// result shape is indistinguishable. Peeking leaves the batch fetchable.
+/// If `stream`'s result set is a DML row-count result, return its
+/// `num_affected_rows` value; otherwise `None`.
+///
+/// Detection is deliberately strict — **every** column must be one of the
+/// known `num_*_rows` counters and `num_affected_rows` must be present. A
+/// SELECT such as `SELECT 1 AS num_affected_rows` passes the same checks and
+/// is indistinguishable from a DML result. Thrift never faces this ambiguity
+/// because it reads the count from operation metadata rather than the result
+/// columns; the strict signature keeps us as close as the SEA wire shape
+/// allows.
+///
+/// Non-consuming: peeks the first batch and buffers it, so the caller's
+/// subsequent fetch still sees the row.
 pub(crate) async fn read_dml_affected_rows(stream: &mut ResultStream) -> Result<Option<i64>> {
     let schema = stream.schema();
     let fields = schema.fields();
@@ -125,6 +135,9 @@ pub(crate) async fn read_batch_affected_rows(
         .and_then(|(represented, total)| (represented == parameter_set_count).then_some(total)))
 }
 
+// The server types these BIGINT (Arrow Int64); accept the narrower
+// signed widths defensively, and ignore anything else rather than
+// mis-reporting.
 fn int_value(col: &dyn Array, row: usize) -> Option<i64> {
     if col.is_null(row) {
         return None;
@@ -158,7 +171,7 @@ mod tests {
             ("repeated", affected(vec![Some(1)]), Some(3), Some(3)),
             ("unknown", affected(vec![Some(-2)]), Some(3), None),
             (
-                "uncompressed",
+                "one row per set",
                 affected(vec![Some(1), Some(2), Some(3)]),
                 None,
                 Some(6),

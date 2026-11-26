@@ -696,8 +696,8 @@ KernelStatusCode kernel_statement_set_sql(kernel_statement_t* stmt, const char* 
  * kernel_statement_set_sql clears all snapshots. Execute retains them.
  * num_modified_rows reports the aggregate affected count, or -1 if unavailable.
  *
- * Count-reader errors are non-retryable because the batch may already have
- * committed. */
+ * Errors reading the batch's affected-row count are non-retryable because
+ * the rows may already be committed. */
 KernelStatusCode kernel_statement_add_parameter_set(kernel_statement_t* stmt);
 
 /* Typed positional parameter binding (1-based ordinal); the kernel infers the
@@ -723,10 +723,10 @@ KernelStatusCode kernel_statement_bind_string(kernel_statement_t* stmt, size_t o
  *
  * Lifecycle: raw binds ACCUMULATE (each call appends a marker in push order);
  * they carry no ordinal to overwrite by. kernel_statement_add_parameter_set
- * snapshots and clears current binds. kernel_statement_set_sql clears ALL scalar
- * binds and parameter sets. kernel_statement_execute
- * does NOT clear them, so a host reusing one statement handle across queries must
- * call set_sql before re-binding, or the prior query's markers persist and the
+ * snapshots and clears current binds. kernel_statement_set_sql clears ALL
+ * scalar binds and parameter sets. kernel_statement_execute does NOT clear
+ * them, so a host reusing one statement handle across queries must call
+ * set_sql before re-binding, or the prior query's markers persist and the
  * server sees the wrong parameter count.
  *
  * Two mutual-exclusion rules hold within each scalar parameter set, enforced at
