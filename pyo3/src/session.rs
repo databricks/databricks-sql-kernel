@@ -207,6 +207,7 @@ fn build_http_config(
     http.sea_response_compression_enabled = sea_response_compression_enabled;
     if let Some(timeout) = request_timeout {
         http.request_timeout = timeout;
+        http.storage_read_timeout = Some(timeout);
     }
     if let Some(max) = max_connections {
         http.pool_max_idle_per_host = max;
@@ -317,11 +318,15 @@ impl Session {
     /// CloudFetch requests; token-endpoint (auth) calls keep a fixed
     /// fast-fail policy.
     ///
-    /// `request_timeout_secs` sets the total timeout for one HTTP request,
+    /// `request_timeout_secs` sets the total timeout for one SQL HTTP request,
     /// from connection start through response-body completion. A separate
     /// 30-second connection timeout also applies, so connection establishment
     /// is bounded by the shorter limit. Unset or `0` keeps the kernel default
     /// (120 seconds).
+    /// For Volume file transfers a positive value is an idle limit instead:
+    /// a transfer fails after that long without progress, except a PUT
+    /// that storage redirects, which is resent without the limit.
+    /// Unset or `0` sets no Volume idle limit.
     ///
     /// `max_connections` sets the maximum idle connections retained per host.
     /// Unset keeps the kernel default (100); zero is rejected.
@@ -869,6 +874,10 @@ mod send_sync_tests {
             .unwrap()
             .expect("positive request timeout should build an HTTP config");
         assert_eq!(http.request_timeout, std::time::Duration::from_millis(500));
+        assert_eq!(
+            http.storage_read_timeout,
+            Some(std::time::Duration::from_millis(500))
+        );
         assert_eq!(http.retry_min_wait, default.retry_min_wait);
         assert_eq!(http.overall_timeout, default.overall_timeout);
 

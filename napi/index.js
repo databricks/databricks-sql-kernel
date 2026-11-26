@@ -310,7 +310,7 @@ if (!nativeBinding) {
   throw new Error(`Failed to load native binding`)
 }
 
-const { AsyncStatement, AsyncResultHandle, CancellableExecution, Connection, AuthMode, openSession, initKernelLogging, kernelLoggingStats, setKernelLogLevel, Statement, version } = nativeBinding
+const { AsyncStatement, AsyncResultHandle, CancellableExecution, Connection, AuthMode, openSession, initKernelLogging, kernelLoggingStats, setKernelLogLevel, Statement, VolumeCompletion, version } = nativeBinding
 
 module.exports.AsyncStatement = AsyncStatement
 module.exports.AsyncResultHandle = AsyncResultHandle
@@ -323,3 +323,4 @@ module.exports.kernelLoggingStats = kernelLoggingStats
 module.exports.setKernelLogLevel = setKernelLogLevel
 module.exports.Statement = Statement
 module.exports.version = version
+module.exports.VolumeCompletion = VolumeCompletion

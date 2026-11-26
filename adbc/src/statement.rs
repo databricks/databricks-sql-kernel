@@ -32,6 +32,7 @@ use crate::error::{adbc_error, map_kernel_error, option_not_found, unsupported};
 use crate::reader::{AsyncKernelReader, BoundRows, KernelReader, SequenceReader, SlicingReader};
 use crate::runtime::{RuntimeExt as _, RuntimeHandle};
 
+const STAGING_ALLOWED_PATHS_OPTION: &str = "adbc.databricks.statement.staging_allowed_local_paths";
 const PARAMETER_STYLE_OPTION: &str = "adbc.databricks.statement.parameter_style";
 const QUERY_TAGS_OPTION: &str = "adbc.databricks.statement.query_tags";
 const CLIENT_TIMEOUT_OPTION: &str = "adbc.databricks.statement.client_timeout_ms";
@@ -84,6 +85,7 @@ pub struct Statement {
     cancellation_notify: Arc<Notify>,
     connection_cancellation: Arc<CancellationRegistry>,
     metadata_options: MetadataCommandOptions,
+    volume_options: Option<kernel::VolumeOptions>,
 }
 
 #[derive(Debug, Default)]
@@ -161,11 +163,16 @@ impl SubmittedStatement<'_> {
             .executed
             .take()
             .ok_or_else(|| adbc_error("submitted statement was consumed", Status::InvalidState))?;
-        let stream = self
+        let mut stream = self
             .statement
             .runtime
             .block_on_safe(executed.await_result())
             .map_err(map_kernel_error)?;
+        complete_volume(
+            &self.statement.runtime,
+            &mut stream,
+            self.statement.volume_options.as_ref(),
+        )?;
         let reader: Box<dyn RecordBatchReader + Send> = Box::new(AsyncKernelReader::new(
             Arc::clone(&self.statement.runtime),
             executed,
@@ -188,11 +195,16 @@ impl SubmittedStatement<'_> {
             .executed
             .take()
             .ok_or_else(|| adbc_error("submitted statement was consumed", Status::InvalidState))?;
-        let stream = self
+        let mut stream = self
             .statement
             .runtime
             .block_on_safe(executed.fetch_result())
             .map_err(map_kernel_error)?;
+        complete_volume(
+            &self.statement.runtime,
+            &mut stream,
+            self.statement.volume_options.as_ref(),
+        )?;
         let reader: Box<dyn RecordBatchReader + Send> = Box::new(AsyncKernelReader::new(
             Arc::clone(&self.statement.runtime),
             executed,
@@ -234,6 +246,7 @@ pub struct StatementCancellationHandle {
 
 impl StatementCancellationHandle {
     pub fn cancel(&self) -> Result<()> {
+        self.canceller.cancel_volume_operation();
         if self.current_cancellation.load(Ordering::Acquire) {
             return Ok(());
         }
@@ -335,6 +348,7 @@ impl Statement {
             canceller,
             runtime,
             binding: None,
+            volume_options: None,
             parameter_style: ParameterStyle::default(),
             prepared: false,
             client_timeout: None,
@@ -392,10 +406,17 @@ impl Statement {
             )),
         };
         self.blocking_execute.store(false, Ordering::Release);
-        match result {
-            Some(result) => result.map_err(map_kernel_error),
-            None => Err(adbc_error("operation was cancelled", Status::Cancelled)),
-        }
+        drop(inner);
+        let mut executed = match result {
+            Some(result) => result.map_err(map_kernel_error)?,
+            None => return Err(adbc_error("operation was cancelled", Status::Cancelled)),
+        };
+        complete_volume(
+            &self.runtime,
+            executed.result_stream_mut(),
+            self.volume_options.as_ref(),
+        )?;
+        Ok(executed)
     }
 
     fn execute_async_inner(
@@ -444,7 +465,9 @@ impl Statement {
             None => Err(adbc_error("operation was cancelled", Status::Cancelled)),
         };
         self.blocking_execute.store(false, Ordering::Release);
-        result
+        let (executed, mut stream) = result?;
+        complete_volume(&self.runtime, &mut stream, self.volume_options.as_ref())?;
+        Ok((executed, stream))
     }
 
     fn invalidate_results(&self) {
@@ -470,6 +493,19 @@ impl Statement {
             return Ok(());
         }
         match key {
+            STAGING_ALLOWED_PATHS_OPTION => {
+                let text = expect_string(value, key)?;
+                let roots: Option<Vec<String>> = serde_json::from_str(&text).map_err(|_| {
+                    adbc_error(
+                        format!("{key} expects a JSON array of strings or null"),
+                        Status::InvalidArguments,
+                    )
+                })?;
+                self.volume_options = roots.map(|roots| {
+                    kernel::VolumeOptions::new(roots.into_iter().map(Into::into).collect(), true)
+                });
+                Ok(())
+            }
             ENABLE_DIRECT_RESULTS_OPTION => {
                 self.enable_direct_results = expect_bool_string(value, key)?;
                 Ok(())
@@ -584,6 +620,14 @@ impl Statement {
 
     fn get_other_string(&self, key: &str) -> Result<String> {
         match key {
+            STAGING_ALLOWED_PATHS_OPTION => self
+                .volume_options
+                .as_ref()
+                .map(|options| {
+                    serde_json::to_string(&options.allowed_paths)
+                        .expect("paths serialize as strings")
+                })
+                .ok_or_else(|| option_not_found("statement string", key)),
             ENABLE_DIRECT_RESULTS_OPTION => Ok(self.enable_direct_results.to_string()),
             IS_METADATA_COMMAND_OPTION => Ok(self.metadata_options.enabled.to_string()),
             METADATA_CATALOG_OPTION => metadata_string_option(
@@ -825,6 +869,7 @@ impl adbc_core::Statement for Statement {
             &row,
             self.parameter_style,
             self.client_timeout,
+            self.volume_options.as_ref(),
         )?;
         let expected_generation = self.generation.load(Ordering::Acquire);
         let reader: Box<dyn RecordBatchReader + Send> = Box::new(SequenceReader::new(
@@ -835,6 +880,7 @@ impl adbc_core::Statement for Statement {
             base_spec,
             self.parameter_style,
             self.client_timeout,
+            self.volume_options.clone(),
             rows,
             executed,
             connection_operation,
@@ -888,6 +934,7 @@ impl adbc_core::Statement for Statement {
                 &row,
                 self.parameter_style,
                 self.client_timeout,
+                self.volume_options.as_ref(),
             ) {
                 Ok(executed) => executed,
                 Err(mut error) => {
@@ -1123,6 +1170,7 @@ pub(crate) fn execute_bound_row(
     row: &RecordBatch,
     style: ParameterStyle,
     client_timeout: Option<Duration>,
+    volume_options: Option<&kernel::VolumeOptions>,
 ) -> Result<kernel::ExecutedStatement> {
     let parameters = convert_binding(row, style)?;
     let mut inner = inner
@@ -1164,11 +1212,33 @@ pub(crate) fn execute_bound_row(
             .spec()
             .param_raw(parameter.name, parameter.param_type, parameter.value);
     }
-    match client_timeout {
+    let mut executed = match client_timeout {
         Some(timeout) => runtime.block_on_safe(inner.execute_with_timeout(timeout)),
         None => runtime.block_on_safe(inner.execute()),
     }
-    .map_err(map_kernel_error)
+    .map_err(map_kernel_error)?;
+    drop(inner);
+    complete_volume(runtime, executed.result_stream_mut(), volume_options)?;
+    Ok(executed)
+}
+
+fn complete_volume(
+    runtime: &RuntimeHandle,
+    stream: &mut kernel::ResultStream,
+    options: Option<&kernel::VolumeOptions>,
+) -> Result<()> {
+    let Some(options) = options else {
+        return Ok(());
+    };
+    match runtime
+        .block_on_safe(stream.complete_volume_operation(options, None))
+        .map_err(map_kernel_error)?
+    {
+        kernel::VolumeCompletion::NeedsInputStream => {
+            Err(unsupported("Volume PUT with input streams"))
+        }
+        kernel::VolumeCompletion::Completed | kernel::VolumeCompletion::NotVolume => Ok(()),
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1459,8 +1529,186 @@ fn parse_client_timeout_option(key: &str, value: OptionValue) -> Option<Result<O
 #[cfg(test)]
 mod tests {
     use super::*;
+    use adbc_core::{Optionable as _, Statement as _};
     use arrow_array::{BinaryArray, Int64Array, LargeBinaryArray, StringArray};
+    use arrow_ipc::writer::StreamWriter;
     use arrow_schema::{DataType, Field};
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use serde_json::json;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn volume_option_controls_completion_on_all_execution_paths_and_preserves_rows() {
+        let runtime = RuntimeHandle::create().unwrap();
+        let server = runtime.block_on_safe(MockServer::start());
+        let names = ["operation", "presignedUrl", "headers", "localFile"];
+        let schema = Arc::new(Schema::new(
+            names
+                .map(|name| Field::new(name, DataType::Utf8, false))
+                .to_vec(),
+        ));
+        let values = [
+            "REMOVE".to_owned(),
+            format!("{}/object", server.uri()),
+            "{}".into(),
+            "".into(),
+        ];
+        let instruction = RecordBatch::try_new(
+            schema.clone(),
+            values
+                .iter()
+                .map(|value| Arc::new(StringArray::from(vec![value.as_str()])) as _)
+                .collect(),
+        )
+        .unwrap();
+        let mut ipc = Vec::new();
+        {
+            let mut writer = StreamWriter::try_new(&mut ipc, &schema).unwrap();
+            writer.write(&instruction).unwrap();
+            writer.finish().unwrap();
+        }
+        let response = json!({
+            "statement_id":"volume", "status":{"state":"CLOSED"},
+            "manifest":{"format":"ARROW_STREAM", "is_volume_operation":true, "total_row_count":1,"total_chunk_count":1,
+                "schema":{"column_count":4,"columns":names.iter().enumerate().map(|(i,name)| json!({"name":name,"type_name":"STRING","type_text":"STRING","position":i})).collect::<Vec<_>>()}},
+            "result":{"chunk_index":0,"row_offset":0,"row_count":1,"attachment":STANDARD.encode(&ipc)}
+        });
+        runtime.block_on_safe(async {
+            for verb in ["POST", "GET"] {
+                Mock::given(method(verb))
+                    .and(path(if verb == "POST" {
+                        "/api/2.0/sql/statements"
+                    } else {
+                        "/api/2.0/sql/statements/volume"
+                    }))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(response.clone()))
+                    .mount(&server)
+                    .await;
+            }
+            Mock::given(method("POST"))
+                .and(path("/api/2.0/sql/warehouses/wh/sessions"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(json!({"session_id":"session"})),
+                )
+                .mount(&server)
+                .await;
+            Mock::given(method("DELETE"))
+                .respond_with(ResponseTemplate::new(200))
+                .mount(&server)
+                .await;
+            Mock::given(method("DELETE"))
+                .and(path("/object"))
+                .respond_with(ResponseTemplate::new(404))
+                .with_priority(1)
+                .expect(7)
+                .mount(&server)
+                .await;
+        });
+        let session = runtime
+            .block_on_safe(
+                kernel::Session::builder()
+                    .http_path(server.uri(), "/sql/1.0/warehouses/wh")
+                    .auth(kernel::AuthConfig::Pat {
+                        token: "test-token".into(),
+                        identity_federation_client_id: None,
+                    })
+                    .open(),
+            )
+            .unwrap();
+        let mut statement = Statement::new(
+            session.statement(),
+            session.metadata(),
+            Arc::clone(&runtime),
+            Arc::new(CancellationRegistry::default()),
+            false,
+        );
+        let key = OptionStatement::Other(STAGING_ALLOWED_PATHS_OPTION.into());
+        assert_eq!(
+            statement.get_option_string(key.clone()).unwrap_err().status,
+            Status::NotFound
+        );
+        for value in [OptionValue::Int(1), OptionValue::String("[1]".into())] {
+            assert_eq!(
+                statement.set_option(key.clone(), value).unwrap_err().status,
+                Status::InvalidArguments
+            );
+        }
+        statement.set_option(key.clone(), "[]".into()).unwrap();
+        statement.set_sql_query("SELECT 1").unwrap();
+        assert_eq!(statement.get_option_string(key.clone()).unwrap(), "[]");
+        statement.set_option(key.clone(), "null".into()).unwrap();
+        assert_eq!(
+            statement.get_option_string(key.clone()).unwrap_err().status,
+            Status::NotFound
+        );
+        statement.set_option(key.clone(), "[]".into()).unwrap();
+        let mut transfers = 0;
+        for mode in ["raw", "sync", "async", "await", "fetch", "bound", "update"] {
+            let mut statement = Statement::new(
+                session.statement(),
+                session.metadata(),
+                Arc::clone(&runtime),
+                Arc::new(CancellationRegistry::default()),
+                false,
+            );
+            statement.set_sql_query("operation ?, ?").unwrap();
+            if mode != "raw" {
+                statement.set_option(key.clone(), "[]".into()).unwrap();
+            }
+            if mode == "async" {
+                statement
+                    .set_option(
+                        OptionStatement::Other(ENABLE_DIRECT_RESULTS_OPTION.into()),
+                        "false".into(),
+                    )
+                    .unwrap();
+            }
+            if mode == "bound" {
+                statement.bind(batch(2)).unwrap();
+            }
+            let reader = match mode {
+                "await" => statement.submit().unwrap().await_result().unwrap(),
+                "fetch" => statement.submit().unwrap().fetch_result().unwrap(),
+                "update" => {
+                    assert_eq!(statement.execute_update().unwrap(), None);
+                    transfers += 1;
+                    continue;
+                }
+                _ => statement.execute().unwrap(),
+            };
+            let batches = reader.collect::<std::result::Result<Vec<_>, _>>().unwrap();
+            assert_eq!(batches.len(), if mode == "bound" { 2 } else { 1 }, "{mode}");
+            for batch in batches {
+                assert_eq!(
+                    batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .unwrap()
+                        .value(0),
+                    "REMOVE"
+                );
+            }
+            transfers += match mode {
+                "raw" => 0,
+                "bound" => 2,
+                _ => 1,
+            };
+            assert_eq!(
+                runtime
+                    .block_on_safe(server.received_requests())
+                    .unwrap()
+                    .iter()
+                    .filter(|request| request.url.path() == "/object")
+                    .count(),
+                transfers,
+                "{mode}"
+            );
+        }
+        assert_eq!(transfers, 7);
+        runtime.block_on_safe(session.close()).unwrap();
+    }
 
     fn batch(rows: usize) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![

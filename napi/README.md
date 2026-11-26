@@ -7,6 +7,13 @@ the umbrella loader that re-exports the per-platform native packages.
 The binding itself lives under `src/`; its public TypeScript surface is
 declared in `index.d.ts`.
 
+`Statement` and `AsyncResultHandle` expose `isVolumeOperation` and
+`completeVolumeOperation(allowedPaths, removeNotFoundIsSuccess)`, which runs
+the file transfer for a Volume `PUT`, `GET` or `REMOVE`. It returns
+`not_volume`, `needs_input_stream` or `completed`, and the result rows stay
+readable. Local paths, and the files they resolve to through symlinks, must be
+inside `allowedPaths`. The Node binding cannot upload from a stream.
+
 ---
 
 ## Building

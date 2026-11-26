@@ -84,6 +84,7 @@ fn databricks_sql_kernel(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<executed_async::AsyncStatementReader>()?;
     m.add_class::<metadata::Metadata>()?;
     m.add_class::<result_stream::ResultStream>()?;
+    m.add_class::<result_stream::VolumeCompletion>()?;
     m.add_function(wrap_pyfunction!(init_logging, m)?)?;
     m.add_function(wrap_pyfunction!(reset_logging, m)?)?;
 

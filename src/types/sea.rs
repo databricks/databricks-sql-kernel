@@ -184,6 +184,8 @@ pub struct ServiceError {
 /// Manifest describing the result set structure.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ResultManifest {
+    #[serde(default)]
+    pub is_volume_operation: bool,
     pub format: String,
     pub schema: ResultSchema,
     /// Physical Arrow schema carried by SEA as a schema-only IPC stream.

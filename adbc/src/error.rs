@@ -60,6 +60,20 @@ pub(crate) fn map_kernel_error(source: kernel::Error) -> Error {
     mapped.details = source
         .error_code
         .map(|code| vec![("databricks.error_code".to_string(), code.into_bytes())]);
+    if let Some(local) = source.local_error {
+        let details = mapped.details.get_or_insert_default();
+        details.push((
+            "databricks.local_error_kind".into(),
+            format!("{:?}", local.kind).into_bytes(),
+        ));
+        details.push(("databricks.local_path".into(), local.path.into_bytes()));
+        if let Some(errno) = local.raw_os_error {
+            details.push((
+                "databricks.local_os_error".into(),
+                errno.to_string().into_bytes(),
+            ));
+        }
+    }
     mapped
 }
 
@@ -101,7 +115,12 @@ mod tests {
             kernel::Error::sql_error()
                 .message("bad query")
                 .with_sql_state("42000")
-                .with_vendor_code(42),
+                .with_vendor_code(42)
+                .with_local_error(kernel::LocalFileError::new(
+                    Some(2),
+                    std::io::ErrorKind::NotFound,
+                    "/allowed/missing",
+                )),
         );
         assert_eq!(mapped.status, Status::InvalidData);
         assert_eq!(mapped.vendor_code, 42);
@@ -109,6 +128,10 @@ mod tests {
             mapped.sqlstate,
             (*b"42000").map(|byte| byte as std::ffi::c_char)
         );
+        assert!(mapped
+            .details
+            .unwrap()
+            .contains(&("databricks.local_path".into(), b"/allowed/missing".to_vec())));
     }
 
     #[test]

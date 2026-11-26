@@ -755,7 +755,13 @@ pub struct HttpConfig {
     /// Total timeout for one HTTP request, from connection start through
     /// response-body completion. A separate 30-second connection timeout also
     /// applies, so connection establishment is bounded by the shorter limit.
+    /// Does not apply to Volume file transfers; see the storage read timeout.
     pub request_timeout: Duration,
+
+    /// Idle limit for Volume file transfers: a transfer fails after this long
+    /// without progress. Also caps connection setup. None sets no limit.
+    /// Exception: a PUT that storage redirects is resent without this limit.
+    pub storage_read_timeout: Option<Duration>,
 
     /// Maximum total time across retries for a single logical RPC.
     /// Retrying stops once cumulative elapsed time exceeds this.
@@ -836,6 +842,7 @@ impl Default for HttpConfig {
         Self {
             sea_response_compression_enabled: false,
             request_timeout: Duration::from_secs(120),
+            storage_read_timeout: None,
             overall_timeout: Duration::from_secs(900),
             pool_max_idle_per_host: 100,
             // Mirror `RetryConfig::default()` so a stock `HttpConfig`

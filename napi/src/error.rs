@@ -143,6 +143,16 @@ pub(crate) fn napi_err_from_kernel(e: KernelError) -> NapiError {
     if let Some(qid) = e.query_id {
         obj.insert("queryId".to_owned(), Value::from(qid));
     }
+    if let Some(local) = e.local_error {
+        if let Some(errno) = local.raw_os_error {
+            obj.insert("localOsError".to_owned(), Value::from(errno));
+        }
+        obj.insert(
+            "localErrorKind".to_owned(),
+            Value::from(format!("{:?}", local.kind)),
+        );
+        obj.insert("localPath".to_owned(), Value::from(local.path));
+    }
     // Thrift-parity extended status fields: surfaced on the napi
     // envelope so a JS caller's catch-block sees the same fields the
     // Thrift driver's `TGetOperationStatusResp` exposes. Only
@@ -195,6 +205,24 @@ fn error_code_str(code: ErrorCode) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_error_metadata_is_optional_and_preserved() {
+        let mut error = KernelError::not_found().message("missing local file");
+        error.local_error = Some(Box::new(databricks_sql_kernel::LocalFileError::new(
+            Some(2),
+            std::io::ErrorKind::NotFound,
+            "local-file",
+        )));
+        let encoded = napi_err_from_kernel(error);
+        let value: Value = serde_json::from_str(&encoded.reason[ERROR_SENTINEL.len()..]).unwrap();
+        assert_eq!(value["localOsError"], 2);
+        assert_eq!(value["localErrorKind"], "NotFound");
+        assert_eq!(value["localPath"], "local-file");
+        let encoded = napi_err_from_kernel(KernelError::internal());
+        let value: Value = serde_json::from_str(&encoded.reason[ERROR_SENTINEL.len()..]).unwrap();
+        assert!(value.get("localErrorKind").is_none());
+    }
 
     #[test]
     fn envelope_carries_sentinel_and_code() {

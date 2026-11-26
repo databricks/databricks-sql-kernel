@@ -14,11 +14,19 @@ layout, or npm publishing. Pure-kernel changes go in the root
 
 ### Added
 
+- `Statement` and `AsyncResultHandle` gain `isVolumeOperation` and
+  `completeVolumeOperation` for Volume `PUT`, `GET` and `REMOVE`. Local file
+  errors carry `localOsError`, `localErrorKind` and `localPath`.
+
 ### Changed
 
 ### Updated
 
 ### Fixed
+
+- `AsyncStatement.close()` also releases a result stream that an in-flight
+  fetch holds, once that operation finishes; later fetches return
+  `InvalidStatementHandle`. `close()` still does not wait for it.
 
 ---
 *Note: When making changes, please add your change under the appropriate

@@ -11,7 +11,16 @@ changes go in their respective binding's NEXT_CHANGELOG.
 
 ### Added
 
+- Volume `PUT`, `GET` and `REMOVE`: `ResultStream::complete_volume_operation`
+  runs the file transfer. Local paths, and the files they resolve to through
+  symlinks, must be inside the caller's allowed directories. A `PUT` can also
+  upload bytes the caller supplies.
+
 ### Changed
+
+- Adds public fields to `Error` and `ResultManifest`. Code that builds these
+  structs with struct literals must be updated. Supported consumers are the PyO3,
+  NAPI, C ABI and ADBC bindings.
 
 ### Updated
 

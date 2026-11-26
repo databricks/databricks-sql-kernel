@@ -54,8 +54,71 @@ impl ResultStream {
     }
 }
 
+#[pyclass(eq, skip_from_py_object)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VolumeCompletion {
+    NotVolume,
+    NeedsInputStream,
+    Completed,
+}
+
+impl From<databricks_sql_kernel::VolumeCompletion> for VolumeCompletion {
+    fn from(value: databricks_sql_kernel::VolumeCompletion) -> Self {
+        match value {
+            databricks_sql_kernel::VolumeCompletion::NotVolume => Self::NotVolume,
+            databricks_sql_kernel::VolumeCompletion::NeedsInputStream => Self::NeedsInputStream,
+            databricks_sql_kernel::VolumeCompletion::Completed => Self::Completed,
+        }
+    }
+}
+
+pub(crate) fn complete_volume(
+    py: Python<'_>,
+    runtime: &Arc<KernelRuntime>,
+    stream: &mut KResultStream,
+    allowed_paths: Vec<String>,
+    remove_not_found_is_success: bool,
+    input_bytes: Option<Vec<u8>>,
+) -> PyResult<VolumeCompletion> {
+    let options = databricks_sql_kernel::VolumeOptions::new(
+        allowed_paths.into_iter().map(Into::into).collect(),
+        remove_not_found_is_success,
+    );
+    Ok(run_kernel_interruptible!(
+        py,
+        runtime,
+        stream.complete_volume_operation(&options, input_bytes)
+    )?
+    .into())
+}
+
 #[pymethods]
 impl ResultStream {
+    #[getter]
+    fn is_volume_operation(&self) -> PyResult<bool> {
+        let inner = alive!(self, "ResultStream");
+        Ok(inner.stream.is_volume_operation())
+    }
+
+    #[pyo3(signature = (allowed_paths, remove_not_found_is_success, input_bytes=None))]
+    fn complete_volume_operation(
+        &mut self,
+        py: Python<'_>,
+        allowed_paths: Vec<String>,
+        remove_not_found_is_success: bool,
+        input_bytes: Option<Vec<u8>>,
+    ) -> PyResult<crate::result_stream::VolumeCompletion> {
+        let inner = alive_mut!(self, "ResultStream");
+        complete_volume(
+            py,
+            &inner.runtime,
+            &mut inner.stream,
+            allowed_paths,
+            remove_not_found_is_success,
+            input_bytes,
+        )
+    }
+
     /// Result schema as a `pyarrow.Schema`. Available even after `close()`.
     fn arrow_schema<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         self.schema.as_ref().to_pyarrow(py)

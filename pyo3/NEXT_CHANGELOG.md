@@ -13,6 +13,11 @@ changes go in the root `NEXT_CHANGELOG.md`.
 
 ### Added
 
+- `ExecutedStatement` and `ResultStream` expose `is_volume_operation` and
+  `complete_volume_operation` for Volume `PUT`, `GET` and `REMOVE`, including
+  uploads from `input_bytes`. Local file errors carry `local_os_error` and
+  `local_path`.
+
 ### Changed
 
 ### Updated

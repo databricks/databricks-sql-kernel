@@ -1472,6 +1472,7 @@ mod tests {
 
     fn make_manifest(columns: Vec<ColumnInfo>) -> ResultManifest {
         ResultManifest {
+            is_volume_operation: false,
             format: "ARROW_STREAM".to_string(),
             schema: ResultSchema {
                 column_count: columns.len() as i32,
@@ -2149,6 +2150,7 @@ mod tests {
 
     fn minimal_manifest(total_chunk_count: Option<i64>) -> ResultManifest {
         ResultManifest {
+            is_volume_operation: false,
             format: "ARROW_STREAM".to_string(),
             schema: ResultSchema {
                 column_count: 0,

@@ -142,6 +142,11 @@ Project URL: https://github.com/serde-rs/json
 Copyright: Copyright serde_json Authors.
 
 
+Package: tempfile
+Project URL: https://github.com/Stebalien/tempfile
+Copyright: Copyright (c) 2015 Steven Allen
+
+
 Package: thiserror
 Project URL: https://github.com/dtolnay/thiserror
 Copyright: Copyright thiserror Authors.

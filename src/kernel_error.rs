@@ -41,12 +41,10 @@
 //!   Aborted, Unimplemented, …) lands in a follow-on PR. External
 //!   `match` arms get a forced `_ =>` fallback — they keep compiling
 //!   when the enum grows.
-//! - `Error` **is not** `#[non_exhaustive]`: wrappers want to
-//!   pattern-match (`let Error { code, message, sql_state, .. }`) for
-//!   logging and host-language exception mapping. New fields go
-//!   through `Error::new(...).with_*(...)`, so adding a field is
-//!   non-breaking without the marker. Keeping the marker would block
-//!   useful pattern-matches for no real benefit.
+//! - `Error` **is not** `#[non_exhaustive]`, so wrappers can pattern-match
+//!   (`let Error { code, message, sql_state, .. }`). Build it with
+//!   `Error::new(...).with_*(...)`: a struct literal stops compiling when a
+//!   field is added.
 
 #![allow(dead_code)]
 
@@ -169,9 +167,6 @@ impl ErrorCode {
 /// chain `with_*` setters. **Pattern-matching is supported** —
 /// wrappers writing a comprehensive logger or host-language exception
 /// adapter can do `let Error { code, message, sql_state, .. } = err;`.
-/// New fields land through additive setters, so the type does not
-/// need `#[non_exhaustive]` (and the marker would block the
-/// pattern-matching wrappers actually want).
 #[derive(Debug, Clone)]
 pub struct Error {
     pub code: ErrorCode,
@@ -180,8 +175,8 @@ pub struct Error {
     /// 5-character SQLSTATE if the server returned one.
     pub sql_state: Option<String>,
 
-    /// Databricks-specific error identifier from the SEA
-    /// `ServiceError.error_code` envelope — a stable string slug like
+    /// Stable error identifier from the kernel or the SEA
+    /// `ServiceError.error_code` envelope, such as
     /// `STATEMENT_NOT_FOUND` or `WAREHOUSE_STOPPED` that wrappers can
     /// branch on to map to host-language exceptions (PySQL's
     /// `OperationalError` taxonomy, JDBC's `SQLException` subclasses).
@@ -248,6 +243,32 @@ pub struct Error {
 
     /// Underlying cause. Boxed to keep the struct stack-friendly.
     pub cause: Option<Box<Error>>,
+
+    /// Original local filesystem failure, for host-language OS error mapping.
+    pub local_error: Option<Box<LocalFileError>>,
+}
+
+/// The OS error behind a failed local file operation.
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct LocalFileError {
+    pub raw_os_error: Option<i32>,
+    pub kind: std::io::ErrorKind,
+    pub path: String,
+}
+
+impl LocalFileError {
+    pub fn new(
+        raw_os_error: Option<i32>,
+        kind: std::io::ErrorKind,
+        path: impl Into<String>,
+    ) -> Self {
+        Self {
+            raw_os_error,
+            kind,
+            path: path.into(),
+        }
+    }
 }
 
 impl Error {
@@ -270,6 +291,7 @@ impl Error {
             diagnostic_info: None,
             error_details_json: None,
             cause: None,
+            local_error: None,
         }
     }
 
@@ -439,6 +461,11 @@ impl Error {
     /// (e.g. `STATEMENT_NOT_FOUND`, `WAREHOUSE_STOPPED`).
     pub fn with_error_code(mut self, error_code: impl Into<String>) -> Self {
         self.error_code = Some(error_code.into());
+        self
+    }
+
+    pub fn with_local_error(mut self, local_error: LocalFileError) -> Self {
+        self.local_error = Some(Box::new(local_error));
         self
     }
 

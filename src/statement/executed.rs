@@ -189,6 +189,7 @@ impl ExecutedStatement {
     }
 
     async fn close_server_statement(&self) -> Result<()> {
+        self.result_stream.cancel_volume();
         // Idempotent on success: a prior successful close sets
         // `closed=true` and subsequent calls short-circuit.
         //
@@ -348,6 +349,7 @@ impl ExecutedStatementHandle for ExecutedStatement {
     }
 
     async fn cancel(&self) -> Result<()> {
+        self.result_stream.cancel_volume();
         // Local validity short-circuits a wire call against an
         // already-closed/superseded handle. `instrument` (rather
         // than `.entered()`) so the future stays `Send` per the
@@ -370,6 +372,7 @@ impl ExecutedStatementHandle for ExecutedStatement {
 
 impl Drop for ExecutedStatement {
     fn drop(&mut self) {
+        self.result_stream.cancel_volume();
         // Backstop for the not-fully-drained case (partial fetch /
         // abandoned result / early error): if the stream was drained,
         // `next_batch`'s auto-close already fired and flipped `closed`,

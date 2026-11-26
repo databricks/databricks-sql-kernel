@@ -322,6 +322,31 @@ impl ExecutedStatement {
 #[pymethods]
 impl ExecutedStatement {
     #[getter]
+    fn is_volume_operation(&self) -> PyResult<bool> {
+        let inner = alive!(self, "ExecutedStatement");
+        Ok(inner.exec.result_stream().is_volume_operation())
+    }
+
+    #[pyo3(signature = (allowed_paths, remove_not_found_is_success, input_bytes=None))]
+    fn complete_volume_operation(
+        &mut self,
+        py: Python<'_>,
+        allowed_paths: Vec<String>,
+        remove_not_found_is_success: bool,
+        input_bytes: Option<Vec<u8>>,
+    ) -> PyResult<crate::result_stream::VolumeCompletion> {
+        let inner = alive_mut!(self, "ExecutedStatement");
+        crate::result_stream::complete_volume(
+            py,
+            &inner.runtime,
+            inner.exec.result_stream_mut(),
+            allowed_paths,
+            remove_not_found_is_success,
+            input_bytes,
+        )
+    }
+
+    #[getter]
     fn statement_id(&self) -> &str {
         &self.statement_id
     }

@@ -60,7 +60,7 @@ use tokio::sync::Mutex;
 use arrow_schema::SchemaRef;
 use databricks_sql_kernel::{
     AsyncStatementCanceller, Error as KernelError, ExecutedAsyncStatement, ExecutedStatementHandle,
-    ResultBatch, ResultStream, Statement as KernelStatement,
+    ResultBatch, ResultStream, Statement as KernelStatement, VolumeOptions,
 };
 
 use crate::error::napi_err_from_kernel;
@@ -320,6 +320,7 @@ impl AsyncStatement {
                 .map_err(napi_err_from_kernel)?;
             let statement_id = inner_state.executed_async.statement_id().to_owned();
             let schema = stream.schema();
+            let is_volume_operation = stream.is_volume_operation();
             let stream = Arc::new(Mutex::new(Some(stream)));
             // Registered while `inner` is held, so a queued `close()` sees it.
             results
@@ -330,6 +331,7 @@ impl AsyncStatement {
                 inner: stream,
                 schema,
                 statement_id,
+                is_volume_operation,
             })
         })
         .await
@@ -374,11 +376,18 @@ impl AsyncStatement {
     /// re-attempting the wire call. The kernel's own `Drop`
     /// fire-and-forget retry runs once in the background.
     ///
-    /// Also invalidates the handles `awaitResult()` returned: their
-    /// `fetchNextBatch()` then rejects with `InvalidStatementHandle`,
-    /// unless a fetch was in progress when `close()` ran.
+    /// Also invalidates the handles `awaitResult()` returned. An operation
+    /// already in flight may finish before its handle is cleared.
     #[napi]
     pub async fn close(&self) -> napi::Result<()> {
+        if let Some(canceller) = self
+            .canceller
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+        {
+            canceller.cancel_volume_operation();
+        }
         let inner = Arc::clone(&self.inner);
         let closed = Arc::clone(&self.closed);
         let canceller = Arc::clone(&self.canceller);
@@ -400,7 +409,8 @@ impl AsyncStatement {
                 .map_err(napi_err_from_kernel);
             // Release what holds the session, so JS references to closed
             // handles don't keep it (and the host's telemetry client) alive.
-            // A stream held by an in-flight fetch is left; close doesn't wait.
+            // A slot in use is cleared in the background, so close() does not wait
+            // for the running call.
             canceller
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -410,6 +420,11 @@ impl AsyncStatement {
             for slot in slots.iter().filter_map(Weak::upgrade) {
                 if let Ok(mut stream) = slot.try_lock() {
                     stream.take();
+                } else {
+                    let slot = Arc::clone(&slot);
+                    tokio::spawn(async move {
+                        slot.lock().await.take();
+                    });
                 }
             }
             outcome
@@ -420,6 +435,14 @@ impl AsyncStatement {
 
 impl Drop for AsyncStatement {
     fn drop(&mut self) {
+        if let Some(canceller) = self
+            .canceller
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+        {
+            canceller.cancel_volume_operation();
+        }
         // Best-effort cleanup — same shape as `Connection::Drop`.
         // JS callers needing a guaranteed close-with-error-surface
         // call `close()` explicitly.
@@ -455,14 +478,48 @@ impl Drop for AsyncStatement {
 /// post-close contract.
 #[napi]
 pub struct AsyncResultHandle {
-    /// Emptied by the parent's `close()`, unless a fetch holds it then.
+    /// Emptied after parent close once any in-flight operation releases it.
     inner: Arc<ResultSlot>,
     schema: SchemaRef,
     statement_id: String,
+    is_volume_operation: bool,
 }
 
 #[napi]
 impl AsyncResultHandle {
+    #[napi(getter)]
+    pub fn is_volume_operation(&self) -> bool {
+        self.is_volume_operation
+    }
+
+    /// Runs the file transfer for a Volume PUT, GET or REMOVE result. Call before
+    /// fetching; the rows stay readable afterwards.
+    /// Keep the parent `AsyncStatement` alive until the transfer finishes; closing or
+    /// collecting it stops the transfer.
+    #[napi]
+    pub async fn complete_volume_operation(
+        &self,
+        allowed_paths: Vec<String>,
+        remove_not_found_is_success: bool,
+    ) -> napi::Result<crate::result::VolumeCompletion> {
+        let options = VolumeOptions::new(
+            allowed_paths.into_iter().map(Into::into).collect(),
+            remove_not_found_is_success,
+        );
+        let inner = Arc::clone(&self.inner);
+        guarded(async move {
+            let mut guard = inner.lock().await;
+            guard
+                .as_mut()
+                .ok_or_else(|| closed_err("AsyncResultHandle"))?
+                .complete_volume_operation(&options, None)
+                .await
+                .map(crate::result::VolumeCompletion::from)
+                .map_err(napi_err_from_kernel)
+        })
+        .await
+    }
+
     /// Server-issued statement id. Cached at construction; readable
     /// for log correlation. Matches the parent `AsyncStatement`'s
     /// `statementId`.
@@ -676,7 +733,7 @@ mod tests {
     /// their statements are closed, even while JS still references the closed
     /// handles. Otherwise the next session on the host reuses it and ignores
     /// its own telemetry settings.
-    async fn next_session_gets_its_own_telemetry_client(fetch_result: bool) {
+    async fn next_session_gets_its_own_telemetry_client(fetch_result: bool, sync_statement: bool) {
         let server = lease_server().await;
         // Batch size 1: this client exports every event at once.
         let first = telemetry_connection(&server, 1, Duration::from_millis(100)).await;
@@ -690,6 +747,16 @@ mod tests {
             None
         };
         statement.close().await.expect("close statement");
+        let sync_statement = if sync_statement {
+            let statement = first
+                .execute_statement("SELECT 1 AS n".into(), None)
+                .await
+                .expect("execute");
+            statement.close().await.expect("close sync statement");
+            Some(statement)
+        } else {
+            None
+        };
         first.close().await.expect("close first session");
 
         let second = telemetry_connection(&server, 1_000, Duration::from_secs(300)).await;
@@ -714,29 +781,30 @@ mod tests {
             assert!(err.reason.contains("AsyncResultHandle already closed"));
         }
         // Dropped only now, as JS GC would.
-        drop((statement, result));
+        drop((statement, result, sync_statement));
     }
 
     #[tokio::test]
     async fn close_releases_session_held_by_canceller() {
-        next_session_gets_its_own_telemetry_client(false).await;
+        next_session_gets_its_own_telemetry_client(false, false).await;
+        next_session_gets_its_own_telemetry_client(false, true).await;
     }
 
     #[tokio::test]
     async fn close_releases_session_held_by_result_handles() {
-        next_session_gets_its_own_telemetry_client(true).await;
+        next_session_gets_its_own_telemetry_client(true, false).await;
     }
 
     #[tokio::test]
-    async fn close_does_not_wait_for_an_in_flight_fetch() {
+    async fn close_releases_session_after_an_in_flight_result() {
         let server = lease_server().await;
-        let connection = telemetry_connection(&server, 1_000, Duration::from_secs(300)).await;
+        let connection = telemetry_connection(&server, 1, Duration::from_millis(100)).await;
         let statement = connection
             .submit_statement("SELECT 1 AS n".into(), None)
             .await
             .expect("submit");
         let result = statement.await_result().await.expect("await result");
-        // Hold the stream the way an in-flight `fetchNextBatch()` does.
+        // Both fetching and Volume completion hold the result slot throughout I/O.
         let in_flight = result.inner.lock().await;
         tokio::time::timeout(Duration::from_secs(5), statement.close())
             .await
@@ -744,6 +812,18 @@ mod tests {
             .expect("close statement");
         drop(in_flight);
         connection.close().await.expect("close session");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while result.inner.lock().await.is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("closed result must release its session after the operation finishes");
+
+        let second = telemetry_connection(&server, 1_000, Duration::from_secs(300)).await;
+        second.close().await.expect("close second session");
+        assert!(exports_for(&server, SECOND_SESSION).await > 0);
+        drop((statement, result));
     }
 
     #[tokio::test]
@@ -758,7 +838,7 @@ mod tests {
             .with_priority(1)
             .mount(&server)
             .await;
-        let connection = telemetry_connection(&server, 1_000, Duration::from_secs(300)).await;
+        let connection = telemetry_connection(&server, 1, Duration::from_millis(100)).await;
         let statement = connection
             .submit_statement("SELECT 1 AS n".into(), None)
             .await
@@ -770,6 +850,18 @@ mod tests {
             .expect_err("the close RPC must fail");
         assert!(statement.canceller.lock().unwrap().is_none());
         assert!(result.inner.lock().await.is_none());
+        let sync_statement = connection
+            .execute_statement("SELECT 1 AS n".into(), None)
+            .await
+            .expect("execute");
+        sync_statement
+            .close()
+            .await
+            .expect_err("the close RPC must fail");
+        sync_statement.close().await.expect("close is terminal");
         connection.close().await.expect("close session");
+        let second = telemetry_connection(&server, 1_000, Duration::from_secs(300)).await;
+        second.close().await.expect("close second session");
+        drop(sync_statement);
     }
 }

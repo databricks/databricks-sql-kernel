@@ -219,9 +219,11 @@ impl CancellableExecution {
     /// behind it. No-op (returns `Ok`) if `result()` already finished
     /// successfully, or if no statement id has been observed yet (query still
     /// in its initial submit round-trip), and idempotent against a server
-    /// already in a terminal state.
+    /// already in a terminal state. It still stops a Volume transfer in progress
+    /// after `result()` has finished.
     #[napi]
     pub async fn cancel(&self) -> napi::Result<()> {
+        self.canceller.cancel_volume_operation();
         // Skip the server-side cancel RPC once the statement is terminal (success
         // OR error) — it would be a redundant no-op-at-server call + confusing log.
         if self.terminal.load(Ordering::Acquire) {
