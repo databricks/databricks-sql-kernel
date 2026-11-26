@@ -418,6 +418,11 @@ pub(crate) trait Transport: Send + Sync + std::fmt::Debug {
     /// Close/cleanup a statement (release server resources).
     async fn close_statement(&self, statement_id: &str) -> Result<()>;
 
+    /// Close a statement whose background caller reports cleanup failures.
+    async fn close_statement_in_background(&self, statement_id: &str) -> Result<()> {
+        self.close_statement(statement_id).await
+    }
+
     // --- Metadata ---
 
     /// List all catalogs.

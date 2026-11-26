@@ -136,7 +136,7 @@ pub(crate) struct SessionInner {
     /// `false`, so [`Drop`] retries via its fire-and-forget path —
     /// transient `delete_session` failures don't leak the server-
     /// side session.
-    closed: std::sync::atomic::AtomicBool,
+    closed: Arc<std::sync::atomic::AtomicBool>,
 
     /// Client-tracked autocommit state. `true` (the default) means every
     /// statement auto-commits at the server; `false` means statements run
@@ -168,6 +168,10 @@ impl SessionInner {
     /// Crate-internal accessor for the server-issued session ID.
     pub(crate) fn session_id(&self) -> &str {
         &self.session_id
+    }
+
+    pub(crate) fn closed_flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        Arc::clone(&self.closed)
     }
 
     /// Typed feature-flag reader for kernel-internal consumers such as
@@ -479,7 +483,7 @@ impl Session {
                 log_span,
                 telemetry,
                 feature_flags,
-                closed: std::sync::atomic::AtomicBool::new(false),
+                closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 // Autocommit defaults to on (every statement commits); a
                 // caller opts into explicit transactions via set_autocommit.
                 autocommit: std::sync::atomic::AtomicBool::new(true),

@@ -2443,7 +2443,16 @@ async fn drained_async_close_detaches_once_and_invalidates_readers() {
     use databricks_sql_kernel::TryNextBatch;
     use std::time::Duration;
 
-    for mode in ["next", "try", "owned", "empty", "fetch", "reader"] {
+    for mode in [
+        "next",
+        "try",
+        "owned",
+        "empty",
+        "fetch",
+        "reader",
+        "partial-owner",
+        "refetch",
+    ] {
         let server = MockServer::start().await;
         mount_create_session(&server).await;
         mount_delete_session(&server).await;
@@ -2478,7 +2487,18 @@ async fn drained_async_close_detaches_once_and_invalidates_readers() {
         statement.spec().sql("SELECT n");
         let mut owner = statement.submit().await.unwrap();
         let reader = owner.reader().unwrap();
-        let mut stream = if mode == "reader" {
+        let mut partial_owner = if mode == "partial-owner" {
+            let mut stream = owner.await_result().await.unwrap();
+            assert!(stream.next_batch().await.unwrap().is_some());
+            assert_eq!(
+                stream.next_row_in_batch().unwrap().get_i64(0).unwrap(),
+                Some(71)
+            );
+            Some(stream)
+        } else {
+            None
+        };
+        let mut stream = if matches!(mode, "reader" | "partial-owner") {
             reader.fetch_result().await.unwrap()
         } else if mode == "fetch" {
             owner.fetch_result().await.unwrap()
@@ -2509,6 +2529,9 @@ async fn drained_async_close_detaches_once_and_invalidates_readers() {
             assert_eq!(batches.len(), 1, "{mode}");
             assert_eq!(batches[0].columns(), batch.columns(), "{mode}");
         }
+        if mode == "refetch" {
+            partial_owner = Some(owner.fetch_result().await.unwrap());
+        }
         assert!(matches!(
             reader.status().await.unwrap(),
             StatementStatus::Succeeded
@@ -2531,6 +2554,7 @@ async fn drained_async_close_detaches_once_and_invalidates_readers() {
         databricks_sql_kernel::ExecutedAsyncStatement::close(&mut owner)
             .await
             .unwrap();
+        drop(partial_owner);
         drop(owner);
         drop(statement);
         assert_eq!(

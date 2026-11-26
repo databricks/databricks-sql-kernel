@@ -73,7 +73,6 @@ async fn drained_async_close_releases_owner_and_server_statement() {
             drop(reader);
             drop(owner);
             drop(statement);
-            session.close().await.expect("session close");
             tokio::time::timeout(Duration::from_secs(10), async {
                 loop {
                     match observer.attach_async_statement(&statement_id).await {
@@ -93,6 +92,7 @@ async fn drained_async_close_releases_owner_and_server_statement() {
             })
             .await
             .expect("server statement must be closed");
+            session.close().await.expect("session close");
         }
     }
     observer.close().await.expect("observer close");

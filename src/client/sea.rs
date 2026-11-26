@@ -227,6 +227,35 @@ impl SeaRestTransport {
         }
     }
 
+    async fn close_statement_impl(&self, statement_id: &str, report_failure: bool) -> Result<()> {
+        let url = format!("{}/statements/{}", self.base_url(), statement_id);
+        debug!("Closing statement at {}", url);
+        let request = self
+            .http_client
+            .inner()
+            .request(Method::DELETE, &url)
+            .build()
+            .map_err(|error| {
+                Error::invalid_argument().message(format!("Failed to build request: {error}"))
+            })?;
+        if let Err(error) = self
+            .http_client
+            .execute(request, RequestType::CloseStatement)
+            .await
+        {
+            if report_failure {
+                crate::klog::warn!(
+                    statement_id = %statement_id,
+                    error = %error,
+                    "close_statement failed after HTTP retries; surfacing to caller (Drop fallback close will run)"
+                );
+            }
+            return Err(error);
+        }
+        debug!("Closed statement: {}", statement_id);
+        Ok(())
+    }
+
     /// Set the reader factory and runtime handle. Must be called once after wrapping in `Arc`.
     pub fn set_reader_factory(
         &self,
@@ -1596,43 +1625,11 @@ impl Transport for SeaRestTransport {
     }
 
     async fn close_statement(&self, statement_id: &str) -> Result<()> {
-        let url = format!("{}/statements/{}", self.base_url(), statement_id);
+        self.close_statement_impl(statement_id, true).await
+    }
 
-        debug!("Closing statement at {}", url);
-
-        let request = self
-            .http_client
-            .inner()
-            .request(Method::DELETE, &url)
-            .build()
-            .map_err(|e| {
-                Error::invalid_argument().message(format!("Failed to build request: {e}"))
-            })?;
-
-        // Surface the wire error so the caller's retry-on-failure path can
-        // run — `ExecutedStatement::close` / `ExecutedAsyncStatement::close`
-        // only flip their `closed` flag on success, so a swallowed error here
-        // would make their store-on-success semantics dead code (and a failed
-        // explicit close would look like it succeeded). The HTTP client has
-        // already applied the SEA retry policy, so callers see only the
-        // post-retry result; the `Drop` fire-and-forget fallback close still
-        // runs on the kernel side if the explicit close errored.
-        if let Err(e) = self
-            .http_client
-            .execute(request, RequestType::CloseStatement)
-            .await
-        {
-            crate::klog::warn!(
-                statement_id = %statement_id,
-                error = %e,
-                "close_statement failed after HTTP retries; surfacing to caller (Drop fallback close will run)"
-            );
-            return Err(e);
-        }
-
-        debug!("Closed statement: {}", statement_id);
-
-        Ok(())
+    async fn close_statement_in_background(&self, statement_id: &str) -> Result<()> {
+        self.close_statement_impl(statement_id, false).await
     }
 
     // --- Metadata ---

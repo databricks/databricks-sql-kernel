@@ -13,7 +13,7 @@ changes go in their respective binding's NEXT_CHANGELOG.
 
 ### Changed
 
-Closing a fully drained asynchronous statement releases ownership immediately and cleans up the server statement in the background. Closing a partial result still waits for server cleanup.
+Once any result stream of an asynchronous execution reaches successful EOF, closing the execution releases ownership immediately and cleans up the server statement in the background, without reporting cleanup errors. This also applies when another stream of that execution is unread or partly read; otherwise close still waits for server cleanup.
 
 ### Updated
 

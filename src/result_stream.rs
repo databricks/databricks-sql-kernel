@@ -672,6 +672,9 @@ impl ResultStream {
     /// `consumed = false` so an abandoned stream doesn't report
     /// think-time as consumption latency.
     fn finalize_telemetry(&mut self, error: Option<&Error>) {
+        if error.is_some() {
+            self.drained = None;
+        }
         let metrics = self.reader_metrics();
         if let Some(telemetry) = &mut self.telemetry {
             telemetry.finish(metrics, error, true);
@@ -726,7 +729,11 @@ impl ResultStream {
         // A batch buffered by `peek_first_batch` is replayed here first,
         // so a non-consuming peek doesn't steal it from the caller.
         if let Some(batch) = self.prefetched.take() {
-            self.set_current_batch(batch.map_err(|error| *error)?);
+            let batch = batch.map_err(|error| {
+                self.drained = None;
+                *error
+            })?;
+            self.set_current_batch(batch);
             return Ok(self.current.as_ref());
         }
         if self.exhausted {
@@ -760,7 +767,11 @@ impl ResultStream {
     /// network or background-prefetch progress.
     pub fn try_next_batch(&mut self) -> Result<TryNextBatch<'_>> {
         if let Some(batch) = self.prefetched.take() {
-            self.set_current_batch(batch.map_err(|error| *error)?);
+            let batch = batch.map_err(|error| {
+                self.drained = None;
+                *error
+            })?;
+            self.set_current_batch(batch);
             return Ok(TryNextBatch::Ready(
                 self.current.as_ref().expect("batch was just installed"),
             ));
@@ -1434,14 +1445,25 @@ mod tests {
 
     #[tokio::test]
     async fn drain_signal_requires_successful_exhaustion() {
-        for mode in ["next", "try", "owned", "drop", "error", "peek-empty"] {
+        for mode in [
+            "next",
+            "try",
+            "owned",
+            "drop",
+            "error",
+            "try-error",
+            "peek-error-next",
+            "peek-error-try",
+            "peek-empty",
+            "finalize-undrained",
+        ] {
             let signal = Arc::new(AtomicBool::new(false));
             let batch = RecordBatch::try_new(
                 schema_for(vec![Field::new("n", DataType::Int64, true)]),
                 vec![Arc::new(Int64Array::from(vec![Some(71), None, Some(-19)]))],
             )
             .unwrap();
-            let mut stream = if mode == "error" {
+            let mut stream = if mode.contains("error") {
                 stream_with_one_shot_error().await
             } else if mode == "peek-empty" {
                 ResultStream::from_reader(Box::new(InMemoryReader::new(batch.schema(), vec![])))
@@ -1480,16 +1502,39 @@ mod tests {
                     assert!(!signal.load(Ordering::Acquire));
                     assert!(stream.next_batch().await.unwrap().is_none());
                 }
+                "finalize-undrained" => stream.finalize_telemetry(None),
                 "error" => {
                     assert!(stream.next_batch().await.is_err());
-                    drop(stream);
+                    assert!(stream.next_batch().await.unwrap().is_none());
+                    assert!(matches!(
+                        stream.try_next_batch().unwrap(),
+                        TryNextBatch::End
+                    ));
+                }
+                "try-error" => {
+                    assert!(stream.try_next_batch().is_err());
+                    assert!(matches!(
+                        stream.try_next_batch().unwrap(),
+                        TryNextBatch::End
+                    ));
+                    assert!(stream.next_batch().await.unwrap().is_none());
+                }
+                "peek-error-next" | "peek-error-try" => {
+                    assert!(stream.peek_first_batch().await.is_err());
+                    stream.attach_drain_signal(Arc::clone(&signal));
+                    if mode == "peek-error-next" {
+                        assert!(stream.next_batch().await.is_err());
+                    } else {
+                        assert!(stream.try_next_batch().is_err());
+                    }
+                    assert!(stream.next_batch().await.unwrap().is_none());
                 }
                 "drop" => drop(stream),
                 _ => unreachable!(),
             }
             assert_eq!(
                 signal.load(Ordering::Acquire),
-                !matches!(mode, "drop" | "error"),
+                !matches!(mode, "drop" | "finalize-undrained") && !mode.contains("error"),
                 "{mode}"
             );
         }
