@@ -1411,12 +1411,12 @@ mod tests {
             let mut future = Box::pin(state.complete(async { Ok(batch.clone()) }, &options, None));
             tokio::select! {
                 result = &mut future => panic!("unexpected early completion: {result:?}"),
-                _ = async {
+                sent = tokio::time::timeout(Duration::from_secs(10), async {
                     loop {
                         if server.received_requests().await.unwrap().len() >= if cancel { 2 } else { 1 } { break; }
                         tokio::task::yield_now().await;
                     }
-                } => {}
+                }) => sent.expect("storage request was not sent"),
             }
             if cancel {
                 state.cancel();

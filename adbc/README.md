@@ -73,6 +73,20 @@ optional C interface and native Rust asynchronous submission and polling.
 Transactions, partitioned execution, statistics, and progress reporting are
 not currently implemented.
 
+## Volume file operations
+
+Set `adbc.databricks.statement.staging_allowed_local_paths` to a JSON array of
+local directories to run the file transfer for Volume `PUT`, `GET` and `REMOVE`
+before results are returned. The result rows stay readable. Without the option
+no file moves and the result is only the server's instruction row.
+The option remains enabled for the statement until set to JSON `null`; an empty
+array still permits REMOVE while denying file PUT and GET. Local `..` components collapse
+before symlink resolution. REMOVE of a missing object succeeds. Input-stream PUT is unsupported.
+The client timeout ends at the terminal SQL status and does not bound Volume transfers.
+`SocketTimeout` (milliseconds) also sets the idle limit for Volume transfers;
+`adbc.databricks.http_request_timeout` sets only the SQL request deadline.
+See the kernel [Volume file operations](../README.md#volume-file-operations).
+
 ## Compatibility and status
 
 The current implementation targets Rust 1.89+, Rust edition 2021, ADBC 1.1,

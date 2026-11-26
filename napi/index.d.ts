@@ -881,7 +881,7 @@ export declare class AsyncResultHandle {
   /**
    * Runs the file transfer for a Volume PUT, GET or REMOVE result. Call before
    * fetching; the rows stay readable afterwards.
-   * Keep the parent AsyncStatement alive until the transfer finishes; closing or
+   * Keep the parent `AsyncStatement` alive until the transfer finishes; closing or
    * collecting it stops the transfer.
    */
   completeVolumeOperation(allowedPaths: Array<string>, removeNotFoundIsSuccess: boolean): Promise<VolumeCompletion>
