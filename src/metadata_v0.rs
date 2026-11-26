@@ -172,14 +172,9 @@ fn normalize_native_metadata_batch(
                     .as_any()
                     .downcast_ref::<arrow_array::StringArray>()
                     .ok_or_else(|| Error::data_loss().message("TABLE_TYPE is not Utf8"))?;
-                return Ok(
-                    Arc::new(arrow_array::StringArray::from_iter(values.iter().map(
-                        |value| match value {
-                            None | Some("") => Some("TABLE"),
-                            Some(value) => Some(value),
-                        },
-                    ))) as ArrayRef,
-                );
+                return Ok(Arc::new(arrow_array::StringArray::from_iter(
+                    values.iter().map(|value| Some(value.unwrap_or(""))),
+                )) as ArrayRef);
             }
 
             if field.name() != "ORDINAL_POSITION" {
@@ -1685,7 +1680,7 @@ mod tests {
     }
 
     #[test]
-    fn native_metadata_defaults_null_and_empty_table_types() {
+    fn native_metadata_preserves_null_and_empty_table_types_as_empty() {
         let batch = RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new(
                 "TABLE_TYPE",
@@ -1710,12 +1705,12 @@ mod tests {
 
         assert_eq!(
             table_types.iter().collect::<Vec<_>>(),
-            vec![Some("TABLE"), Some("TABLE"), Some("VIEW")]
+            vec![Some(""), Some(""), Some("VIEW")]
         );
     }
 
     #[test]
-    fn native_tables_filter_defaults_null_and_empty_table_types() {
+    fn native_tables_filter_retains_null_and_empty_table_types() {
         let mut fields = GET_TABLES_SCHEMA
             .fields()
             .iter()

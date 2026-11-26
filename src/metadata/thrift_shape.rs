@@ -398,11 +398,11 @@ fn table_type_column(batch: &RecordBatch) -> Result<ArrayRef> {
         .ok_or_else(|| Error::data_loss().message("tableType is not Utf8"))?;
     Ok(Arc::new(StringArray::from_iter((0..values.len()).map(
         |row| {
-            if values.is_null(row) || values.value(row).is_empty() {
-                Some("TABLE")
+            Some(if values.is_null(row) {
+                ""
             } else {
-                Some(values.value(row))
-            }
+                values.value(row)
+            })
         },
     ))))
 }
@@ -590,8 +590,7 @@ pub(crate) fn reshape_tables(
     };
     let table_schem = utf8_column(batch, "namespace")?;
     let table_name = utf8_column(batch, "tableName")?;
-    // Some server versions include tableType but leave individual values null or empty for legacy
-    // hive_metastore tables. Match JDBC by treating those values like a missing column.
+    // Preserve the Thrift server's empty type for legacy hive_metastore rows.
     let table_type = table_type_column(batch)?;
     // REMARKS is contractually nullable per the JDBC spec, but the Thrift
     // backend has historically emitted `""` for tables without a comment
@@ -1026,8 +1025,12 @@ fn filter_tables_by_type(batch: &RecordBatch, types: &[&str]) -> Result<RecordBa
         .ok_or_else(|| Error::data_loss().message("TABLE_TYPE is not Utf8"))?;
     let keep: Vec<bool> = (0..batch.num_rows())
         .map(|i| {
-            if types_arr.is_null(i) {
+            if types.is_empty() {
                 false
+            } else if types_arr.is_null(i) || types_arr.value(i).is_empty() {
+                // Thrift GetTables retains legacy rows whose type is unknown
+                // even when a non-empty table-type filter is supplied.
+                true
             } else {
                 // Exact (case-sensitive) match, for parity with the Thrift
                 // server's `GetTables` and the JDBC driver's client-side
@@ -1422,7 +1425,7 @@ mod tests {
     }
 
     #[test]
-    fn tables_defaults_missing_null_and_empty_table_types() {
+    fn tables_preserves_present_null_and_empty_table_types() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("namespace", DataType::Utf8, false),
             Field::new("tableName", DataType::Utf8, false),
@@ -1445,7 +1448,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             table_types.iter().collect::<Vec<_>>(),
-            vec![Some("TABLE"), Some("TABLE"), Some("VIEW")]
+            vec![Some(""), Some(""), Some("VIEW")]
         );
 
         let schema = Arc::new(Schema::new(vec![
@@ -1463,6 +1466,42 @@ mod tests {
         assert_eq!(
             table_types.iter().collect::<Vec<_>>(),
             vec![Some("TABLE"); 3]
+        );
+    }
+
+    #[test]
+    fn tables_filter_by_type_retains_unknown_rows() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("namespace", DataType::Utf8, false),
+            Field::new("tableName", DataType::Utf8, false),
+            Field::new("tableType", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["s", "s", "s"])),
+                Arc::new(StringArray::from(vec!["unknown", "table", "view"])),
+                Arc::new(StringArray::from(vec!["", "TABLE", "VIEW"])),
+            ],
+        )
+        .unwrap();
+
+        let output = reshape_tables(&batch, Some("main"), Some(&["TABLE"])).unwrap();
+        assert_eq!(
+            output
+                .column(2)
+                .as_string::<i32>()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![Some("unknown"), Some("table")]
+        );
+        assert_eq!(
+            output
+                .column(3)
+                .as_string::<i32>()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![Some(""), Some("TABLE")]
         );
     }
 
