@@ -14,6 +14,11 @@ changes go in the root `NEXT_CHANGELOG.md`.
 ### Added
 
 ### Changed
+- Allow pyarrow 24.x through 26.x on Python 3.10+ (`pyarrow>=23.0.1,<27`),
+  so the wheel installs alongside pyarrow 26, the first release clear of
+  CVE-2026-92287. Fresh `[kernel]` installs without their own pyarrow pin now
+  resolve pyarrow 26 on Python 3.11+ (25.x on 3.10); pin `pyarrow<24` to stay
+  on 23.x.
 
 ### Updated
 

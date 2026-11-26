@@ -52,7 +52,10 @@ defaults:
 
 jobs:
   build-and-test:
-    name: "PyO3 build + test (Python ${{ matrix.python-version }})"
+    # The name stays "PyO3 build + test (Python 3.x)" for the default
+    # legs so existing required-check rules keep matching; only the
+    # floor leg gets a suffix.
+    name: "PyO3 build + test (Python ${{ matrix.python-version }}${{ matrix.pyarrow != 'latest' && format(', pyarrow {0}', matrix.pyarrow) || '' }})"
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     permissions:
       contents: read
@@ -83,6 +86,15 @@ jobs:
         # the older `pyarrow>=14,<19` series via the env-marker split
         # in pyproject.toml, exercising that path in CI.)
         python-version: ["3.9", "3.10", "3.11", "3.12", "3.13", "3.14"]
+        # `uv sync` resolves the newest pyarrow inside the declared bound,
+        # so the default legs only ever see the top of `>=23.0.1,<27`.
+        # The include below adds one leg pinned to the floor, so a kernel
+        # change that breaks on the oldest supported pyarrow fails CI
+        # instead of a user's install.
+        pyarrow: ["latest"]
+        include:
+          - python-version: "3.12"
+            pyarrow: "23.0.1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -133,6 +145,13 @@ jobs:
         # the extension twice per matrix entry.
         run: uv sync --group dev --no-install-project
 
+      - name: Pin pyarrow to the declared floor
+        if: matrix.pyarrow != 'latest'
+        working-directory: pyo3
+        # Replaces the newest-in-bound pyarrow that `uv sync` picked. The
+        # later `uv run --no-sync` steps keep this pin in place.
+        run: uv pip install "pyarrow==${{ matrix.pyarrow }}"
+
       - name: Cargo unit tests (pyo3 crate)
         # The pyo3 crate's Rust-side unit tests cover the GIL handoff
         # in isolation. Runs before any maturin build so a pure-Rust
@@ -177,7 +196,7 @@ jobs:
   # intentionally substitutes the credential-free package proxies and omits
   # the azure-prod environment, its secrets, and the live-test tier.
   fork-build-and-test:
-    name: "PyO3 build + test (Python ${{ matrix.python-version }})"
+    name: "PyO3 build + test (Python ${{ matrix.python-version }}${{ matrix.pyarrow != 'latest' && format(', pyarrow {0}', matrix.pyarrow) || '' }})"
     if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
     permissions:
       contents: read
@@ -192,6 +211,11 @@ jobs:
       fail-fast: false
       matrix:
         python-version: ["3.9", "3.10", "3.11", "3.12", "3.13", "3.14"]
+        # Same floor leg as `build-and-test`; see the comment there.
+        pyarrow: ["latest"]
+        include:
+          - python-version: "3.12"
+            pyarrow: "23.0.1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -219,6 +243,11 @@ jobs:
       - name: Install dev dependencies
         working-directory: pyo3
         run: uv sync --group dev --no-install-project
+
+      - name: Pin pyarrow to the declared floor
+        if: matrix.pyarrow != 'latest'
+        working-directory: pyo3
+        run: uv pip install "pyarrow==${{ matrix.pyarrow }}"
 
       - name: Cargo unit tests
         working-directory: pyo3
