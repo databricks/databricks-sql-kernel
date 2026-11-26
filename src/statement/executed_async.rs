@@ -933,20 +933,22 @@ impl ExecutedAsyncStatement {
                 response.status.state,
                 StatementState::Succeeded | StatementState::Closed
             );
+        // Result reading can fail after a batch commits; retrying could duplicate rows.
+        let batch_error = |error: Error| {
+            if completed_batch {
+                error
+                    .with_query_id(&self.statement_id)
+                    .with_retryable(false)
+            } else {
+                error
+            }
+        };
         let result = self
             .session
             .transport()
             .completed_result(response, self.session_attribution)
             .await
-            .map_err(|error| {
-                if completed_batch {
-                    error
-                        .with_query_id(&self.statement_id)
-                        .with_retryable(false)
-                } else {
-                    error
-                }
-            })?;
+            .map_err(batch_error)?;
         self.check_read_validity()?;
         match result {
             Some(result) => {
@@ -979,11 +981,7 @@ impl ExecutedAsyncStatement {
                         self.parameter_set_count,
                     )
                     .await
-                    .map_err(|error| {
-                        error
-                            .with_query_id(&self.statement_id)
-                            .with_retryable(false)
-                    })?;
+                    .map_err(batch_error)?;
                     if let Ok(mut status) = self.latest_status.lock() {
                         status.num_modified_rows = count;
                     }

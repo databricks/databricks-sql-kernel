@@ -3599,7 +3599,7 @@ async fn native_batch_transport_and_result_failures_do_not_replay() {
 }
 
 #[tokio::test]
-async fn async_native_batch_cloudfetch_failure_is_not_retryable() {
+async fn native_batch_async_cloudfetch_failure_is_not_retryable() {
     for native in [false, true] {
         let server = MockServer::start().await;
         mount_create_session(&server).await;
