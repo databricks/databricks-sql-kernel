@@ -18,6 +18,7 @@ changes go in their respective binding's NEXT_CHANGELOG.
 ### Fixed
 
 - The C ABI and shared telemetry runtime threads now block SIGPIPE. A TLS write after a peer reset no longer kills a host that doesn't ignore SIGPIPE, such as a Go program linking the C ABI; the write fails with `EPIPE` and the request reports the connection error instead.
+- The Rust ADBC driver's own runtime threads now block SIGPIPE too, so a Go program loading the driver through a cgo driver manager isn't killed by a write after a peer reset. Caller-injected runtimes are unchanged.
 
 ---
 *Note: When making changes, please add your change under the appropriate

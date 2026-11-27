@@ -37,6 +37,7 @@ impl RuntimeHandle {
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(DEFAULT_WORKER_THREADS)
             .enable_all()
+            .on_thread_start(databricks_sql_kernel::block_sigpipe_on_current_thread)
             .build()
             .map(|runtime| Arc::new(Self::Owned(Some(runtime))))
     }
@@ -162,6 +163,32 @@ mod tests {
             .build()
             .unwrap();
         caller.block_on(async { drop(RuntimeHandle::create().unwrap()) });
+    }
+
+    /// Whether SIGPIPE (13 on Linux) is in the calling thread's `SigBlk` mask.
+    #[cfg(target_os = "linux")]
+    fn sigpipe_blocked() -> bool {
+        let path = "/proc/thread-self/status";
+        let status = std::fs::read_to_string(path).unwrap();
+        let mask = status
+            .lines()
+            .find_map(|line| line.strip_prefix("SigBlk:"))
+            .unwrap();
+        let mask = u64::from_str_radix(mask.trim(), 16).unwrap();
+        (mask & (1 << (13 - 1))) != 0
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn owned_runtime_threads_block_sigpipe() {
+        assert!(!sigpipe_blocked(), "caller already blocks SIGPIPE");
+        let runtime = RuntimeHandle::create().unwrap();
+        let worker = runtime.spawn(async { sigpipe_blocked() });
+        let blocking = runtime.spawn_blocking(sigpipe_blocked);
+        let on_worker = runtime.block_on(worker).unwrap();
+        let on_blocking = runtime.block_on(blocking).unwrap();
+        assert!(on_worker, "runtime worker must block SIGPIPE");
+        assert!(on_blocking, "blocking-pool thread must block SIGPIPE");
     }
 
     #[test]

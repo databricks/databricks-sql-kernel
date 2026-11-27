@@ -157,6 +157,10 @@ pub use statement::params_codec::parse_typed_value;
 pub use statement::spec::{ResultFormat, StatementSpec, TypedValue};
 pub use statement::{MAX_CLIENT_QUERY_TIMEOUT, MAX_CLIENT_QUERY_TIMEOUT_MS};
 pub use telemetry::DriverSystemConfiguration;
+/// `on_thread_start` hook that blocks SIGPIPE on runtime threads the ADBC and
+/// pyo3 crates own. Not a supported API.
+#[doc(hidden)]
+pub use util::runtime::block_sigpipe_on_current_thread;
 
 // === Compile-time guarantees on auto-traits ===
 //

@@ -19,6 +19,8 @@ changes go in the root `NEXT_CHANGELOG.md`.
 
 ### Fixed
 
+- Session runtime threads now block SIGPIPE. A TLS write after a peer reset no longer kills a Python process that restored the default action (`signal.signal(signal.SIGPIPE, signal.SIG_DFL)`); the write fails with `EPIPE` instead.
+
 ---
 *Note: When making changes, please add your change under the appropriate
 section with a brief description. At release time, move the entries here

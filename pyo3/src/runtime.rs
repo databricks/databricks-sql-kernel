@@ -43,6 +43,22 @@ impl KernelRuntime {
         Self(Some(runtime))
     }
 
+    /// Builds a session's runtime. Multi-thread so CloudFetch chunk downloads
+    /// can overlap with the main poll loop; worker count is tokio's default.
+    pub(crate) fn build() -> PyResult<Self> {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .thread_name("dbx-sql-kernel")
+            .on_thread_start(databricks_sql_kernel::block_sigpipe_on_current_thread)
+            .build()
+            .map(Self::new)
+            .map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "failed to build tokio runtime: {e}"
+                ))
+            })
+    }
+
     /// Release a handle at the end of an explicit `close()`. If it was the
     /// last one, shut down and wait for the workers with the GIL released,
     /// so none is still logging into Python after `close()` returns.
@@ -113,6 +129,32 @@ mod tests {
         done_rx
             .recv_timeout(Duration::from_secs(10))
             .unwrap_or_else(|_| panic!("{what} deadlocked on a GIL-blocked worker"))
+    }
+
+    /// Whether SIGPIPE (13 on Linux) is in the calling thread's `SigBlk` mask.
+    #[cfg(target_os = "linux")]
+    fn sigpipe_blocked() -> bool {
+        let path = "/proc/thread-self/status";
+        let status = std::fs::read_to_string(path).unwrap();
+        let mask = status
+            .lines()
+            .find_map(|line| line.strip_prefix("SigBlk:"))
+            .unwrap();
+        let mask = u64::from_str_radix(mask.trim(), 16).unwrap();
+        (mask & (1 << (13 - 1))) != 0
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn session_runtime_threads_block_sigpipe() {
+        assert!(!sigpipe_blocked(), "caller already blocks SIGPIPE");
+        let runtime = KernelRuntime::build().expect("build runtime");
+        let worker = runtime.spawn(async { sigpipe_blocked() });
+        let blocking = runtime.spawn_blocking(sigpipe_blocked);
+        let on_worker = runtime.block_on(worker).unwrap();
+        let on_blocking = runtime.block_on(blocking).unwrap();
+        assert!(on_worker, "runtime worker must block SIGPIPE");
+        assert!(on_blocking, "blocking-pool thread must block SIGPIPE");
     }
 
     #[test]
