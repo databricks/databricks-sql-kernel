@@ -11,6 +11,10 @@ changes go in their respective binding's NEXT_CHANGELOG.
 
 ### Added
 
+- Configure the Arrow result LZ4 session default with `ResultConfig.lz4_compression_enabled`
+  (client config key `lz4_compression_enabled`) and override it with `StatementSpec::lz4_compression`.
+  ADBC exposes the default through `adbc.databricks.enable_query_result_lz4_compression`.
+
 ### Changed
 
 ### Updated

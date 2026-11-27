@@ -13,6 +13,8 @@ changes go in the root `NEXT_CHANGELOG.md`.
 
 ### Added
 
+- `Statement.set_lz4_compression` overrides Arrow result LZ4 compression per statement.
+
 ### Changed
 
 ### Updated

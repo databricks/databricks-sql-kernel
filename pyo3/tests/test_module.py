@@ -39,5 +39,6 @@ def test_exports_expected_classes():
     assert expected.issubset(actual), f"missing exports: {expected - actual}"
 
 
-def test_statement_exposes_row_limit():
+def test_statement_exposes_public_setters():
     assert callable(k.Statement.set_row_limit)
+    assert callable(k.Statement.set_lz4_compression)
