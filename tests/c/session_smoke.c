@@ -269,6 +269,8 @@ static void test_client_conf_setter(void) {
   KernelStatusCode rc =
       kernel_session_config_set_client_conf(config, "cloudfetch_enabled", "false");
   CHECK(rc == KernelStatusCode_Success, "set_client_conf cloudfetch_enabled=false succeeds");
+  rc = kernel_session_config_set_client_conf(config, "lz4_compression_enabled", "false");
+  CHECK(rc == KernelStatusCode_Success, "set_client_conf lz4_compression_enabled=false succeeds");
   rc = kernel_session_config_set_client_conf(config, "cloudfetch_max_chunks_in_memory", "32");
   CHECK(rc == KernelStatusCode_Success, "set_client_conf max_chunks=32 succeeds");
   rc = kernel_session_config_set_client_conf(config, "complex_types_as_json", "true");

@@ -391,6 +391,7 @@ impl Session {
         let defaults = config.defaults.clone().unwrap_or_default();
         let transport_config = TransportConfig {
             cloudfetch_enabled: config.result.cloudfetch_enabled,
+            lz4_compression_enabled: config.result.lz4_compression_enabled,
             ..TransportConfig::default()
         };
         let sea = Arc::new(SeaRestTransport::new(
@@ -1290,9 +1291,7 @@ fn apply_client_result_overrides(config: &mut SessionConfig) {
     }
 }
 
-/// Project the public [`ResultConfig`] (today only carries
-/// CloudFetch knobs; future result-management options slot in here
-/// too) onto the internal `CloudFetchConfig`.
+/// Project the CloudFetch settings from [`ResultConfig`] onto the reader configuration.
 fn result_to_cloudfetch_config(
     result: &ResultConfig,
 ) -> crate::types::cloudfetch::CloudFetchConfig {
@@ -2065,7 +2064,7 @@ mod retry_config_tests {
         }
     }
 
-    /// All six client-side result knobs are recognised in session_conf,
+    /// All client-side result knobs are recognised in session_conf,
     /// applied to the typed ResultConfig, and stripped so none reach the
     /// wire. Guards the parity between `ClientConfKey::ALL` and the
     /// session_conf sweep.
@@ -2077,6 +2076,7 @@ mod retry_config_tests {
                 K::CloudfetchEnabled.as_str().to_string(),
                 "false".to_string(),
             ),
+            ("LZ4_COMPRESSION_ENABLED".to_string(), " FaLsE ".to_string()),
             (
                 K::CloudfetchLinkPrefetchWindow.as_str().to_string(),
                 "7".to_string(),
@@ -2102,6 +2102,7 @@ mod retry_config_tests {
         ]));
         apply_client_result_overrides(&mut cfg);
         assert!(!cfg.result.cloudfetch_enabled);
+        assert!(!cfg.result.lz4_compression_enabled);
         assert_eq!(cfg.result.cloudfetch_link_prefetch_window, 7);
         assert_eq!(cfg.result.cloudfetch_max_chunks_in_memory, 9);
         assert_eq!(cfg.result.inline_max_chunks_in_memory, 3);

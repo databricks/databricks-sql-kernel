@@ -63,6 +63,8 @@ const GEOSPATIAL_REPRESENTATION: &str = "adbc.databricks.geospatial.result_repre
 const ENABLE_GEOSPATIAL: &str = "adbc.databricks.enable_geospatial_support";
 const CLOUDFETCH_MAX_CHUNKS_IN_MEMORY: &str = "adbc.databricks.cloudfetch.max_chunks_in_memory";
 const CLOUDFETCH_ENABLED: &str = "adbc.databricks.cloudfetch.enabled";
+const ENABLE_QUERY_RESULT_LZ4_COMPRESSION: &str =
+    "adbc.databricks.enable_query_result_lz4_compression";
 const PROTOCOL: &str = "adbc.databricks.protocol";
 pub(crate) const ESCAPE_CATALOG_NAME: &str = "adbc.databricks.metadata.escape_catalog_name";
 
@@ -371,6 +373,9 @@ impl DatabaseConfig {
             }
             CLOUDFETCH_ENABLED | "databricks.cloudfetch.enabled" => {
                 self.result.cloudfetch_enabled = boolean_compat(value, key)?
+            }
+            ENABLE_QUERY_RESULT_LZ4_COMPRESSION => {
+                self.result.lz4_compression_enabled = boolean_compat(value, key)?
             }
             PROTOCOL => {
                 let protocol = string_value(value, key)?;
@@ -1242,6 +1247,28 @@ mod tests {
 
         set(&mut config, "databricks.cloudfetch.enabled", "true");
         assert!(config.result.cloudfetch_enabled);
+    }
+
+    #[test]
+    fn lz4_compression_option_configures_kernel_result_codec() {
+        let mut config = DatabaseConfig::default();
+        assert!(config.result.lz4_compression_enabled);
+
+        let key = ENABLE_QUERY_RESULT_LZ4_COMPRESSION;
+        for (value, expected) in [
+            ("false".into(), false),
+            ("true".into(), true),
+            (OptionValue::Int(0), false),
+            (OptionValue::Int(1), true),
+        ] {
+            config.set_option(key, value).unwrap();
+            assert_eq!(config.result.lz4_compression_enabled, expected);
+        }
+        for value in ["bogus".into(), OptionValue::Int(2)] {
+            let error = config.set_option(key, value).unwrap_err();
+            assert_eq!(error.status, Status::InvalidArguments);
+            assert!(config.result.lz4_compression_enabled);
+        }
     }
 
     #[test]

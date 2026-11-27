@@ -582,10 +582,8 @@ KernelStatusCode kernel_session_config_set_u2m_token_cache_config(KernelSessionC
  *
  * Counterpart to kernel_session_config_set_session_conf: that one carries
  * SERVER session confs (ANSI_MODE, TIMEZONE, ...) to the SEA wire; this one
- * sets CLIENT-SIDE knobs that tune how the kernel fetches, buffers, and
- * post-processes results and are NEVER sent to the server. The two channels
- * are deliberately separate (conflating them is what made a client flag
- * masquerade as a rejected server conf).
+ * configures how the kernel requests, fetches, buffers, and post-processes
+ * results. These keys are kept out of the server session configuration.
  *
  * Key/value (rather than one typed setter per knob) so the signature never
  * changes as new result knobs are added, and so a host that already has DSN
@@ -596,6 +594,8 @@ KernelStatusCode kernel_session_config_set_u2m_token_cache_config(KernelSessionC
  * Recognised keys (case-insensitive):
  * - "cloudfetch_enabled" = "true"|"false" — false serves every result
  *   through paged inline delivery without cloud-storage downloads.
+ * - "lz4_compression_enabled" = "true"|"false", for LZ4 compression
+ *   for Arrow results. Defaults to "true".
  * - "cloudfetch_link_prefetch_window" = positive integer.
  * - "cloudfetch_max_chunks_in_memory" = positive integer (bounds peak RSS;
  *   values above the kernel ceiling of 256 are clamped with a warning).

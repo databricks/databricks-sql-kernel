@@ -401,10 +401,7 @@ pub struct ExecuteStatementRequest {
     pub on_wait_timeout: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub row_limit: Option<i64>,
-    /// Server-side compression for external-link result chunks. Set to
-    /// `Some("LZ4_FRAME")` so the cloud-fetch payload is LZ4-compressed
-    /// (matches Python/JDBC SEA default). Without it the server returns
-    /// uncompressed arrow bytes, doubling network transfer.
+    /// Requested Arrow result codec (`LZ4_FRAME` or `NONE`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result_compression: Option<String>,
     /// Positional parameters for parameterized queries.
@@ -424,6 +421,7 @@ pub struct ExecuteParams {
     pub wait_timeout: Option<String>,
     pub on_wait_timeout: Option<String>, // "CONTINUE" or "CANCEL"
     pub row_limit: Option<i64>,
+    pub lz4_compression: Option<bool>,
     /// Parameters for parameterized query execution.
     pub parameters: Vec<StatementParameter>,
     /// Per-statement query tags, forwarded to the SEA request's native

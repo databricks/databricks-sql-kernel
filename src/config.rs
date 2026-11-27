@@ -1077,13 +1077,7 @@ impl std::fmt::Debug for TlsConfig {
 
 // ─── Result management (CloudFetch + future result knobs) ───────────────────
 
-/// Result-stream tuning. Today this is exclusively CloudFetch knobs;
-/// future non-CloudFetch result-management options (chunk-size hints,
-/// decompression strategy, max-row buffer, etc.) slot in here too — the
-/// name is intentionally general.
-///
-/// Renamed from `CloudFetchConfig` so the type doesn't fossilise around
-/// one transport feature.
+/// Result delivery, compression, buffering, and representation settings.
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct ResultConfig {
@@ -1094,6 +1088,9 @@ pub struct ResultConfig {
     /// This connection-level setting requests paged inline Arrow results.
     /// Servers without this capability may reject session creation or the first statement.
     pub cloudfetch_enabled: bool,
+
+    /// Request LZ4 compression for Arrow results. Default: `true`.
+    pub lz4_compression_enabled: bool,
 
     /// Number of presigned URLs to prefetch ahead of the consumer.
     pub cloudfetch_link_prefetch_window: usize,
@@ -1157,6 +1154,7 @@ impl Default for ResultConfig {
     fn default() -> Self {
         Self {
             cloudfetch_enabled: true,
+            lz4_compression_enabled: true,
             cloudfetch_link_prefetch_window: 10,
             cloudfetch_max_chunks_in_memory: 16,
             inline_max_chunks_in_memory: 4,
@@ -1188,6 +1186,7 @@ pub(crate) const CLOUDFETCH_MAX_CHUNKS_CEILING: usize = 256;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ClientConfKey {
     CloudfetchEnabled,
+    Lz4CompressionEnabled,
     CloudfetchLinkPrefetchWindow,
     CloudfetchMaxChunksInMemory,
     InlineMaxChunksInMemory,
@@ -1200,6 +1199,7 @@ impl ClientConfKey {
     /// and to pin parity with [`ResultConfig`]'s fields in tests.
     pub(crate) const ALL: &'static [ClientConfKey] = &[
         Self::CloudfetchEnabled,
+        Self::Lz4CompressionEnabled,
         Self::CloudfetchLinkPrefetchWindow,
         Self::CloudfetchMaxChunksInMemory,
         Self::InlineMaxChunksInMemory,
@@ -1211,6 +1211,7 @@ impl ClientConfKey {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::CloudfetchEnabled => "cloudfetch_enabled",
+            Self::Lz4CompressionEnabled => "lz4_compression_enabled",
             Self::CloudfetchLinkPrefetchWindow => "cloudfetch_link_prefetch_window",
             Self::CloudfetchMaxChunksInMemory => "cloudfetch_max_chunks_in_memory",
             Self::InlineMaxChunksInMemory => "inline_max_chunks_in_memory",
@@ -1238,11 +1239,9 @@ impl ResultConfig {
     /// DSN / connection-string attributes as key/value pairs). The key is
     /// resolved via [`ClientConfKey::parse`] (case-insensitive).
     ///
-    /// Unlike the server `session_conf` map, these knobs are **client-side**
-    /// and never reach the SEA wire — so this deliberately does NOT accept
-    /// server conf keys (`ANSI_MODE`, `TIMEZONE`, …); those remain in
-    /// `session_conf` and pass through unchanged. Keeping the two channels
-    /// separate is the point (see #226).
+    /// These knobs configure the client. Server keys such as `ANSI_MODE`
+    /// and `TIMEZONE` belong in `session_conf`, which sends them as server
+    /// settings.
     ///
     /// # Errors
     /// Returns `ErrorCode::InvalidArgument` when:
@@ -1298,6 +1297,9 @@ impl ResultConfig {
         match known {
             ClientConfKey::CloudfetchEnabled => {
                 self.cloudfetch_enabled = parse_bool(value)?;
+            }
+            ClientConfKey::Lz4CompressionEnabled => {
+                self.lz4_compression_enabled = parse_bool(value)?;
             }
             ClientConfKey::CloudfetchLinkPrefetchWindow => {
                 self.cloudfetch_link_prefetch_window = parse_positive_usize(value)?;

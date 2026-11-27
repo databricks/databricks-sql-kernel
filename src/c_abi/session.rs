@@ -192,13 +192,8 @@ pub struct KernelSessionConfig {
     /// machine-local derived key. Only U2M auth reads it — PAT and M2M never
     /// touch the cache. See [`TokenCacheConfig`].
     token_cache: TokenCacheConfig,
-    /// Client-side result-management knobs (CloudFetch / inline streaming
-    /// tuning, flat-text rendering). Populated by
-    /// `kernel_session_config_set_client_conf`; defaults to
-    /// [`ResultConfig::default`]. These are **client-side** behaviours
-    /// folded into the kernel's `ResultConfig` at `open()` — they never
-    /// reach the SEA wire (unlike [`Self::session_conf`]). See
-    /// [`ResultConfig`].
+    /// Client-side result settings populated by
+    /// `kernel_session_config_set_client_conf`. See [`ResultConfig`].
     result: ResultConfig,
     /// Telemetry collection/export knobs. Defaults to disabled; populated by
     /// `kernel_session_config_set_telemetry_config`.
@@ -1363,10 +1358,8 @@ pub unsafe extern "C" fn kernel_session_config_set_u2m_token_cache_config(
 /// This is the client-side counterpart to
 /// `kernel_session_config_set_session_conf`: that one carries **server**
 /// session confs (`ANSI_MODE`, `TIMEZONE`, …) to the SEA wire; this one
-/// sets **client-side** knobs that tune how the kernel fetches, buffers,
-/// and post-processes results and are **never sent to the server**. The two
-/// channels are deliberately separate (see #196 / #226 — conflating them is
-/// what made a client flag masquerade as a rejected server conf).
+/// configures how the kernel requests, fetches, buffers, and post-processes
+/// results. These keys are kept out of the server session configuration.
 ///
 /// A key/value shape (rather than one typed setter per knob) is chosen so
 /// the signature never changes as `ResultConfig` grows new knobs, and so a
@@ -1379,6 +1372,8 @@ pub unsafe extern "C" fn kernel_session_config_set_u2m_token_cache_config(
 /// [`ResultConfig`]:
 /// - `cloudfetch_enabled` = `"true"` / `"false"` — `false` serves every
 ///   result through paged inline delivery without cloud-storage downloads.
+/// - `lz4_compression_enabled` = `"true"` / `"false"`, for LZ4
+///   compression for Arrow results. Defaults to `"true"`.
 /// - `cloudfetch_link_prefetch_window` = positive integer — presigned URLs
 ///   prefetched ahead of the consumer.
 /// - `cloudfetch_max_chunks_in_memory` = positive integer — decompressed

@@ -286,12 +286,14 @@ fn c_abi_set_client_conf_rejects_unknown_key_and_bad_value() {
         );
 
         // Unparseable value for a known bool key → InvalidArgument.
-        let key = CString::new("cloudfetch_enabled").unwrap();
-        let bad_val = CString::new("flase").unwrap(); // typo
-        assert_eq!(
-            kernel_session_config_set_client_conf(config, key.as_ptr(), bad_val.as_ptr()),
-            KernelStatusCode::InvalidArgument
-        );
+        for key in ["cloudfetch_enabled", "lz4_compression_enabled"] {
+            let key = CString::new(key).unwrap();
+            let bad_val = CString::new("flase").unwrap(); // typo
+            assert_eq!(
+                kernel_session_config_set_client_conf(config, key.as_ptr(), bad_val.as_ptr()),
+                KernelStatusCode::InvalidArgument
+            );
+        }
         let mut err = std::mem::MaybeUninit::<KernelError>::uninit();
         assert!(
             kernel_get_last_error(err.as_mut_ptr()),

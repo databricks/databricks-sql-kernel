@@ -664,6 +664,14 @@ impl SeaRestTransport {
             ),
             Some(SessionRoute::Realtime { .. }) => (None, None),
         };
+        let compression = if params
+            .lz4_compression
+            .unwrap_or(self.config.lz4_compression_enabled)
+        {
+            "LZ4_FRAME"
+        } else {
+            "NONE"
+        };
         let request_body = ExecuteStatementRequest {
             warehouse_id,
             statement: sql.to_string(),
@@ -676,7 +684,7 @@ impl SeaRestTransport {
             wait_timeout: params.wait_timeout.clone(),
             on_wait_timeout: params.on_wait_timeout.clone(),
             row_limit: params.row_limit,
-            result_compression: Some("LZ4_FRAME".to_string()),
+            result_compression: Some(compression.to_string()),
             parameters: params.parameters.clone(),
             query_tags: params.query_tags.clone(),
         };

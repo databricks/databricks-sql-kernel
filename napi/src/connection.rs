@@ -102,6 +102,8 @@ pub struct ExecuteOptions {
     /// (SEA `row_limit`), independent of any SQL `LIMIT`. Maps to
     /// `StatementSpec.row_limit`. Omitted ⇒ no driver-imposed cap.
     pub row_limit: Option<i64>,
+    /// Request LZ4 compression for Arrow results. Omit to use the session default.
+    pub lz4_compression: Option<bool>,
     /// Positional parameters, in 1-based wire order. Index `i` in this
     /// Vec corresponds to the `i+1`-th `?` placeholder in the SQL.
     /// Each entry is a `{ sqlType, value }` pair — `value` is the
@@ -190,6 +192,7 @@ fn build_statement(
     statement_conf: Option<HashMap<String, String>>,
     query_tags: Option<HashMap<String, Option<String>>>,
     row_limit: Option<i64>,
+    lz4_compression: Option<bool>,
     positional_params: Vec<TypedValue>,
     named_params: Vec<(String, TypedValue)>,
     raw_params: Vec<RawParameterInput>,
@@ -215,6 +218,7 @@ fn build_statement(
     }
     // `None` leaves the kernel's omit-the-field default in place.
     stmt.spec().row_limit(row_limit);
+    stmt.spec().lz4_compression(lz4_compression);
     // Bind positional params 1-based on the wire.
     for (i, value) in positional_params.into_iter().enumerate() {
         stmt.spec()
@@ -293,11 +297,10 @@ impl Connection {
         mut options: Option<ExecuteOptions>,
     ) -> napi::Result<Statement> {
         let inner = Arc::clone(&self.inner);
-        // Pull the scalar knobs out (both `i64`/`u32` are `Copy`) before
-        // the `.take()`s below consume the map fields out of `options`.
-        let row_limit = options.as_ref().and_then(|o| o.row_limit); // Decode positional params before `options` is consumed below; a
-                                                                    // malformed entry surfaces as InvalidArgument here, before any wire
-                                                                    // round-trip.
+        // Read scalar options before consuming the other fields in `options`.
+        let row_limit = options.as_ref().and_then(|o| o.row_limit);
+        let lz4_compression = options.as_ref().and_then(|o| o.lz4_compression);
+        // Invalid positional parameters fail here before any wire round-trip.
         let positional_params = options
             .as_mut()
             .and_then(|o| o.positional_params.take())
@@ -342,6 +345,7 @@ impl Connection {
                     statement_conf,
                     query_tags,
                     row_limit,
+                    lz4_compression,
                     positional_params,
                     named_params,
                     raw_params,
@@ -387,6 +391,7 @@ impl Connection {
     ) -> napi::Result<napi::Either<Statement, AsyncStatement>> {
         let inner = Arc::clone(&self.inner);
         let row_limit = options.as_ref().and_then(|o| o.row_limit);
+        let lz4_compression = options.as_ref().and_then(|o| o.lz4_compression);
         let positional_params = options
             .as_mut()
             .and_then(|o| o.positional_params.take())
@@ -415,6 +420,7 @@ impl Connection {
                     statement_conf,
                     query_tags,
                     row_limit,
+                    lz4_compression,
                     positional_params,
                     named_params,
                     raw_params,
@@ -460,6 +466,7 @@ impl Connection {
         let inner = Arc::clone(&self.inner);
         // Same option decoding as `execute_statement`.
         let row_limit = options.as_ref().and_then(|o| o.row_limit);
+        let lz4_compression = options.as_ref().and_then(|o| o.lz4_compression);
         let positional_params = options
             .as_mut()
             .and_then(|o| o.positional_params.take())
@@ -495,6 +502,7 @@ impl Connection {
                     statement_conf,
                     query_tags,
                     row_limit,
+                    lz4_compression,
                     positional_params,
                     named_params,
                     raw_params,
@@ -533,6 +541,7 @@ impl Connection {
         // Same option decoding as `execute_statement` — malformed
         // params surface as InvalidArgument before any wire round-trip.
         let row_limit = options.as_ref().and_then(|o| o.row_limit);
+        let lz4_compression = options.as_ref().and_then(|o| o.lz4_compression);
         let positional_params = options
             .as_mut()
             .and_then(|o| o.positional_params.take())
@@ -573,6 +582,7 @@ impl Connection {
                     statement_conf,
                     query_tags,
                     row_limit,
+                    lz4_compression,
                     positional_params,
                     named_params,
                     raw_params,
@@ -756,6 +766,7 @@ mod tests {
             None,
             None,
             None,
+            Some(false),
             vec![],
             vec![],
             vec![raw()],
@@ -778,6 +789,7 @@ mod tests {
         assert_eq!(statement_requests.len(), 1);
         let body: serde_json::Value =
             serde_json::from_slice(&statement_requests[0].body).expect("statement request is JSON");
+        assert_eq!(body["result_compression"], "NONE");
         assert_eq!(
             body["parameters"],
             json!([{ "ordinal": 1, "type": "INTERVAL MONTH", "value": "13" }])
@@ -786,6 +798,7 @@ mod tests {
         let mut mixed_stmt = build_statement(
             &session,
             "SELECT ?".into(),
+            None,
             None,
             None,
             None,

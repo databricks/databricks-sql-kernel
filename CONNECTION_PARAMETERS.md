@@ -171,6 +171,7 @@ Setting only one of `client_cert_pem` / `client_key_pem` is rejected at
 | Field | Description | Default |
 |-------|-------------|---------|
 | `cloudfetch_enabled` | Opt into CloudFetch (cloud-storage-backed download of large results via presigned URLs). Set `false` to force the inline-Arrow path (mirrors JDBC `EnableQueryResultDownload=0`). | `true` |
+| `lz4_compression_enabled` | Request LZ4 compression for Arrow results, including inline and CloudFetch delivery. Statements can override this default via `StatementSpec::lz4_compression`. | `true` |
 | `cloudfetch_link_prefetch_window` | Number of presigned URLs to prefetch ahead of the consumer. | `10` |
 | `cloudfetch_max_chunks_in_memory` | Max decompressed CloudFetch chunks held in memory at once (bounds download parallelism and peak RSS). | `16` |
 | `inline_max_chunks_in_memory` | Prefetch window for the inline-Arrow path (used when CloudFetch is disabled). `1` disables prefetching. | `4` |
@@ -257,12 +258,12 @@ Each key mirrors a field of [`ResultConfig`](#resultconfig--result-handling-opti
 | Key | Description | Default |
 |-----|-------------|---------|
 | `cloudfetch_enabled` | Same knob as `ResultConfig::cloudfetch_enabled` — opt into CloudFetch (`false` forces the inline-Arrow path). | `true` |
+| `lz4_compression_enabled` | Same knob as `ResultConfig::lz4_compression_enabled` — request LZ4 compression for Arrow results. | `true` |
 | `cloudfetch_link_prefetch_window` | Same knob as `ResultConfig::cloudfetch_link_prefetch_window` — number of presigned URLs to prefetch ahead of the consumer. | `10` |
 | `cloudfetch_max_chunks_in_memory` | Same knob as `ResultConfig::cloudfetch_max_chunks_in_memory` — max decompressed CloudFetch chunks held in memory at once. Values above `256` are clamped (with a warning) rather than rejected (peak RSS scales with this, so the ceiling bounds OOM risk). | `16` |
 | `inline_max_chunks_in_memory` | Same knob as `ResultConfig::inline_max_chunks_in_memory` — prefetch window for the inline-Arrow path. `1` disables prefetching. | `4` |
 | `complex_types_as_json` | Same knob as `ResultConfig::complex_types_as_json` — render complex columns as compact JSON strings instead of native Arrow nested types. | `false` |
 | `intervals_as_string` | Same knob as `ResultConfig::intervals_as_string` — render `INTERVAL` / `DURATION` columns as canonical Databricks text instead of native Arrow interval types. | `false` |
 
-Compression (LZ4) is **not** a parameter: the kernel detects it from the
-server's result manifest (`result_compression`) and decompresses
-`LZ4_FRAME` payloads automatically.
+The kernel reads the codec from the server's result manifest
+(`result_compression`) and decompresses `LZ4_FRAME` payloads automatically.
