@@ -100,7 +100,7 @@ jobs:
           cargo package --list --allow-dirty --manifest-path adbc/Cargo.toml | grep -qx NOTICE
 
       - name: Install cargo-deny
-        uses: taiki-e/install-action@41049aa56687c35e0afa74eed4f09cec4f9afabf # v2.85.2
+        uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
         with:
           # Pin the version: an unpinned `tool: cargo-deny` lets
           # install-action grab whatever's newest, and cargo-deny's CLI
