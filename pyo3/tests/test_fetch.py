@@ -48,6 +48,21 @@ def execute(sql_api):
     return statement, statement.execute()
 
 
+def test_statement_forwards_lz4_compression_override(sql_api):
+    statement = sql_api.session.statement()
+    try:
+        statement.set_sql("SELECT n")
+        statement.set_lz4_compression(False)
+        statement.execute().close()
+        assert sql_api.statement_bodies[-1]["result_compression"] == "NONE"
+
+        statement.set_lz4_compression(None)
+        statement.execute().close()
+        assert sql_api.statement_bodies[-1]["result_compression"] == "LZ4_FRAME"
+    finally:
+        statement.close()
+
+
 @pytest.mark.parametrize("batches", [[], [[1, 2]], [[], [1, 2], [3]]])
 def test_buffered_fetch_closes_once_after_exhaustion(sql_api, batches):
     sql_api.batches = batches
