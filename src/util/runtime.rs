@@ -149,11 +149,12 @@ pub(crate) fn ambient_rust_min_stack() -> Option<usize> {
         .and_then(|v| v.parse::<usize>().ok())
 }
 
-/// `on_thread_start` hook for kernel-owned runtimes. std's `write_vectored` is a plain
-/// `writev`, so a write after a peer reset raises SIGPIPE on this thread, and non-Rust hosts
-/// that don't ignore it (Go) die. Only kernel threads change; the write still fails with EPIPE.
+/// `on_thread_start` hook for kernel-owned runtimes, including the ADBC and pyo3 ones through
+/// the crate-root re-export. std's `write_vectored` is a plain `writev`, so a write after a peer
+/// reset raises SIGPIPE on this thread, and non-Rust hosts that don't ignore it (Go) die. Only
+/// kernel threads change; the write still fails with EPIPE.
 #[cfg(unix)]
-pub(crate) fn block_sigpipe_on_current_thread() {
+pub fn block_sigpipe_on_current_thread() {
     // SAFETY: initialises a stack-local `sigset_t` and changes only this thread's mask.
     unsafe {
         let mut set: libc::sigset_t = std::mem::zeroed();
@@ -165,7 +166,7 @@ pub(crate) fn block_sigpipe_on_current_thread() {
 
 /// Windows has no SIGPIPE.
 #[cfg(not(unix))]
-pub(crate) fn block_sigpipe_on_current_thread() {}
+pub fn block_sigpipe_on_current_thread() {}
 
 /// Whether SIGPIPE is in the calling thread's `SigBlk` mask.
 #[cfg(all(test, target_os = "linux"))]
