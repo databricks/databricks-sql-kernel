@@ -55,9 +55,8 @@ impl ExecutionTimeout {
 /// Backend-agnostic configuration for [`Transport`] implementations.
 ///
 /// Contains polling settings shared across SEA REST, SEA gRPC, and
-/// Thrift backends. CloudFetch tuning lives on
-/// [`crate::reader::ResultReaderFactory`] instead — the transport
-/// never reads it.
+/// Thrift backends. Result-reader buffering lives on
+/// [`crate::reader::ResultReaderFactory`].
 #[derive(Debug, Clone)]
 pub(crate) struct TransportConfig {
     /// Default polling ceiling for async and metadata execution (600s).
@@ -70,6 +69,8 @@ pub(crate) struct TransportConfig {
     /// When false, session creation requests paged inline results without
     /// cloud-storage downloads. The value is fixed for the session lifetime.
     pub cloudfetch_enabled: bool,
+    /// Session default for LZ4 compression of Arrow results.
+    pub lz4_compression_enabled: bool,
 }
 
 impl Default for TransportConfig {
@@ -79,6 +80,7 @@ impl Default for TransportConfig {
             poll_interval: Duration::from_millis(500),
             // Mirror `ResultConfig::default().cloudfetch_enabled`.
             cloudfetch_enabled: true,
+            lz4_compression_enabled: true,
         }
     }
 }

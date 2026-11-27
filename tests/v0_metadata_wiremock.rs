@@ -38,7 +38,8 @@ use arrow_schema::{DataType, Field, Schema};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use databricks_sql_kernel::metadata_v0::exact_catalog_and_pattern;
 use databricks_sql_kernel::{
-    AuthConfig, ConnectionConfig, DefaultOpts, Identifier, LikePattern, ResultBatch, Session,
+    AuthConfig, ConnectionConfig, DefaultOpts, Identifier, LikePattern, ResultBatch, ResultConfig,
+    Session, SessionBuilder,
 };
 use serde_json::json;
 use std::sync::Arc;
@@ -51,8 +52,8 @@ async fn open_session(server: &MockServer) -> Session {
     open_session_with_default_catalog(server, None).await
 }
 
-async fn open_session_with_default_catalog(server: &MockServer, catalog: Option<&str>) -> Session {
-    let builder = Session::builder()
+fn session_builder(server: &MockServer) -> SessionBuilder {
+    Session::builder()
         .connection(
             ConnectionConfig::from_http_path(server.uri(), "/sql/1.0/warehouses/test_wh")
                 .expect("valid http_path"),
@@ -60,7 +61,11 @@ async fn open_session_with_default_catalog(server: &MockServer, catalog: Option<
         .auth(AuthConfig::Pat {
             token: "dapi_test_token".into(),
             identity_federation_client_id: None,
-        });
+        })
+}
+
+async fn open_session_with_default_catalog(server: &MockServer, catalog: Option<&str>) -> Session {
+    let builder = session_builder(server);
     let builder = match catalog {
         Some(catalog) => {
             let mut defaults = DefaultOpts::default();
@@ -670,9 +675,22 @@ async fn list_catalogs_returns_table_cat_column() {
         "catalog",
         vec![Some("main"), Some("hive_metastore")],
     )]);
-    mount_execute(&server, succeeded_inline_response_body(&raw)).await;
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .and(body_partial_json(json!({ "result_compression": "NONE" })))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(succeeded_inline_response_body(&raw)),
+        )
+        .mount(&server)
+        .await;
 
-    let session = open_session(&server).await;
+    let mut result = ResultConfig::default();
+    result.lz4_compression_enabled = false;
+    let session = session_builder(&server)
+        .result(result)
+        .open()
+        .await
+        .unwrap();
     let mut stream = session
         .metadata()
         .list_catalogs()

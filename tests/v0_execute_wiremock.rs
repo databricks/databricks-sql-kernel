@@ -1617,6 +1617,56 @@ async fn execute_with_cloudfetch_enabled_sends_inline_or_external_links_disposit
 }
 
 #[tokio::test]
+async fn execute_lz4_compression_uses_statement_override_or_session_default() {
+    for (session_default, expected) in [
+        (true, ["LZ4_FRAME", "NONE", "NONE", "LZ4_FRAME"]),
+        (false, ["NONE", "LZ4_FRAME", "LZ4_FRAME", "NONE"]),
+    ] {
+        let server = MockServer::start().await;
+        mount_create_session(&server).await;
+        mount_delete_session(&server).await;
+        mount_close_any_statement(&server).await;
+        let batch = int64_batch("n", vec![1]);
+        mount_execute(&server, succeeded_inline_body("stmt-lz4", &batch)).await;
+        let session = if session_default {
+            open_session(&server).await
+        } else {
+            let mut result = ResultConfig::default();
+            result.lz4_compression_enabled = false;
+            open_session_with_result(&server, result).await
+        };
+
+        let mut stmt = session.statement();
+        for (sql, override_update) in [
+            ("SELECT 1", None),
+            ("SELECT 1 AS n", Some(Some(!session_default))),
+            ("SELECT 1 AS m", None),
+            ("SELECT 1 AS p", Some(None)),
+        ] {
+            stmt.spec().sql(sql);
+            if let Some(override_value) = override_update {
+                stmt.spec().lz4_compression(override_value);
+            }
+            let mut executed = stmt.execute().await.unwrap();
+            drain(executed.result_stream_mut()).await;
+            executed.close().await.unwrap();
+        }
+
+        let codecs: Vec<_> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.path() == "/api/2.0/sql/statements" && r.method.as_str() == "POST")
+            .map(|request| {
+                request.body_json::<serde_json::Value>().unwrap()["result_compression"].clone()
+            })
+            .collect();
+        assert_eq!(codecs, expected);
+    }
+}
+
+#[tokio::test]
 async fn execute_with_cloudfetch_disabled_supports_paged_arrow_results() {
     let server = MockServer::start().await;
     mount_create_session(&server).await;

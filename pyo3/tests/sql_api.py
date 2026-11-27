@@ -28,6 +28,7 @@ def sql_api(session_type, arrow_bytes=None):
         batches=[[1, 2]] if arrow_bytes else [],
         mode="buffered",
         requests=[],
+        statement_bodies=[],
         chunk_requested=threading.Event(),
         release_chunk=threading.Event(),
         statement_closed=threading.Event(),
@@ -37,13 +38,14 @@ def sql_api(session_type, arrow_bytes=None):
 
     class Handler(BaseHTTPRequestHandler):
         def reply(self):
-            self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
             path = self.path.split("?")[0]
             state.requests.append((self.command, path))
             status, response = 200, {}
             if self.command == "POST" and path.endswith("/sessions"):
                 response = {"session_id": "00000000-0000-0000-0000-000000000001"}
             elif self.command == "POST" and path.endswith("/statements"):
+                state.statement_bodies.append(json.loads(body))
                 pending = state.mode != "buffered"
                 raw = arrow_bytes(state.batches) if state.batches else b""
                 count = sum(map(len, state.batches))

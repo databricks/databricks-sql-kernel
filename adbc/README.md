@@ -63,6 +63,10 @@ and proxy behavior, TLS, logging, telemetry, result fetching, query execution,
 and metadata. Supply credentials at runtime and do not place them in source
 code, manifests, logs, or connection URLs.
 
+LZ4 compression is enabled by default for Arrow query results. Set the database
+option `adbc.databricks.enable_query_result_lz4_compression` to `"false"` or
+integer `0` to request uncompressed results.
+
 ## Supported functionality
 
 The driver supports query and update execution, parameter binding,

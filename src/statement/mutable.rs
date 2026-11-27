@@ -165,6 +165,7 @@ fn build_execute_params(
         wait_timeout,
         on_wait_timeout,
         row_limit: spec.row_limit,
+        lz4_compression: spec.lz4_compression,
         ..ExecuteParams::default()
     };
     for (i, value) in spec.positional_params.iter().enumerate() {

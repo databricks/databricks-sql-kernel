@@ -220,6 +220,9 @@ pub struct StatementSpec {
     /// omits the field, so the server applies no driver-imposed cap.
     pub row_limit: Option<i64>,
 
+    /// Override LZ4 compression for Arrow results. `None` uses the session default.
+    pub lz4_compression: Option<bool>,
+
     /// Result wire format.
     pub result_format: ResultFormat,
 }
@@ -234,10 +237,8 @@ impl StatementSpec {
     /// bound parameter — raw, positional-typed, and named-typed — so each
     /// `sql()` begins a fresh set of *bound parameters*.
     ///
-    /// Scope note: this clears the three parameter collections only. It does
-    /// **not** reset `statement_conf` (e.g. query tags) or `row_limit`, which
-    /// survive a `sql()` call and must be re-set explicitly if a reused handle
-    /// should not carry them into the next query.
+    /// Reused handles carry statement options such as `statement_conf`,
+    /// `row_limit`, and `lz4_compression` into the next query unless explicitly reset.
     ///
     /// This is the single reset point for the *bound parameters* of a reused
     /// statement handle. New SQL has its own parameter markers, so carrying
@@ -390,6 +391,12 @@ impl StatementSpec {
     /// Set the server-side row cap (SEA `row_limit`). `None` clears it.
     pub fn row_limit(&mut self, row_limit: Option<i64>) -> &mut Self {
         self.row_limit = row_limit;
+        self
+    }
+
+    /// Set the Arrow result compression override. `None` restores the session default.
+    pub fn lz4_compression(&mut self, enabled: Option<bool>) -> &mut Self {
+        self.lz4_compression = enabled;
         self
     }
 

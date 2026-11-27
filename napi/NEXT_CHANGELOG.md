@@ -14,6 +14,8 @@ layout, or npm publishing. Pure-kernel changes go in the root
 
 ### Added
 
+- `ExecuteOptions.lz4Compression` overrides Arrow result LZ4 compression per statement.
+
 ### Changed
 
 ### Updated

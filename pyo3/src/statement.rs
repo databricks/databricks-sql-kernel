@@ -66,6 +66,14 @@ impl Statement {
         Ok(())
     }
 
+    /// Set LZ4 compression for Arrow results. ``None`` uses the session default.
+    #[pyo3(signature = (enabled))]
+    fn set_lz4_compression(&mut self, enabled: Option<bool>) -> PyResult<()> {
+        let inner = alive_mut!(self, "Statement");
+        inner.stmt.spec().lz4_compression(enabled);
+        Ok(())
+    }
+
     /// Set the server-side row cap for this statement. ``None`` clears it.
     fn set_row_limit(&mut self, row_limit: Option<i64>) -> PyResult<()> {
         let inner = alive_mut!(self, "Statement");
