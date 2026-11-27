@@ -91,7 +91,7 @@ jobs:
           cache-workspaces: "napi -> target"
 
       - name: Setup sccache
-        uses: Mozilla-Actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+        uses: Mozilla-Actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
 
       - name: cargo fmt --all -- --check
         run: cargo fmt --all -- --check
